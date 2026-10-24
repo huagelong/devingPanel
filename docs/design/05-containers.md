@@ -45,8 +45,8 @@ SheetHeader: web-1 (mono)  [跟随] Switch  [停止] [重启]
 
 ## 5. 清理磁盘 Dialog
 
-1. 第一步：点击 [清理磁盘] 后执行预检（`docker system df`），Dialog 展示可回收空间明细：悬空镜像 / 停止容器 / 未使用网络 / 构建缓存，各一行 + 预计释放总量。
-2. 第二步：AlertDialog 确认"将执行 docker system prune，预计释放 3.2 GB"。
+1. 第一步：点击 [清理磁盘] 后执行预检（`docker system df`），Dialog 展示全局可回收空间估值：悬空镜像 / 停止容器 / 未使用网络 / 构建缓存；提示估值不等于本次 `docker system prune` 的实际释放空间，且可能包含其他项目的资源。
+2. 第二步：AlertDialog 列明操作范围（将删除其他项目的停止容器、未使用网络及缓存等）并确认"这是全局 Docker 清理，可能影响其他项目"；默认不选中卷清理，不把本操作当作发布历史镜像清理。
 3. 完成后 Toast 显示实际释放空间。
 
 ## 6. 状态与确认
@@ -54,3 +54,4 @@ SheetHeader: web-1 (mono)  [跟随] Switch  [停止] [重启]
 - 加载：表格 Skeleton；主机 SSH 不可达：Card 内错误态 + [重试]。
 - 停止 / 删除 / 重启：AlertDialog 二次确认（删除为 destructive 按钮）；执行中行内 loading，完成 Toast。
 - 容器列表每 10s 刷新；正在操作的行禁用操作按钮防止重复提交。
+- 镜像列表中当前运行或受发布保留策略保护的镜像禁用删除，显示保护原因；删除镜像也需二次确认。
