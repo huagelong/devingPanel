@@ -1,0 +1,56 @@
+# P5 容器管理 设计文档
+
+> 需求映射：C-1/C-2/C-3/C-4/C-5 容器列表、操作、日志、镜像、磁盘清理、S-2/SEC-2 仅经 SSH 且不在 VPS 装 agent
+
+## 1. 页面目的
+
+以 SSH 只读 + 操作命令的方式，提供轻量 Docker 管理能力，替代 VPS 上的常驻管理面板。
+
+## 2. 入口
+
+- 侧边栏"容器"；主机详情 [打开容器管理]。
+
+## 3. 布局
+
+```
+内容区
+|
+|-- 页头: "容器"  左侧主机切换 Select (列出所有已配置主机)
+|          右侧: [清理磁盘] (variant=outline)
+|
+|-- Tabs: [容器] [镜像]
+|
+|-- Tab 容器:
+|  Table (Card)
+|  列: 状态 | 名称(mono) | 镜像(mono) | 端口 | CPU | 内存 | 操作
+|       ●Up 3d  web-1  myapp:v1.4.2  0.0.0.0:80->8080  2%  120MB  [日志][...]
+|  操作列 DropdownMenu: 启动 / 停止 / 重启 / 删除(destructive)
+|  行点击 -> 日志 Sheet
+|
+|-- Tab 镜像:
+|  Table: 仓库名:tag(mono) | 大小 | 创建时间 | 未使用标记 | 操作[删除]
+|  顶部次操作: [清理悬空镜像] (variant=ghost)
+```
+
+## 4. 容器日志 Sheet
+
+右侧滑出 Sheet `sm:max-w-2xl`：
+
+```
+SheetHeader: web-1 (mono)  [跟随] Switch  [停止] [重启]
+主体: 等宽日志区 (bg-muted, h 全高, 自动滚动到底部)
+      跟随开启时新日志自动追加; 手动上滚时暂停跟随, 底部出现 [回到底部]
+底部: 条数上限提示 "仅显示最近 1000 行 (docker logs)"
+```
+
+## 5. 清理磁盘 Dialog
+
+1. 第一步：点击 [清理磁盘] 后执行预检（`docker system df`），Dialog 展示可回收空间明细：悬空镜像 / 停止容器 / 未使用网络 / 构建缓存，各一行 + 预计释放总量。
+2. 第二步：AlertDialog 确认"将执行 docker system prune，预计释放 3.2 GB"。
+3. 完成后 Toast 显示实际释放空间。
+
+## 6. 状态与确认
+
+- 加载：表格 Skeleton；主机 SSH 不可达：Card 内错误态 + [重试]。
+- 停止 / 删除 / 重启：AlertDialog 二次确认（删除为 destructive 按钮）；执行中行内 loading，完成 Toast。
+- 容器列表每 10s 刷新；正在操作的行禁用操作按钮防止重复提交。
