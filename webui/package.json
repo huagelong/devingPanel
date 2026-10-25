@@ -1,0 +1,15 @@
+{
+  "name": "webui",
+  "version": "1.0.0",
+  "description": "Documentation-aligned HTML design prototype",
+  "scripts": {
+    "start": "node serve.cjs",
+    "test": "playwright test"
+  },
+  "license": "BSD-3-Clause",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "^1.64.1"
+  },
+  "private": true
+}

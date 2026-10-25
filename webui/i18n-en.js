@@ -1,0 +1,795 @@
+/* Chinese source messages are stable keys; UI data is never translated. */
+const I18N_EN = Object.freeze({
+  本机锁屏: "Local screen lock",
+  本机锁屏与系统凭据管理: "Local screen lock and OS credentials",
+  "敏感值不写入 SQLite；锁屏密码仅以加盐验证值保存在本机浏览器存储。":
+    "Secrets are not stored in SQLite. Only a salted password verifier is stored in this browser.",
+  未启用: "Not enabled",
+  已启用: "Enabled",
+  配置损坏: "Configuration damaged",
+  "无操作达到设定时间后自动锁定；刷新或重新打开应用也需解锁。这只是本机界面锁，不替代操作系统登录、磁盘加密或服务器认证。":
+    "Locks after the configured idle time. Refreshing or reopening also requires the password. This is a local UI lock, not a substitute for OS login, disk encryption or server authentication.",
+  新锁屏密码: "New lock password",
+  确认新密码: "Confirm new password",
+  当前锁屏密码: "Current lock password",
+  锁屏密码: "Lock password",
+  无操作自动锁屏间隔: "Auto-lock after inactivity",
+  "自定义分钟数（1–1440）": "Custom minutes (1–1440)",
+  "{0} 分钟无操作后锁屏": "Idle timeout: {0} min",
+  "15 分钟": "15 minutes",
+  "30 分钟": "30 minutes",
+  "60 分钟": "60 minutes",
+  分钟: "minutes",
+  新间隔: "New interval",
+  启用锁屏: "Enable screen lock",
+  保存间隔: "Save interval",
+  修改锁屏密码: "Change lock password",
+  修改密码: "Change password",
+  立即锁屏: "Lock now",
+  关闭锁屏: "Disable screen lock",
+  "关闭锁屏？": "Disable screen lock?",
+  确认关闭: "Confirm disable",
+  确认修改间隔: "Confirm interval change",
+  已锁定: "Locked",
+  "输入锁屏密码以继续使用。": "Enter the lock password to continue.",
+  解锁: "Unlock",
+  "正在验证…": "Verifying…",
+  "密码错误，请重试。": "Incorrect password. Try again.",
+  "当前密码不正确。": "Current password is incorrect.",
+  "锁屏已启用。": "Screen lock enabled.",
+  "锁屏已关闭。": "Screen lock disabled.",
+  "自动锁屏间隔已更新。": "Auto-lock interval updated.",
+  "锁屏密码已修改。": "Lock password changed.",
+  "锁屏密码须为 8–1024 个字符。":
+    "Lock password must contain 8–1024 characters.",
+  "无操作间隔必须是 1–1440 分钟的整数。":
+    "Idle timeout must be an integer from 1 to 1440 minutes.",
+  "当前浏览器无法安全验证密码；请使用 HTTPS 或 localhost。":
+    "Secure password verification is unavailable. Use HTTPS or localhost.",
+  "无法保存锁屏设置；请允许本机浏览器存储。":
+    "Could not save screen-lock settings. Allow local browser storage.",
+  "锁屏配置损坏，无法校验密码；请在可信环境中检查本机浏览器存储。不会自动解除锁定。":
+    "Screen-lock configuration is damaged. Check local browser storage in a trusted environment. The screen will not unlock automatically.",
+  "关闭后不会再自动锁屏；请确认这是您的设备。":
+    "Auto-lock will stop. Confirm this is your device.",
+  "密码不以明文存储；丢失密码无法通过此原型找回。请妥善保存。锁屏时会清除尚未提交的敏感输入和当前会话的备份加密密码。":
+    "The password is not stored in plaintext and cannot be recovered in this prototype. Locking clears unsaved secret inputs and this session's backup encryption password.",
+  "本机界面锁不替代系统账户、磁盘加密或服务器权限。":
+    "This local UI lock does not replace OS accounts, disk encryption or server permissions.",
+  "{0} 台主机": "Hosts: {0}",
+  "{0} 个项目": "Projects: {0}",
+  "{0} 台目标主机": "Target hosts: {0}",
+  "{0} 台": "{0}",
+  "确认{0}此容器？可能中断服务。":
+    "Confirm action: {0} this container? Service may be interrupted.",
+  "语言仅影响界面；项目数据和日志保持原文。":
+    "Language changes the interface only. Project data and raw logs are preserved.",
+  总览: "Overview",
+  主机: "Hosts",
+  项目: "Projects",
+  发布: "Deployments",
+  容器: "Containers",
+  设置: "Settings",
+  主导航: "Main navigation",
+  设置分类: "Settings category",
+  外观: "Appearance",
+  备份与恢复: "Backup and restore",
+  镜像仓库: "Image registry",
+  "镜像仓库（可选）": "Image registry (optional)",
+  发布保留策略: "Release retention",
+  本地环境: "Local environment",
+  安全: "Security",
+  告警: "Alerts",
+  语言: "Language",
+  "语言已更新。": "Language updated.",
+  简体中文: "Simplified Chinese",
+  主题: "Theme",
+  浅色: "Light",
+  深色: "Dark",
+  跟随系统: "System",
+  "主题已保存。": "Theme saved.",
+  "切换主题，当前": "Change theme; current: ",
+  "主题：": "Theme: ",
+  "与顶部栏主题切换同步。":
+    "Synchronized with the theme control in the top bar.",
+  "仅 SSH · 无远端 Agent": "SSH only · No remote agent",
+  "交互原型 · 所有数值均为演示": "Interactive prototype · Sample data",
+  "v0.1 · 本地构建，远端运行": "v0.1 · Build locally, run remotely",
+  原型预览选项: "Prototype options",
+  打开导航: "Open navigation",
+  去发布: "Deploy",
+  "本地 Docker 可用": "Local Docker available",
+  "Docker 不可用": "Docker unavailable",
+  "Docker Engine 27.3.1 · 演示环境": "Docker Engine 27.3.1 · Demo environment",
+  "未检测到 Docker": "Docker not detected",
+  检测说明: "Setup guide",
+  "CPU 使用率趋势": "CPU utilization trend",
+  "CPU · 现在": "CPU · Now",
+  内存: "Memory",
+  磁盘: "Disk",
+  网络: "Network",
+  运行: "running",
+  在线: "Online",
+  离线: "Offline",
+  已连接: "Connected",
+  不可达: "Unreachable",
+  不可用: "Unavailable",
+  可用: "Available",
+  最近发布: "Recent deployments",
+  "最近 5 条发布记录": "The five most recent deployments",
+  查看全部: "View all",
+  暂无发布记录: "No deployment history",
+  "添加你的第一台 VPS": "Add your first VPS",
+  时间: "Time",
+  发布标识: "Release ID",
+  结果: "Result",
+  耗时: "Duration",
+  状态: "Status",
+  别名: "Alias",
+  地址: "Address",
+  用户: "User",
+  分组: "Group",
+  容器数: "Containers",
+  最近连接: "Last connected",
+  操作: "Actions",
+  全部分组: "All groups",
+  主机分组: "Host group",
+  添加主机: "Add host",
+  还没有主机: "No hosts yet",
+  测试连接: "Test connection",
+  更多操作: "More actions",
+  详情: "Details",
+  编辑: "Edit",
+  删除: "Delete",
+  编辑主机: "Edit host",
+  主机名: "Host name",
+  主机组: "Host group",
+  "2 分钟前": "2 minutes ago",
+  "2 小时前": "2 hours ago",
+  "1 天前": "1 day ago",
+  "7 天前": "7 days ago",
+  "10 分钟前": "10 minutes ago",
+  连接超时: "Connection timed out",
+  "SSH 端口": "SSH port",
+  用户名: "Username",
+  认证方式: "Authentication",
+  密码: "Password",
+  私钥: "Private key",
+  保存: "Save",
+  关闭: "Close",
+  取消: "Cancel",
+  确认: "Confirm",
+  应用: "Apply",
+  "密码 / 私钥": "Password / Private key",
+  "IP 或域名": "IP address or hostname",
+  "仅演示，请勿输入真实凭据": "Demo only; do not enter real credentials",
+  原型中请勿输入真实凭据: "Do not enter real credentials in this prototype",
+  "仅演示，请勿粘贴真实私钥": "Demo only; do not paste a real private key",
+  "已安全保存（演示），留空则不修改。":
+    "Saved securely (demo). Leave blank to keep unchanged.",
+  "浏览器原型不连接主机，不保存密码或私钥。":
+    "This browser prototype does not connect to hosts or store passwords or private keys.",
+  "首次连接：核对 SSH 主机指纹":
+    "First connection: verify the SSH host fingerprint",
+  "首次连接：确认主机指纹": "First connection: confirm the host fingerprint",
+  "主机指纹变化：连接已阻断": "Host fingerprint changed: connection blocked",
+  "请通过独立渠道核对指纹。这里只演示确认流程。":
+    "Verify the fingerprint through an independent channel. This is a confirmation demo only.",
+  "请通过独立渠道核对主机指纹，不要自动接受。以下指纹仅用于演示。":
+    "Independently verify the host fingerprint; do not accept it automatically. These fingerprints are examples only.",
+  确认演示指纹: "Confirm demo fingerprint",
+  更新可信指纹: "Update trusted fingerprint",
+  旧指纹: "Old fingerprint",
+  新指纹: "New fingerprint",
+  "旧地址：": "Previous address: ",
+  "地址：": "Address: ",
+  "连接成功，Docker 已就绪（模拟结果）。":
+    "Connected; Docker is ready (simulated result).",
+  "连接成功，Docker 已就绪（演示）。": "Connected; Docker is ready (demo).",
+  "连接目标已变化，请重新测试连接并核对指纹。":
+    "The endpoint changed. Test the connection and verify the fingerprint again.",
+  "别名、地址和用户不能为空。": "Alias, address and username are required.",
+  "主机配置已更新（仅本次演示；未保存凭据）。":
+    "Host configuration updated for this session only. Credentials were not saved.",
+  "删除主机？": "Delete host?",
+  "只删除本地演示配置，不影响 VPS；将解除相关项目绑定。":
+    "Only the local demo configuration and project bindings will be removed. The VPS is unaffected.",
+  "存在运行中或待核实的发布，不能删除主机。":
+    "This host has an active or unverified deployment and cannot be deleted.",
+  "主机演示配置已删除。": "Demo host configuration deleted.",
+  基本信息: "Host information",
+  资源监控: "Resource monitoring",
+  资源趋势: "Resource trends",
+  打开容器管理: "Manage containers",
+  "SSH 连接配置与远端环境": "SSH configuration and remote environment",
+  登录用户: "Login user",
+  "私钥（已安全保存 · 演示）": "Private key (securely saved · demo)",
+  "系统 / 内核": "OS / Kernel",
+  "Docker 版本": "Docker version",
+  架构: "Architecture",
+  无: "None",
+  连接已断开: "Connection lost",
+  重连: "Reconnect",
+  "近 10 分钟 · 演示数据，仅客户端在线期间采样":
+    "Last 10 minutes · Sample data collected only while the client is online",
+  运行的容器: "Running containers",
+  "每 5s 刷新 · 原型不实际采样":
+    "Refresh every 5s · No live sampling in this prototype",
+  名称: "Name",
+  镜像: "Image",
+  主机不存在: "Host not found",
+  返回主机列表: "Back to hosts",
+  项目名: "Project name",
+  本地路径: "Local path",
+  绑定主机数: "Bound hosts",
+  新建项目: "New project",
+  还没有项目: "No projects yet",
+  就绪: "Ready",
+  待完善: "Incomplete",
+  "请完善 Compose、部署服务和目标主机":
+    "Configure Compose, deployment service and target hosts first",
+  请完善项目配置: "Complete the project configuration first",
+  编辑项目: "Edit project",
+  本地代码目录: "Local source directory",
+  "Dockerfile 路径": "Dockerfile path",
+  相对于本地代码目录: "Relative to the source directory",
+  浏览: "Browse",
+  创建项目: "Create project",
+  项目不存在: "Project not found",
+  返回项目列表: "Back to projects",
+  "静态浏览器不能读取完整本地目录路径，请手动填写；桌面版将调用系统选择器。":
+    "The browser cannot read the full local directory path. Enter it manually; the desktop app will use a native picker.",
+  "项目名不能为空。": "Project name is required.",
+  "项目名已存在。": "A project with this name already exists.",
+  "项目已保存，请完善部署配置。":
+    "Project saved. Complete the deployment configuration.",
+  "删除项目？": "Delete project?",
+  "只删除本地演示项目，不删除远端服务。":
+    "Only the local demo project will be deleted. Remote services are unaffected.",
+  "发布尚未结束，不能删除关联项目。":
+    "The deployment is not finished. Its project cannot be deleted.",
+  "项目已删除（演示）。": "Project deleted (demo).",
+  "请先完成或终止当前发布。":
+    "Finish or terminate the current deployment first.",
+  构建配置: "Build configuration",
+  "镜像在开发机构建，不占用 VPS 编译资源。":
+    "Build images on the development machine, not on the VPS.",
+  镜像名: "Image name",
+  "Tag 规则": "Tag pattern",
+  目标平台: "Target platform",
+  "按主机自动（默认）": "Auto-detect from hosts (default)",
+  部署服务: "Deployment service",
+  请选择部署服务: "Select a service",
+  "支持 {timestamp} / {git-sha}，自动附架构后缀，不覆盖旧版本；原型 git-sha 使用 a1b2c3d 示例值":
+    "Supports {timestamp} / {git-sha}. An architecture suffix is added; existing releases are never overwritten. Demo git-sha: a1b2c3d.",
+  "构建参数不是秘密传输机制，请勿填写密码或令牌。":
+    "Build arguments are not a secret transport. Do not enter passwords or tokens.",
+  "构建配置已保存（演示）。": "Build configuration saved (demo).",
+  添加变量: "Add variable",
+  变量名: "Variable name",
+  变量值: "Variable value",
+  删除行: "Remove row",
+  "该项目来自配置备份。请核对本地路径和 Compose 文件、补齐构建参数值，再保存确认；连接凭据和环境变量需重新配置。":
+    "This project was restored from a configuration backup. Verify local paths and Compose files, restore build argument values, then save to confirm. Reconfigure credentials and environment variables.",
+  "请补齐导入后清空的构建参数值，或明确删除不需要的参数。":
+    "Restore the build argument values cleared during import, or explicitly remove arguments you no longer need.",
+  "支持多个 compose 文件，按顺序合并（后者覆盖前者）。":
+    "Compose files are merged in order; later files override earlier ones.",
+  上移: "Move up",
+  下移: "Move down",
+  移除: "Remove",
+  "添加 compose 文件": "Add Compose file",
+  "添加 Compose 文件": "Add Compose file",
+  查看部署配置摘要: "View deployment configuration summary",
+  "首个文件必须位于项目根目录。目标服务使用":
+    "The first file must be in the project root. The target service uses ",
+  "。不支持远端 build、相对 bind mount、外部 env_file、文件型 configs/secrets、include 或 extends。":
+    ". Remote build, relative bind mounts, external env_file, file-based configs/secrets, include and extends are not supported.",
+  "服务 web · 镜像 ${DEVINGPANEL_IMAGE}":
+    "Service web · Image ${DEVINGPANEL_IMAGE}",
+  "端口 8080:3000 · 卷 app-data:/data":
+    "Port 8080:3000 · Volume app-data:/data",
+  "环境变量：已脱敏（演示摘要，非文件解析结果）":
+    "Environment values redacted (demo summary, not parsed from a file)",
+  相对于项目根目录的路径: "Path relative to the project root",
+  "原型只维护文件列表，不读取磁盘或执行 Compose 校验。":
+    "The prototype only maintains the file list; it does not read files or validate Compose contents.",
+  添加: "Add",
+  "必须是项目内 YAML 文件，且首个文件必须位于项目根目录。":
+    "Use YAML files inside the project; the first file must be in the project root.",
+  "文件已存在。": "This file is already listed.",
+  "文件列表已更新（尚未检查文件内容）。":
+    "File list updated; file contents have not been validated.",
+  "尚未配置 Compose 文件。": "No Compose files configured.",
+  "首个 Compose 文件必须位于项目根目录。":
+    "The first Compose file must be in the project root.",
+  环境变量: "Environment variables",
+  "主机专属值覆盖项目通用值；敏感值不写入 SQLite。":
+    "Host-specific values override shared project values. Secrets are not stored in SQLite.",
+  配置范围: "Scope",
+  项目通用: "Project-wide",
+  敏感: "Secret",
+  切换掩码: "Toggle visibility",
+  "部署时写入远端 .env（权限 600），不纳入镜像。原型不保存输入值，请勿输入真实密钥。":
+    "Written to the remote .env with mode 600 at deployment, not included in the image. This prototype does not save values. Do not enter real secrets.",
+  "关闭敏感标记后，实际客户端将以非秘密配置写入 SQLite。原型不会保存此值。":
+    "Disabling the secret flag stores this as non-secret SQLite configuration in the desktop app. The prototype does not save this value.",
+  "变量名为空、格式不正确、重复或使用保留键 DEVINGPANEL_IMAGE。":
+    "A variable name is empty, invalid, duplicated, or uses the reserved DEVINGPANEL_IMAGE key.",
+  "已验证变量格式；原型不保存敏感值，输入已清空。":
+    "Variable format validated. The prototype does not save secrets; input values were cleared.",
+  "已切换配置范围；原型不保存变量值。":
+    "Scope changed. The prototype does not save variable values.",
+  目标主机: "Target hosts",
+  "只能选择同一主机组内的主机。": "Select hosts from a single group.",
+  "发布时按列表顺序逐台部署，健康检查通过后进入下一台；并行度大于 1 时按批处理。":
+    "Deploy in list order and wait for health checks before continuing. Concurrency above 1 deploys in batches.",
+  顺序: "Order",
+  选择: "Select",
+  "目标主机已保存。": "Target hosts saved.",
+  发布历史: "Deployment history",
+  目标主机数: "Target hosts",
+  "每页 20 条 · 共": "20 per page · Total: ",
+  "条 · 第": " · Page ",
+  页: "",
+  上一页: "Previous",
+  下一页: "Next",
+  执行: "Run",
+  历史: "History",
+  先创建项目: "Create a project first",
+  并行度: "Concurrency",
+  已选: "Selected: ",
+  台: " hosts",
+  更改: "Change",
+  开始发布: "Start deployment",
+  终止: "Terminate",
+  "需要项目配置完整、至少一台目标主机且 Docker 可用":
+    "Requires a complete project, at least one target host and local Docker",
+  上次发布结果: "Previous deployment result",
+  发布进度总览: "Deployment progress",
+  "Registry · 按架构 push，按主机 pull":
+    "Registry · Push per architecture, pull per host",
+  "SSH 直连 · save → SFTP → load": "Direct SSH · save → SFTP → load",
+  本地构建: "Local build",
+  "构建前：校验 Compose 路径、禁止远端 build、主机架构及本地能力。":
+    "Before build: check Compose paths, disallow remote builds, and verify host architectures and local capabilities.",
+  "构建后：校验有效 HEALTHCHECK 和每台主机的目标镜像 tag。":
+    "After build: verify effective HEALTHCHECK and each host's target image tag.",
+  健康: "Healthy",
+  未验证: "Unverified",
+  失败: "Failed",
+  待处理: "Pending",
+  阶段: "Stage",
+  进度: "Progress",
+  查看原因: "View reason",
+  重试该主机: "Retry host",
+  跳过此台继续: "Skip and continue",
+  重新核实状态: "Verify remote state",
+  构建日志: "Build log",
+  "演示日志 · 不包含环境变量值": "Demo log · No environment variable values",
+  复制日志: "Copy log",
+  "等待开始发布…": "Waiting to deploy…",
+  等待: "Waiting",
+  等待发布: "Waiting to deploy",
+  构建中: "Building",
+  完成: "Complete",
+  传输中: "Transferring",
+  部署中: "Deploying",
+  健康检查中: "Checking health",
+  成功: "Succeeded",
+  健康成功: "Healthy",
+  "已启动，未验证就绪": "Started; readiness unverified",
+  待核实: "Unverified",
+  已跳过: "Skipped",
+  已终止: "Terminated",
+  已暂停: "Paused",
+  进行中: "In progress",
+  发布进行中: "Deployment in progress",
+  未执行: "Not started",
+  "SFTP 传输": "SFTP transfer",
+  拉取镜像: "Pulling image",
+  "等待 Docker HEALTHCHECK": "Waiting for Docker HEALTHCHECK",
+  用户跳过: "Skipped by user",
+  重试传输: "Retrying transfer",
+  "容器 running": "Container running",
+  健康检查超时: "Health check timed out",
+  容器启动失败: "Container failed to start",
+  "SSH 断开，远端结果未知": "SSH disconnected; remote result unknown",
+  "已核实：容器未就绪": "Verified: container not ready",
+  核实后确认容器未就绪: "Verification confirmed the container is not ready",
+  部分完成: "Partially completed",
+  结果待核实: "Result unverified",
+  "请完善项目配置、选择目标主机并启用本地 Docker。":
+    "Complete the project, select target hosts and enable local Docker.",
+  "目标平台与所选主机架构不匹配，未开始构建或传输。":
+    "The target platform does not match the selected hosts. No build or transfer started.",
+  "有目标主机离线，请先测试连接或取消选择。":
+    "A target host is offline. Test its connection or deselect it.",
+  "发布标识只能包含字母、数字、下划线、点和连字符，长度不超过 111。":
+    "Release IDs must be at most 111 characters using letters, numbers, underscores, dots or hyphens.",
+  "发布标识已存在，不允许覆盖历史版本。":
+    "This release ID already exists. Historical releases cannot be overwritten.",
+  "P0 仅支持单主机发布，请选择一台。":
+    "P0 supports single-host deployment. Select one host.",
+  "P0 仅支持单台 VPS。": "P0 supports one VPS only.",
+  "在开发机校验并构建镜像…": "Validating and building the image locally…",
+  "构建后预检通过，准备分发镜像。":
+    "Post-build checks passed. Preparing image distribution.",
+  构建后预检失败: "Post-build checks failed",
+  "多主机发布必须提供有效 HEALTHCHECK，所有主机保持等待，未开始传输。":
+    "Multi-host deployments require an effective HEALTHCHECK. All hosts remain waiting; no transfer has started.",
+  "按架构推送到 Registry：": "Pushing each architecture to the registry: ",
+  "结果待核实；核实前不可重试或跳过。":
+    "Result unknown. Verify remote state before retrying or skipping.",
+  "发布暂停；已启动任务继续至可确认状态。":
+    "Deployment paused. Already-started tasks continue until their state can be confirmed.",
+  "继续发布，不重新构建镜像。":
+    "Continuing deployment without rebuilding the image.",
+  "发布配置已锁定。": "Deployment configuration is locked.",
+  选择目标主机: "Select target hosts",
+  "项目绑定的同组主机，可调整发布顺序。":
+    "Hosts bound to this project in the same group. You can change their deployment order.",
+  "终止发布？": "Terminate deployment?",
+  终止发布: "Terminate deployment",
+  "不再启动新任务；已在运行的任务完成状态核实后展示。已成功主机不会自动回滚。":
+    "No new tasks will start. Running tasks will be verified before reporting results. Successful hosts will not be rolled back automatically.",
+  "终止请求已接受，等待正在执行的任务达到可确认状态。":
+    "Termination requested. Waiting for active tasks to reach a verifiable state.",
+  失败原因: "Failure reason",
+  "模拟容器启动失败：端口 8080 已被占用。请核查远端容器与 Compose 状态后重试。":
+    "Simulated startup failure: port 8080 is in use. Verify the remote container and Compose state before retrying.",
+  "远端状态已核实（演示），等待其余已启动任务完成。":
+    "Remote state verified (demo). Waiting for other active tasks to finish.",
+  "远端状态已核实（演示），可重试或跳过。":
+    "Remote state verified (demo). You can retry or skip.",
+  "日志已复制。": "Log copied.",
+  "浏览器不允许访问剪贴板，请选中日志手动复制。":
+    "Clipboard access is unavailable. Select and copy the log manually.",
+  发布详情: "Deployment details",
+  "阶段：": "Stage: ",
+  "原因：": "Reason: ",
+  "审计：": "Audit: ",
+  "· SSH 部署 · 演示记录": "· SSH deployment · Demo record ",
+  "· 耗时": "· Duration: ",
+  "健康成功 · 耗时": "healthy · Duration: ",
+  "健康检查超过 120s 未就绪。":
+    "The container did not become healthy within 120 seconds.",
+  回滚: "Roll back",
+  回滚已更新主机: "Roll back updated hosts",
+  "当前版本 → 上一版本": "Current → Previous release",
+  可回滚状态: "Rollback availability",
+  "逐台恢复镜像、Compose 与环境配置，再检查健康状态。每台主机独立选择上一已完成版本。":
+    "Restore image, Compose and environment per host, then check health. Each host uses its own previous completed release.",
+  "历史版本若无 HEALTHCHECK，恢复后仍标记“已启动，未验证就绪”。原型不会执行真实回滚。":
+    "A release without HEALTHCHECK remains marked as started with unverified readiness after restore. This prototype performs no real rollback.",
+  确认回滚: "Confirm rollback",
+  "仅保留当前版本，无法回滚":
+    "Only the current release is retained; rollback unavailable",
+  "项目已删除，无法回滚": "Project deleted; rollback unavailable",
+  "该主机发布中或待核实，不能回滚":
+    "Host is deploying or awaiting verification; rollback unavailable",
+  主机已删除: "Host deleted",
+  "主机离线，无法核实": "Host offline; verification unavailable",
+  仅保留当前版本: "Only the current release is retained",
+  无上一已完成版本: "No previous completed release",
+  本次未更新此主机: "This host was not updated in this deployment",
+  所选记录不是当前版本: "The selected record is not the current release",
+  "材料完整（演示）": "Restore data complete (demo)",
+  "请选择具有完整历史材料的可回滚主机。":
+    "Select a host with complete historical data that can be rolled back.",
+  演示回滚完成: "Demo rollback complete",
+  "演示回滚完成：": "Demo rollback completed: ",
+  "，真实 VPS 未发生变化。": "; the real VPS was not changed.",
+  "演示发布：": "Demo deployment: ",
+  清理磁盘: "Clean up disk",
+  "每 10s 刷新 · 原型使用演示数据": "Refresh every 10s · Sample data only",
+  暂无容器或镜像: "No containers or images",
+  "主机 SSH 不可达": "Host unreachable over SSH",
+  重试: "Retry",
+  "仓库名:tag": "Repository:tag",
+  大小: "Size",
+  创建时间: "Created",
+  未使用标记: "Usage",
+  "当前运行，受保护": "Running; protected",
+  "保留版本，受保护": "Retained release; protected",
+  未使用: "Unused",
+  受发布保留策略保护: "Protected by the release retention policy",
+  清理悬空镜像: "Prune dangling images",
+  端口: "Ports",
+  日志: "Logs",
+  启动: "Start",
+  停止: "Stop",
+  重启: "Restart",
+  跟随: "Follow",
+  回到底部: "Scroll to bottom",
+  "仅显示最近 1000 行 (docker logs) · 演示日志":
+    "Last 1,000 lines (docker logs) · Demo log",
+  确认容器操作: "Confirm container action",
+  "此容器？可能中断服务。": " this container? This may interrupt service.",
+  "容器操作完成（仅演示）。": "Container action completed (demo only).",
+  "删除镜像？": "Delete image?",
+  将删除: "Delete ",
+  "。当前运行与保留版本受到保护。":
+    ". Running and retained releases are protected.",
+  "镜像已删除（演示）。": "Image deleted (demo).",
+  "清理悬空镜像？": "Prune dangling images?",
+  "仅清理未使用的悬空镜像，不删除受保护的发布版本。":
+    "Only unused dangling images will be pruned. Protected releases will not be deleted.",
+  确认清理: "Confirm cleanup",
+  "docker system df · 演示预估": "docker system df · Demo estimate",
+  资源: "Resource",
+  预估可回收: "Estimated reclaimable",
+  悬空镜像: "Dangling images",
+  停止容器: "Stopped containers",
+  未使用网络: "Unused networks",
+  构建缓存: "Build cache",
+  "这是全局 Docker 清理，可能删除其他项目的停止容器、未使用网络及缓存。估值不等于实际释放空间。不清理卷。":
+    "This is a global Docker cleanup. It may remove other projects' stopped containers, unused networks and caches. Estimates differ from actual reclaimed space. Volumes are not removed.",
+  继续: "Continue",
+  "确认全局 Docker 清理": "Confirm global Docker cleanup",
+  "此操作可能影响其他项目。发布历史镜像清理请使用设置中的独立入口。":
+    "This may affect other projects. Use the separate Settings action for managed release cleanup.",
+  "演示清理完成：实际释放 308 MB（模拟数据）。":
+    "Demo cleanup complete: 308 MB reclaimed (simulated).",
+  "按每项目 / 每主机计算已完成版本，保护当前运行与可回滚版本。":
+    "Retain completed releases per project and host, protecting running and rollback versions.",
+  已完成版本保留数: "Completed releases to retain",
+  自定义: "Custom",
+  自定义数量: "Custom count",
+  "仅保留当前版本，该主机无法回滚到上一版本。":
+    "Only the current release will be retained. This host cannot roll back to a previous release.",
+  自动清理: "Automatic cleanup",
+  客户端在线时每日检查: "Checked daily while the client is online",
+  "最近检查：2026-10-24 09:00 · 下次：2026-10-25 09:00":
+    "Last check: 2026-10-24 09:00 · Next: 2026-10-25 09:00",
+  "离线期间将在下次启动 / 重连时补查，不安装 VPS 定时任务。":
+    "Missed checks run on the next startup or reconnect. No scheduled task is installed on the VPS.",
+  立即清理托管的历史镜像: "Clean up managed release images",
+  "未配置时使用 SSH 直连传输镜像；配置后发布时改为 push + 远端 pull。":
+    "Use direct SSH transfer when no registry is configured; otherwise push locally and pull remotely.",
+  "Registry 地址": "Registry address",
+  访问令牌: "Access token",
+  "实际客户端使用系统凭据管理器；原型不保存认证信息。":
+    "The desktop client uses the OS credential manager. This prototype does not save credentials.",
+  测试登录: "Test login",
+  "仅客户端在线时采样与通知。":
+    "Sample and notify only while the client is online.",
+  "阈值（%）": "threshold (%)",
+  持续时长: "Duration",
+  "1 分钟": "1 minute",
+  "5 分钟": "5 minutes",
+  "10 分钟": "10 minutes",
+  "以下路径及检测结果均为演示。":
+    "Paths and detection results below are examples.",
+  重新检测: "Detect again",
+  打开所在文件夹: "Open folder",
+  "操作系统凭据管理器（敏感值不写入 SQLite）":
+    "OS credential manager (secrets are not stored in SQLite)",
+  打开日志文件夹: "Open audit log folder",
+  清理托管历史镜像: "Clean up managed release images",
+  "只清理超过保留数的版本，不执行 docker system prune。":
+    "Only releases beyond the retention limit are cleaned up. docker system prune is not used.",
+  待清理版本: "Release to remove",
+  "受保护 / 跳过": "Protected / Skipped",
+  预估空间: "Estimated space",
+  当前运行及保留版本: "Running and retained releases",
+  "离线，待重连": "Offline; awaiting reconnect",
+  "同步删除退出保留期版本的 Compose 与 .env 目录；保留当前运行及可回滚版本。":
+    "Also remove expired releases' Compose and .env directories. Running and rollback releases are protected.",
+  "演示清理：": "Demo cleanup: ",
+  "台成功，": " hosts succeeded; ",
+  "台离线待重试。": " hosts offline, awaiting retry.",
+  "请填写 Registry 地址。": "Enter a registry address.",
+  "模拟登录成功；原型未验证凭据，也未保存令牌。":
+    "Simulated login succeeded. Credentials were not verified and the token was not saved.",
+  "检测完成：Docker 可用（演示）。":
+    "Detection complete: Docker available (demo).",
+  "未检测到 Docker，请查看安装指引。":
+    "Docker not detected. See the setup guide.",
+  "本地 Docker 环境": "Local Docker environment",
+  "Windows：安装并启动 Docker Desktop。":
+    "Windows: install and start Docker Desktop.",
+  "macOS：安装 Docker Desktop 或 OrbStack。":
+    "macOS: install Docker Desktop or OrbStack.",
+  "Linux：安装 Docker Engine 与 Compose 插件。":
+    "Linux: install Docker Engine and the Compose plugin.",
+  "此页面仅演示环境状态，不执行本机检测。":
+    "This page demonstrates environment status; it does not detect local software.",
+  "浏览器原型不支持打开系统文件夹；桌面客户端将调用原生文件管理器。":
+    "This browser prototype cannot open system folders. The desktop client will use the native file manager.",
+  "保留策略已更新（演示）。": "Retention policy updated (demo).",
+  "仓库用户名已更新（仅演示）。": "Registry username updated (demo).",
+  "传输方式已更新（演示）。": "Transfer mode updated (demo).",
+  "告警配置已更新（演示，不发送系统通知）。":
+    "Alert settings updated (demo; no system notifications are sent).",
+  "仅改变演示状态，不连接任何真实服务。":
+    "Changes demo state only; no real services are contacted.",
+  迭代阶段: "Product stage",
+  "P0 · 单机发布 MVP": "P0 · Single-host MVP",
+  "P1 · 多机 / 监控 / 容器": "P1 · Multi-host / Monitoring / Containers",
+  "P2 · 趋势 / 告警": "P2 · Trends / Alerts",
+  页面状态: "Page state",
+  正常: "Normal",
+  加载: "Loading",
+  空状态: "Empty",
+  错误: "Error",
+  发布情景: "Deployment scenario",
+  部署失败: "Deployment failure",
+  "SSH 断开 / 待核实": "SSH disconnect / Verification required",
+  "单主机无 HEALTHCHECK": "Single host without HEALTHCHECK",
+  "所有表格、进度和日志均为演示数据；刷新页面重置业务数据。":
+    "Tables, progress and logs use sample data. Refreshing resets session data.",
+  "发布尚未结束，暂不能切换演示情景。":
+    "Finish the deployment before changing the demo scenario.",
+  "加载失败：SSH 连接超时，请检查网络与主机地址。":
+    "Loading failed: SSH connection timed out. Check the network and host address.",
+  "备份客户端配置，不是 VPS 业务数据备份。":
+    "Back up client configuration, not VPS application data.",
+  备份加密密码: "Backup encryption password",
+  "已设置 · 仅本次会话": "Set · This session only",
+  "未设置，无法创建备份": "Not set; backup creation unavailable",
+  设置加密密码: "Set encryption password",
+  更改加密密码: "Change encryption password",
+  清除密码: "Clear password",
+  "密码不持久化，刷新后需重新设置。更改密码仅用于新备份，旧备份仍需旧密码；忘记密码无法找回。":
+    "The password is not persisted and must be set again after refresh. A changed password only applies to new backups; old backups still need their original password. Lost passwords cannot be recovered.",
+  本地备份: "Local backup",
+  "S3 备份": "S3 backup",
+  本地配置备份: "Local configuration backup",
+  "导出当前主机、项目及非秘密设置为密码加密的 JSON；导入时预览并整体替换本次会话中的配置。":
+    "Export hosts, projects and non-secret settings as password-encrypted JSON. Import previews and replaces this session's configuration.",
+  台主机: " hosts",
+  个项目: " projects",
+  "加密 JSON · AES-256-GCM": "Encrypted JSON · AES-256-GCM",
+  导出配置: "Export configuration",
+  选择文件导入: "Choose file to import",
+  "选择本地备份 JSON 文件": "Choose a local backup JSON file",
+  "最大 5 MB · 先输入密码解密校验，再预览确认；不接受明文文件。":
+    "Up to 5 MB · Enter the password, decrypt and validate, then confirm the preview. Plaintext files are not accepted.",
+  "S3 页面为交互演示：不会连接云端或上传数据，备份记录仅保留在当前浏览器会话中，刷新后消失。请勿填写真实凭据。":
+    "S3 is an interactive demo: no cloud connections or uploads. Records exist only in this browser session and disappear on refresh. Do not enter real credentials.",
+  "Prefix（可选）": "Prefix (optional)",
+  演示中无需真实凭据: "No real credentials needed for the demo",
+  "不保存、不导出": "Not saved or exported",
+  "使用 Path-style 寻址（S3 兼容服务）":
+    "Use path-style addressing (S3-compatible services)",
+  "测试连接（演示）": "Test connection (demo)",
+  "创建备份（演示）": "Create backup (demo)",
+  请先完成演示连接测试: "Complete the demo connection test first",
+  "非秘密配置即改即存于当前会话。凭据仅作为输入展示，测试后立即清空。":
+    "Non-secret settings update immediately for this session. Credentials are input-only and are cleared after testing.",
+  "S3 备份记录": "S3 backup records",
+  "本地模拟记录，不是云端对象列表":
+    "Local simulated records, not a cloud object listing",
+  "时间（北京时间）": "Time (Beijing)",
+  "Bucket / 对象路径": "Bucket / Object key",
+  "已加密 · 仅本地模拟": "Encrypted · Local demo only",
+  下载: "Download",
+  预览恢复: "Preview restore",
+  "发布未结束，暂不能恢复": "Finish the deployment before restoring",
+  "发布未结束，暂不能导入": "Finish the deployment before importing",
+  删除演示记录: "Delete demo record",
+  暂无备份记录: "No backup records",
+  "设置加密密码并完成连接演示后，可创建一份加密配置快照。":
+    "Set an encryption password and complete the demo connection test to create an encrypted snapshot.",
+  "发布运行中、暂停或待核实时，禁止导入和恢复；仍可导出配置。":
+    "Import and restore are blocked while a deployment is running, paused or awaiting verification. Configuration export is still available.",
+  "备份必须使用密码加密（AES-256-GCM）。不包含 SSH 密码/私钥、Registry/S3 凭据、环境变量值、构建参数值、镜像、卷、发布历史或回滚材料。加密密码不写入文件，忘记密码无法恢复。":
+    "Backups require password encryption (AES-256-GCM). SSH passwords/keys, registry/S3 credentials, variable and build argument values, images, volumes, history and rollback data are excluded. The password is not stored in the file. A lost password makes recovery impossible.",
+  "格式 v": "Format v",
+  "（北京时间）": " (Beijing time)",
+  "来源：": "Source: ",
+  "（本地模拟）": " (local demo)",
+  导入配置预览: "Import preview",
+  查看将恢复的配置: "Review configuration to restore",
+  类型: "Type",
+  说明: "Description",
+  台目标主机: " target hosts",
+  将整体替换当前: "This replaces the current ",
+  "台主机、": " hosts, ",
+  "个项目及非秘密设置，并清空":
+    " projects and non-secret settings, and clears ",
+  "条当前演示发布历史和容器列表。不合并配置，不恢复任何服务器数据。":
+    " demo deployment records and the container list. Configuration is not merged; no server data is restored.",
+  "所有主机将重置为离线、未信任；项目标记待确认。需重新确认主机指纹、核对本地路径、补齐构建参数及凭据。":
+    "All hosts will be offline and untrusted; projects will require review. Verify fingerprints and local paths, then restore build arguments and credentials.",
+  我确认覆盖当前会话中的配置:
+    "I confirm replacing this session's configuration",
+  确认导入: "Confirm import",
+  主机配置: "Host configuration",
+  项目配置: "Project configuration",
+  设置备份加密密码: "Set backup encryption password",
+  加密密码: "Encryption password",
+  再次输入密码: "Confirm password",
+  "至少 8 个字符，建议使用较长且唯一的口令。仅保存在本次页面会话内，不写入配置或浏览器存储。忘记密码无法恢复备份。":
+    "Use at least 8 characters; a long, unique passphrase is recommended. It stays in this page session only, never in configuration or browser storage. A lost password cannot recover a backup.",
+  "更改不会重新加密已有备份，旧文件仍需原密码。":
+    "Changing the password does not re-encrypt existing backups. Old files still need their original password.",
+  设置密码: "Set password",
+  解密备份: "Decrypt backup",
+  "AES-256-GCM · PBKDF2-SHA-256 · 输入创建此备份时设置的密码。解密校验通过后才显示配置预览，不会自动覆盖。":
+    "AES-256-GCM · PBKDF2-SHA-256 · Enter the password used to create this backup. Configuration is shown only after authenticated decryption. Nothing is overwritten automatically.",
+  备份密码: "Backup password",
+  "忘记密码无法恢复；原型不保留此次输入的解密密码。":
+    "A lost password cannot be recovered. The prototype does not retain this decryption password.",
+  解密并预览: "Decrypt and preview",
+  "两次输入的密码不一致。": "The passwords do not match.",
+  "加密密码已设置，仅用于本次会话中新创建的备份。请妥善记住密码。":
+    "Encryption password set for new backups in this session. Keep the password safe.",
+  "本次会话的加密密码已清除；现有备份仍需原密码解密。":
+    "The session encryption password was cleared. Existing backups still need their original password.",
+  "解密校验中…": "Decrypting and verifying…",
+  导出本地配置: "Export local configuration",
+  "仅导出当前会话中的非秘密配置。环境变量值及所有构建参数值均不进入文件。":
+    "Only non-secret configuration is exported. Environment variable values and all build argument values are excluded.",
+  确认导出: "Confirm export",
+  "正在加密…": "Encrypting…",
+  "加密备份已交给浏览器下载；恢复时需要此次加密密码。":
+    "Encrypted backup sent to the browser for download. Restoring requires this encryption password.",
+  "配置已在当前演示会话中恢复。请重新验证主机并确认项目配置；真实 VPS 未发生变化。":
+    "Configuration restored in this demo session. Verify hosts and review project configuration. Real VPS instances were not changed.",
+  "模拟配置检查通过；未连接 S3、未验证访问权限，输入凭据已清空。":
+    "Simulated configuration check passed. S3 was not contacted and permissions were not verified. Credential inputs were cleared.",
+  "请先完成当前 S3 配置的演示连接测试。":
+    "Complete the demo connection test for this S3 configuration first.",
+  "已创建真实加密的本地演示快照，未上传 S3。刷新页面后演示记录将消失。":
+    "A genuinely encrypted local demo snapshot was created. Nothing was uploaded to S3; demo records disappear on refresh.",
+  "演示快照已交给浏览器下载。未访问 S3。":
+    "Demo snapshot sent to the browser for download. S3 was not contacted.",
+  "删除演示备份记录？": "Delete demo backup record?",
+  "仅移除当前浏览器内存中的记录，不会删除任何云端对象。":
+    "Only the in-memory browser record is removed. No cloud objects will be deleted.",
+  "演示备份记录已删除，云端未发生变化。":
+    "Demo backup record deleted. No cloud data was changed.",
+  "发布尚未结束，不能导入或恢复配置。":
+    "The deployment is not finished. Configuration cannot be imported or restored.",
+  "发布尚未结束，不能导入配置。":
+    "The deployment is not finished. Configuration cannot be imported.",
+  "发布尚未结束，不能恢复配置。":
+    "The deployment is not finished. Configuration cannot be restored.",
+  "备份格式错误：": "Invalid backup format: ",
+  文件: "File",
+  包含未知字段或敏感字段: "contains unknown or secret fields",
+  不能含凭据或查询参数: "must not contain credentials or query parameters",
+  重复: "is duplicated",
+  "主机 ID": "Host ID",
+  "项目 ID": "Project ID",
+  项目名称: "Project name",
+  "目标主机 ID": "Target host ID",
+  构建参数名称: "Build argument name",
+  项目引用了不存在的主机: "Project references a missing host",
+  项目目标主机不属于同一分组: "Project target hosts are not in the same group",
+  "备份文件不能超过 5 MB。": "Backup files must not exceed 5 MB.",
+  "文件不是有效的 JSON 备份。": "The file is not a valid JSON backup.",
+  "仅支持加密备份，不接受旧版明文 JSON。":
+    "Only encrypted backups are supported. Legacy plaintext JSON is not accepted.",
+  加密文件: "Encrypted file",
+  "加密密码须为 8–1024 个字符，建议使用较长且唯一的口令。":
+    "Use an encryption password of 8–1024 characters. A long, unique passphrase is recommended.",
+  "当前浏览器不支持安全加密，请使用 HTTPS 或本机 localhost 预览；不会退回明文备份。":
+    "Secure encryption is unavailable. Use HTTPS or the localhost preview. Plaintext fallback is not allowed.",
+  "当前浏览器不支持安全加密，不会退回明文备份。":
+    "Secure encryption is unavailable. Plaintext fallback is not allowed.",
+  "请输入此备份的加密密码（最多 1024 个字符）。":
+    "Enter this backup's encryption password (up to 1024 characters).",
+  "密码错误或备份文件已损坏，未恢复任何数据。":
+    "Incorrect password or damaged backup. No data was restored.",
+  加密头与内容不一致: "Encrypted header does not match the contents",
+  "Endpoint 必须是无凭据、查询参数和片段的 HTTPS 地址。":
+    "Endpoint must be an HTTPS URL without credentials, query parameters or a fragment.",
+  "请填写有效的 HTTPS Endpoint。": "Enter a valid HTTPS endpoint.",
+  "请填写 Region。": "Enter a region.",
+  "Bucket 应为 3–63 位小写字母、数字、点或连字符。":
+    "Bucket must contain 3–63 lowercase letters, digits, dots or hyphens.",
+  "Prefix 应为相对对象前缀，不能包含上级目录。":
+    "Prefix must be a relative object prefix without parent-directory segments.",
+  "[演示]": "[demo]",
+  "本地 Docker build 启动": "Local Docker build started",
+  "本地各架构 push": "Local push per architecture",
+  "本地构建完成；校验有效 HEALTHCHECK 与最终镜像 tag":
+    "Local build complete; verifying HEALTHCHECK and final image tags",
+  "校验 Compose 路径、镜像变量与目标平台":
+    "Checking Compose paths, image variables and target platforms",
+  镜像传输完成: "Image transfer completed",
+  "服务已就绪，监听 0.0.0.0:3000": "Service ready, listening on 0.0.0.0:3000",
+});
