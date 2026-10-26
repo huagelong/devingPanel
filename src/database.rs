@@ -38,7 +38,8 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
              image TEXT NOT NULL,
              tag_rule TEXT NOT NULL DEFAULT '{timestamp}',
              platform TEXT NOT NULL DEFAULT 'auto',
-             service TEXT NOT NULL DEFAULT ''
+             service TEXT NOT NULL DEFAULT '',
+             manifest_mode INTEGER NOT NULL DEFAULT 0
          );
          CREATE TABLE project_compose_files (
              project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -86,7 +87,7 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
          CREATE UNIQUE INDEX project_env_common_name ON project_env(project_id, name) WHERE host_id IS NULL;
          CREATE UNIQUE INDEX project_env_host_name ON project_env(project_id, host_id, name) WHERE host_id IS NOT NULL;
          CREATE TABLE pending_env_credentials (credential_id TEXT PRIMARY KEY);
-         PRAGMA user_version = 9;
+         PRAGMA user_version = 10;
          COMMIT;",
         ),
         1 => {
@@ -181,7 +182,8 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
              COMMIT;")?;
             initialize(conn)
         }
-        8 => conn.execute_batch(
+        8 => {
+            conn.execute_batch(
             "BEGIN;
              CREATE TABLE project_env (
                  id INTEGER PRIMARY KEY,
@@ -198,8 +200,16 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
              CREATE TABLE pending_env_credentials (credential_id TEXT PRIMARY KEY);
              PRAGMA user_version = 9;
              COMMIT;",
+            )?;
+            initialize(conn)
+        }
+        9 => conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE projects ADD COLUMN manifest_mode INTEGER NOT NULL DEFAULT 0;
+             PRAGMA user_version = 10;
+             COMMIT;",
         ),
-        9 => Ok(()),
+        10 => Ok(()),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }
@@ -222,7 +232,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         let name: String = conn
             .query_row("SELECT name FROM projects", [], |row| row.get(0))
             .unwrap();
@@ -241,7 +251,8 @@ mod tests {
     fn upgrades_version_five_without_touching_hosts() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE hosts (id INTEGER PRIMARY KEY, credential_id TEXT NOT NULL);
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY);
+             CREATE TABLE hosts (id INTEGER PRIMARY KEY, credential_id TEXT NOT NULL);
              INSERT INTO hosts (credential_id) VALUES ('retained-id');
              PRAGMA user_version = 5;",
         )
@@ -259,7 +270,8 @@ mod tests {
     fn upgrades_version_six_with_pending_credentials() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE hosts (id INTEGER PRIMARY KEY, credential_id TEXT NOT NULL, trusted_fingerprint TEXT);
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY);
+             CREATE TABLE hosts (id INTEGER PRIMARY KEY, credential_id TEXT NOT NULL, trusted_fingerprint TEXT);
              CREATE TABLE pending_credentials (credential_id TEXT PRIMARY KEY);
              INSERT INTO hosts (credential_id, trusted_fingerprint) VALUES ('live-id', 'SHA256:known');
              INSERT INTO pending_credentials VALUES ('orphan-id');
@@ -270,7 +282,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         let pending: String = conn
             .query_row("SELECT credential_id FROM pending_credentials", [], |row| {
                 row.get(0)
@@ -300,7 +312,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         conn.execute(
             "INSERT INTO project_hosts (project_id, host_id, ordinal) VALUES (3, 5, 0)",
             [],
@@ -326,11 +338,31 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         let host_id: i64 = conn
             .query_row("SELECT host_id FROM project_hosts", [], |row| row.get(0))
             .unwrap();
         assert_eq!(host_id, 5);
         conn.execute("INSERT INTO project_env (project_id, name, value, ordinal) VALUES (3, 'MODE', 'prod', 0)", []).unwrap();
+    }
+
+    #[test]
+    fn upgrades_version_nine_without_adopting_existing_projects() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY);
+             INSERT INTO projects VALUES (7);
+             PRAGMA user_version = 9;",
+        )
+        .unwrap();
+        initialize(&conn).unwrap();
+        let mode: i64 = conn
+            .query_row(
+                "SELECT manifest_mode FROM projects WHERE id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mode, 0);
     }
 }

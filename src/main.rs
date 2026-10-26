@@ -5,6 +5,7 @@ mod docker;
 mod env_store;
 mod host_store;
 mod preferences;
+mod project_config;
 mod project_store;
 mod release;
 mod ssh;

@@ -521,6 +521,8 @@ mod tests {
             missing_compose_files: Vec::new(),
             build_args: Vec::new(),
             host_ids: Vec::new(),
+            manifest_mode: false,
+            config_error: None,
         };
         let services = inspect_services(&project).unwrap();
         assert_eq!(services.len(), 1);

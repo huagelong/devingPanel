@@ -12,6 +12,18 @@ use std::sync::{
 };
 
 pub fn check_project_config(project: &Project, host_ids: &[i64]) -> Result<(), String> {
+    let current = if project.manifest_mode {
+        project_store::effective(project.id)?
+    } else {
+        project.clone()
+    };
+    let project = &current;
+    if project.manifest_mode && host_ids != project.host_ids {
+        return Err("YAML 项目的目标主机由开发者配置，不能在发布草稿中改动。".into());
+    }
+    if let Some(error) = &project.config_error {
+        return Err(format!("devingpanel.yaml 待修复：{error}"));
+    }
     if host_ids.is_empty() {
         return Err("请先选择目标主机。".into());
     }
@@ -242,6 +254,8 @@ mod tests {
             missing_compose_files: Vec::new(),
             build_args: Vec::new(),
             host_ids: vec![1],
+            manifest_mode: false,
+            config_error: None,
         }
     }
 

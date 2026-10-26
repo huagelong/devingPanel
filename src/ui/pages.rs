@@ -435,6 +435,7 @@ impl AppView {
                             view.hosts.insert(0, host);
                             view.host_loaded = true;
                             view.host_error = None;
+                            view.reload_project_configs(window, cx);
                             if active {
                                 view.page = Page::Hosts;
                                 view.host_id = None;
@@ -673,6 +674,7 @@ impl AppView {
                                     view.host_test_generation.wrapping_add(1);
                                 view.host_testing = None;
                             }
+                            view.reload_project_configs(window, cx);
                             cx.notify();
                             dialog.alive.get() && view.dialog_seq == dialog.seq
                         })
@@ -2289,6 +2291,15 @@ impl AppView {
         if id.is_some() && existing.is_none() {
             return;
         }
+        if existing.is_some_and(|project| project.manifest_mode) {
+            window.push_notification(
+                Notification::warning(
+                    "此项目由开发者维护 devingpanel.yaml，请编辑文件后重新读取。",
+                ),
+                cx,
+            );
+            return;
+        }
         self.dialog_seq = self.dialog_seq.wrapping_add(1);
         let dialog_seq = self.dialog_seq;
         let name = cx.new(|cx| {
@@ -2465,6 +2476,211 @@ impl AppView {
         .detach();
     }
 
+    fn import_configured_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picker = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择包含 devingpanel.yaml 的项目目录".into()),
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            let path = match picker.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                Ok(Ok(None)) => None,
+                Ok(Err(error)) => {
+                    let _ = cx.update(|window, app| {
+                        window.push_notification(Notification::error(error.to_string()), app)
+                    });
+                    None
+                }
+                Err(error) => {
+                    let _ = cx.update(|window, app| {
+                        window.push_notification(Notification::error(error.to_string()), app)
+                    });
+                    None
+                }
+            };
+            let Some(path) = path else { return };
+            let result = cx
+                .background_executor()
+                .spawn(async move { project_store::create_from_manifest(&path) })
+                .await;
+            let _ = cx.update(|window, app| match result {
+                Ok(project) => {
+                    let id = project.id;
+                    let _ = view.update(app, |view, cx| {
+                        view.projects.insert(0, project);
+                        view.project_loaded = true;
+                        view.project_error = None;
+                        view.select_project(id, window, cx);
+                    });
+                    window.push_notification(
+                        Notification::success("已导入 devingpanel.yaml；请核对发布就绪状态"),
+                        app,
+                    );
+                }
+                Err(error) => window.push_notification(Notification::error(error), app),
+            });
+        })
+        .detach();
+    }
+
+    fn reload_project_configs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { project_store::list() })
+                .await;
+            let _ = cx.update(|window, app| match result {
+                Ok(projects) => {
+                    let _ = view.update(app, |view, cx| {
+                        view.projects = projects;
+                        view.invalidate_compose_summary();
+                        if let Some(id) = view.project_id {
+                            view.build_form = view
+                                .projects
+                                .iter()
+                                .find(|project| project.id == id)
+                                .filter(|project| !project.manifest_mode)
+                                .map(|project| BuildForm::new(project, window, cx));
+                        }
+                        if let Some(id) = view.deploy_project_id {
+                            view.select_deploy_project(id, window, cx);
+                        }
+                        cx.notify();
+                    });
+                }
+                Err(error) => window.push_notification(Notification::error(error), app),
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_adopt_manifest(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if !self
+            .projects
+            .iter()
+            .any(|project| project.id == id && !project.manifest_mode)
+        {
+            return;
+        }
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm_view = view.clone();
+            dialog
+                .title("改用 devingpanel.yaml")
+                .w(px(520.))
+                .child(div().flex().flex_col().gap_3()
+                    .child("若项目目录已有 devingpanel.yaml，将读取并校验，绝不覆盖。否则从现有非秘密配置生成文件。")
+                    .child("Build args 会作为明文写入项目目录；请先确认其中没有密码或令牌。SSH 凭据及敏感环境变量不会写入文件。")
+                    .child("目标主机按 YAML 顺序重新绑定；移除绑定可能清理该主机的本地专属变量。迁移后项目构建、Compose 和目标主机设置由 YAML 唯一决定。"))
+                .footer(div().flex().justify_end().gap_2()
+                    .child(Button::new("adopt-cancel").label("取消")
+                        .on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("adopt-confirm").primary().label("确认迁移")
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let _ = confirm_view.update(cx, |view, cx| view.adopt_manifest(id, window, cx));
+                        })))
+        });
+    }
+
+    fn adopt_manifest(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { project_store::adopt_manifest(id) })
+                .await;
+            let _ = cx.update(|window, app| match result {
+                Ok((project, warning)) => {
+                    let _ = view.update(app, |view, cx| {
+                        if let Some(existing) = view.projects.iter_mut().find(|item| item.id == id)
+                        {
+                            *existing = project;
+                        }
+                        view.build_form = None;
+                        view.invalidate_compose_summary();
+                        if view.deploy_project_id == Some(id) {
+                            view.select_deploy_project(id, window, cx);
+                        }
+                        cx.notify();
+                    });
+                    window.push_notification(
+                        match warning {
+                            Some(warning) => Notification::warning(format!("已迁移；{warning}")),
+                            None => Notification::success("项目已改用 devingpanel.yaml"),
+                        },
+                        app,
+                    );
+                }
+                Err(error) => window.push_notification(Notification::error(error), app),
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_manifest_targets(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if !self
+            .projects
+            .iter()
+            .any(|project| project.id == id && project.manifest_mode)
+        {
+            return;
+        }
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm_view = view.clone();
+            dialog.title("确认 YAML 目标主机")
+                .w(px(520.))
+                .child(div().flex().flex_col().gap_3()
+                    .child("请先由管理员核对本机主机组、别名、SSH 凭据和指纹。")
+                    .child("确认后按 devingpanel.yaml 顺序绑定目标；取消旧绑定可能清理对应的本机主机专属环境变量。"))
+                .footer(div().flex().justify_end().gap_2()
+                    .child(Button::new("manifest-target-cancel").label("取消")
+                        .on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("manifest-target-confirm").primary().label("确认绑定")
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let _ = confirm_view.update(cx, |view, cx| view.sync_manifest_targets(id, window, cx));
+                        })))
+        });
+    }
+
+    fn sync_manifest_targets(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { project_store::confirm_manifest_targets(id) })
+                .await;
+            let _ = cx.update(|window, app| match result {
+                Ok((project, warning)) => {
+                    let _ = view.update(app, |view, cx| {
+                        if let Some(existing) = view.projects.iter_mut().find(|item| item.id == id)
+                        {
+                            *existing = project;
+                        }
+                        view.invalidate_compose_summary();
+                        if view.deploy_project_id == Some(id) {
+                            view.select_deploy_project(id, window, cx);
+                        }
+                        cx.notify();
+                    });
+                    window.push_notification(
+                        match warning {
+                            Some(warning) => {
+                                Notification::warning(format!("目标已更新；{warning}"))
+                            }
+                            None => Notification::success("YAML 目标主机已核对"),
+                        },
+                        app,
+                    );
+                }
+                Err(error) => window.push_notification(Notification::error(error), app),
+            });
+        })
+        .detach();
+    }
+
     fn save_project(
         &mut self,
         id: Option<i64>,
@@ -2548,12 +2764,22 @@ impl AppView {
             .child(Icon::new(assets::IconName::Folder).size(px(24.)))
             .child(title)
             .child(
-                Button::new("project-empty-add")
-                    .primary()
-                    .label("新建项目")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_project_dialog(None, window, cx)
-                    })),
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("project-empty-import")
+                            .primary()
+                            .label("导入已配置项目")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.import_configured_project(window, cx)
+                            })),
+                    )
+                    .child(Button::new("project-empty-add").label("新建项目").on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.open_project_dialog(None, window, cx)
+                        }),
+                    )),
             )
     }
 
@@ -2571,12 +2797,24 @@ impl AppView {
             .child(
                 self.page_head(
                     "项目",
-                    Button::new("project-new")
-                        .primary()
-                        .label("＋ 新建项目")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_project_dialog(None, window, cx)
-                        })),
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Button::new("project-import-config")
+                                .label("导入已配置项目")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.import_configured_project(window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("project-new")
+                                .primary()
+                                .label("＋ 新建项目")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_project_dialog(None, window, cx)
+                                })),
+                        ),
                 ),
             )
             .child(if !self.project_loaded {
@@ -2652,15 +2890,35 @@ impl AppView {
                             .flex()
                             .items_center()
                             .gap_1()
-                            .text_color(self.palette().warning)
-                            .child(div().size(px(7.)).rounded_full().bg(self.palette().warning))
-                            .child("待完善"),
+                            .text_color(
+                                if project.manifest_mode && project.config_error.is_none() {
+                                    self.palette().success
+                                } else {
+                                    self.palette().warning
+                                },
+                            )
+                            .child(div().size(px(7.)).rounded_full().bg(
+                                if project.manifest_mode && project.config_error.is_none() {
+                                    self.palette().success
+                                } else {
+                                    self.palette().warning
+                                },
+                            ))
+                            .child(if project.manifest_mode {
+                                if project.config_error.is_some() {
+                                    "需管理员处理"
+                                } else {
+                                    "配置已读取"
+                                }
+                            } else {
+                                "待完善"
+                            }),
                     )
                     .child(
                         Button::new(("project-deploy", id as usize))
                             .primary()
                             .label("发布")
-                            .tooltip("请先完善 Compose、部署服务和目标主机")
+                            .tooltip("发布执行链尚未完成，暂不可一键发布")
                             .disabled(true),
                     )
                     .child(self.project_actions(id, cx)),
@@ -4332,6 +4590,63 @@ impl AppView {
                     .on_click(cx.listener(|view, _, window, cx| view.save_environment(window, cx))))))
     }
 
+    fn manifest_panel(&self, project: &Project) -> AnyElement {
+        if let Some(error) = &project.config_error {
+            return self
+                .panel(
+                    "项目配置待修复",
+                    "请联系技术人员修复项目文件，或由管理员预先配置目标主机与凭据。",
+                    div()
+                        .px_6()
+                        .pb_6()
+                        .text_color(self.palette().destructive)
+                        .child(error.clone()),
+                )
+                .into_any_element();
+        }
+        let (title, content) = match self.project_tab {
+            ProjectTab::Build => (
+                "构建配置",
+                format!(
+                    "镜像：{}  ·  Tag：{}  ·  平台：{}  ·  Dockerfile：{}  ·  Build args：{} 项  ·  部署服务：{}",
+                    project.image,
+                    project.tag_rule,
+                    project.platform,
+                    project.dockerfile,
+                    project.build_args.len(),
+                    project.service
+                ),
+            ),
+            ProjectTab::Compose => (
+                "Compose",
+                format!("按顺序合并：{}", project.compose_files.join("  →  ")),
+            ),
+            ProjectTab::Targets => (
+                "目标主机",
+                format!(
+                    "按顺序发布：{}",
+                    project
+                        .host_ids
+                        .iter()
+                        .filter_map(|id| self
+                            .hosts
+                            .iter()
+                            .find(|host| host.id == *id)
+                            .map(|host| format!("{}/{}", host.group, host.name)))
+                        .collect::<Vec<_>>()
+                        .join("  →  ")
+                ),
+            ),
+            _ => ("项目配置", String::new()),
+        };
+        self.panel(
+            title,
+            "配置由项目目录的 devingpanel.yaml 提供；此处只读。",
+            div().px_6().pb_6().whitespace_normal().child(content),
+        )
+        .into_any_element()
+    }
+
     fn project_detail(
         &self,
         project: &Project,
@@ -4383,6 +4698,11 @@ impl AppView {
             ),
         );
         let body = match self.project_tab {
+            ProjectTab::Build | ProjectTab::Compose | ProjectTab::Targets
+                if project.manifest_mode =>
+            {
+                self.manifest_panel(project)
+            }
             ProjectTab::Build => self.build_panel(project, narrow, cx),
             ProjectTab::Compose => self.compose_panel(project, cx),
             ProjectTab::Environment => self.environment_panel(project, cx).into_any_element(),
@@ -4410,12 +4730,71 @@ impl AppView {
                     Button::new("project-release")
                         .primary()
                         .label("发布")
+                        .disabled(project.config_error.is_some())
                         .on_click(cx.listener(move |view, _, window, cx| {
                             view.navigate(Page::Deploy, window, cx);
                             if view.deploy_project_id != Some(release_project_id) {
                                 view.select_deploy_project(release_project_id, window, cx);
                             }
                         })),
+                ),
+            )
+            .child(
+                self.panel(
+                    if project.manifest_mode {
+                        "devingpanel.yaml"
+                    } else {
+                        "项目配置来源"
+                    },
+                    if project.manifest_mode {
+                        "开发者维护的非秘密发布方案"
+                    } else {
+                        "当前为本机表单配置，可明确迁移到项目文件"
+                    },
+                    div()
+                        .px_6()
+                        .pb_6()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .gap_3()
+                        .child(if let Some(error) = &project.config_error {
+                            format!("配置待修复：{error}")
+                        } else if project.manifest_mode {
+                            format!(
+                                "配置已读取 · {} 台目标主机 · 发布前仍需完整预检",
+                                project.host_ids.len()
+                            )
+                        } else {
+                            "开发者可以将项目配置交付为 devingpanel.yaml。".into()
+                        })
+                        .child(if project.manifest_mode {
+                            Button::new("manifest-reload")
+                                .label("重新读取配置")
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.reload_project_configs(window, cx)
+                                }))
+                        } else {
+                            let id = project.id;
+                            Button::new("manifest-adopt")
+                                .label("改用 devingpanel.yaml")
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    view.confirm_adopt_manifest(id, window, cx)
+                                }))
+                        })
+                        .when(
+                            project.manifest_mode && project.config_error.is_some(),
+                            |el| {
+                                let id = project.id;
+                                el.child(
+                                    Button::new("manifest-targets-confirm")
+                                        .label("管理员确认目标绑定")
+                                        .on_click(cx.listener(move |view, _, window, cx| {
+                                            view.confirm_manifest_targets(id, window, cx)
+                                        })),
+                                )
+                            },
+                        ),
                 ),
             )
             .child(tab_row)
@@ -4549,8 +4928,12 @@ impl AppView {
             .iter()
             .find(|project| project.id == project_id)
         {
-            self.deploy_host_ids
-                .retain(|id| project.host_ids.contains(id));
+            if project.manifest_mode {
+                self.deploy_host_ids = project.host_ids.clone();
+            } else {
+                self.deploy_host_ids
+                    .retain(|id| project.host_ids.contains(id));
+            }
             self.deploy_parallel = self.deploy_parallel.min(self.deploy_host_ids.len().max(1));
         }
         self.refresh_deploy_environment(cx);
@@ -4784,6 +5167,13 @@ impl AppView {
         else {
             return;
         };
+        if project.manifest_mode {
+            window.push_notification(
+                Notification::warning("YAML 项目的目标顺序由开发者预设。"),
+                cx,
+            );
+            return;
+        }
         let bound = project.host_ids.clone();
         let hosts = self.hosts.clone();
         let draft = Rc::new(RefCell::new(self.deploy_host_ids.clone()));
@@ -5140,6 +5530,7 @@ impl AppView {
                     .h(px(36.))
                     .w_full()
                     .outline()
+                    .disabled(project.manifest_mode)
                     .label(format!("{}  ▾", self.deploy_parallel)),
             )
             .content(move |_, _, cx| {
@@ -5232,9 +5623,10 @@ impl AppView {
                         .child("目标主机")
                         .child(div().h(px(36.)).flex().items_center().gap_2()
                             .child(format!("已选 {} 台", ids.len()))
-                            .child(Button::new("deploy-targets-change").label("更改")
+                            .when(project.manifest_mode, |el| el.child("YAML 预设"))
+                            .when(!project.manifest_mode, |el| el.child(Button::new("deploy-targets-change").label("更改")
                                 .disabled(project.host_ids.is_empty())
-                                .on_click(cx.listener(|view, _, window, cx| view.open_deploy_targets_dialog(window, cx))))))
+                                .on_click(cx.listener(|view, _, window, cx| view.open_deploy_targets_dialog(window, cx)))))))
                     .child(div().w(px(75.)).child(Self::form_field("并行度", parallel_selector)))
                     .child(Button::new("start-deploy").primary().label("开始发布").tooltip("SSH 发布链路与执行尚未接入").disabled(true)),
             )
@@ -7243,6 +7635,8 @@ mod release_tag_tests {
             missing_compose_files: Vec::new(),
             build_args: Vec::new(),
             host_ids: Vec::new(),
+            manifest_mode: false,
+            config_error: None,
         };
         let tag = generate_release_tag(&project).unwrap();
         assert_eq!(tag.len(), 16);

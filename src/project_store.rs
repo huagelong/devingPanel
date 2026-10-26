@@ -1,6 +1,7 @@
 use crate::database::connect;
 use crate::env_store;
 use crate::host_store::with_credential_lock;
+use crate::project_config;
 use rusqlite::{Connection, Row, params};
 use std::path::{Component, Path, PathBuf};
 
@@ -18,6 +19,8 @@ pub struct Project {
     pub missing_compose_files: Vec<String>,
     pub build_args: Vec<(String, String)>,
     pub host_ids: Vec<i64>,
+    pub manifest_mode: bool,
+    pub config_error: Option<String>,
 }
 
 pub struct BuildConfig {
@@ -78,12 +81,14 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
         missing_compose_files: Vec::new(),
         build_args: Vec::new(),
         host_ids: Vec::new(),
+        manifest_mode: row.get::<_, i64>(8)? != 0,
+        config_error: None,
     })
 }
 
 fn list_in(conn: &Connection) -> rusqlite::Result<Vec<Project>> {
     let mut stmt =
-        conn.prepare("SELECT id, name, path, dockerfile, image, tag_rule, platform, service FROM projects ORDER BY id DESC")?;
+        conn.prepare("SELECT id, name, path, dockerfile, image, tag_rule, platform, service, manifest_mode FROM projects ORDER BY id DESC")?;
     let mut projects: Vec<Project> = stmt
         .query_map([], project_from_row)?
         .collect::<rusqlite::Result<_>>()?;
@@ -141,7 +146,193 @@ fn list_in(conn: &Connection) -> rusqlite::Result<Vec<Project>> {
 }
 
 pub fn list() -> Result<Vec<Project>, String> {
-    list_in(&connect()?).map_err(|err| err.to_string())
+    let mut projects = list_in(&connect()?).map_err(|err| err.to_string())?;
+    if projects.iter().any(|project| project.manifest_mode) {
+        let (hosts, _) = crate::host_store::list()?;
+        for project in projects.iter_mut().filter(|project| project.manifest_mode) {
+            let config = resolve_manifest_project(project, &hosts);
+            match config {
+                Ok(effective) => *project = effective,
+                Err(error) => {
+                    project.dockerfile.clear();
+                    project.image.clear();
+                    project.tag_rule.clear();
+                    project.platform.clear();
+                    project.service.clear();
+                    project.compose_files.clear();
+                    project.build_args.clear();
+                    project.host_ids.clear();
+                    project.config_error = Some(error);
+                }
+            }
+        }
+    }
+    Ok(projects)
+}
+
+pub fn effective(id: i64) -> Result<Project, String> {
+    let project = list()?
+        .into_iter()
+        .find(|project| project.id == id)
+        .ok_or("项目不存在。")?;
+    if let Some(error) = &project.config_error {
+        return Err(format!("devingpanel.yaml 待修复：{error}"));
+    }
+    Ok(project)
+}
+
+fn resolve_manifest_project(
+    project: &Project,
+    hosts: &[crate::host_store::Host],
+) -> Result<Project, String> {
+    let manifest = project_config::load(Path::new(&project.path))?;
+    let ids = project_config::resolve_targets(&manifest, hosts)?;
+    if ids != project.host_ids {
+        return Err("YAML 目标主机与本机绑定不同，请管理员确认目标变更。".into());
+    }
+    project_config::apply(project, &manifest, ids)
+}
+
+pub fn adopt_manifest(id: i64) -> Result<(Project, Option<String>), String> {
+    let conn = connect()?;
+    let project = list_in(&conn)
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .find(|project| project.id == id)
+        .ok_or("项目不存在。")?;
+    if project.manifest_mode {
+        return Err("项目已使用 devingpanel.yaml。".into());
+    }
+    let (hosts, _) = crate::host_store::list()?;
+    let path = Path::new(&project.path).join(project_config::FILE_NAME);
+    if !path.exists() {
+        project_config::export_legacy(&project, &hosts)?;
+    }
+    let manifest = project_config::load(Path::new(&project.path))?;
+    let host_ids = project_config::resolve_targets(&manifest, &hosts)?;
+    project_config::apply(&project, &manifest, host_ids.clone())?;
+    let warning = if project.host_ids != host_ids {
+        with_credential_lock(|| {
+            let mut conn = connect()?;
+            set_hosts_inner(
+                &mut conn,
+                id,
+                host_ids,
+                Some((&project.name, &project.path)),
+            )?;
+            Ok(())
+        })?;
+        env_store::cleanup_pending().unwrap_or_else(Some)
+    } else {
+        let changed = conn.execute(
+            "UPDATE projects SET manifest_mode = 1 WHERE id = ?1 AND manifest_mode = 0 AND name = ?2 AND path = ?3",
+            params![id, project.name, project.path],
+        ).map_err(|err| err.to_string())?;
+        if changed != 1 {
+            return Err("项目在迁移期间发生变化，请重新核对。".into());
+        }
+        None
+    };
+    let adopted = list()?
+        .into_iter()
+        .find(|project| project.id == id)
+        .ok_or("项目不存在。")?;
+    Ok((adopted, warning))
+}
+
+pub fn confirm_manifest_targets(id: i64) -> Result<(Project, Option<String>), String> {
+    let changed = with_credential_lock(|| {
+        let mut conn = connect()?;
+        let project = list_in(&conn)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .find(|project| project.id == id && project.manifest_mode)
+            .ok_or("YAML 项目不存在。")?;
+        let manifest = project_config::load(Path::new(&project.path))?;
+        let hosts = crate::host_store::list_in(&conn).map_err(|err| err.to_string())?;
+        let ids = project_config::resolve_targets(&manifest, &hosts)?;
+        project_config::apply(&project, &manifest, ids.clone())?;
+        if project.host_ids == ids {
+            return Ok(false);
+        }
+        set_hosts_inner(&mut conn, id, ids, None)?;
+        Ok(true)
+    })?;
+    let warning = if changed {
+        env_store::cleanup_pending().unwrap_or_else(Some)
+    } else {
+        None
+    };
+    Ok((effective(id)?, warning))
+}
+
+fn create_from_manifest_in(
+    conn: &Connection,
+    directory: &Path,
+    hosts: &[crate::host_store::Host],
+) -> Result<i64, String> {
+    let root = directory.canonicalize().map_err(|_| "项目目录不存在。")?;
+    let manifest = project_config::load(&root)?;
+    let host_ids = project_config::resolve_targets(&manifest, hosts).ok();
+    let path = root.to_string_lossy().into_owned();
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|err| err.to_string())?;
+    let changed = transaction
+        .execute(
+            "INSERT INTO projects (name, path, dockerfile, image, tag_rule, platform, service, manifest_mode)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, 1
+             WHERE NOT EXISTS (SELECT 1 FROM projects WHERE name = ?1 OR path = ?2)",
+            params![
+                manifest.name,
+                path,
+                manifest.dockerfile,
+                manifest.image,
+                manifest.tag_rule,
+                manifest.platform,
+                manifest.service
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+    if changed == 0 {
+        return Err("同名项目或项目目录已存在，请打开现有项目。".into());
+    }
+    let id = transaction.last_insert_rowid();
+    if let Some(host_ids) = host_ids {
+        for (ordinal, host_id) in host_ids.into_iter().enumerate() {
+            transaction
+                .execute(
+                    "INSERT INTO project_hosts (project_id, host_id, ordinal) VALUES (?1, ?2, ?3)",
+                    params![id, host_id, ordinal as i64],
+                )
+                .map_err(|err| err.to_string())?;
+        }
+    }
+    transaction.commit().map_err(|err| err.to_string())?;
+    Ok(id)
+}
+
+pub fn create_from_manifest(directory: &Path) -> Result<Project, String> {
+    let (hosts, _) = crate::host_store::list()?;
+    let id = create_from_manifest_in(&connect()?, directory, &hosts)?;
+    list()?
+        .into_iter()
+        .find(|project| project.id == id)
+        .ok_or("项目不存在。".into())
+}
+
+fn ensure_editable(conn: &Connection, id: i64) -> Result<(), String> {
+    let mode: i64 = conn
+        .query_row(
+            "SELECT manifest_mode FROM projects WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "项目不存在。")?;
+    if mode != 0 {
+        return Err("项目已使用 devingpanel.yaml；请编辑文件后重新校验。".into());
+    }
+    Ok(())
 }
 
 pub fn missing_compose_files(id: i64) -> Result<(Vec<String>, Vec<String>), String> {
@@ -183,10 +374,22 @@ fn create_in(conn: &Connection, input: NewProject) -> Result<Project, String> {
         missing_compose_files: Vec::new(),
         build_args: Vec::new(),
         host_ids: Vec::new(),
+        manifest_mode: false,
+        config_error: None,
     })
 }
 
 fn set_hosts_in(conn: &mut Connection, id: i64, host_ids: Vec<i64>) -> Result<Project, String> {
+    ensure_editable(conn, id)?;
+    set_hosts_inner(conn, id, host_ids, None)
+}
+
+fn set_hosts_inner(
+    conn: &mut Connection,
+    id: i64,
+    host_ids: Vec<i64>,
+    adopt: Option<(&str, &str)>,
+) -> Result<Project, String> {
     let transaction = conn.transaction().map_err(|err| err.to_string())?;
     if !transaction
         .query_row("SELECT 1 FROM projects WHERE id = ?1", [id], |_| Ok(()))
@@ -239,6 +442,15 @@ fn set_hosts_in(conn: &mut Connection, id: i64, host_ids: Vec<i64>) -> Result<Pr
             [id],
         )
         .map_err(|err| err.to_string())?;
+    if let Some((name, path)) = adopt {
+        let changed = transaction.execute(
+            "UPDATE projects SET manifest_mode = 1 WHERE id = ?1 AND manifest_mode = 0 AND name = ?2 AND path = ?3",
+            params![id, name, path],
+        ).map_err(|err| err.to_string())?;
+        if changed != 1 {
+            return Err("项目在迁移期间发生变化，请重新核对。".into());
+        }
+    }
     transaction.commit().map_err(|err| err.to_string())?;
     list_in(conn)
         .map_err(|err| err.to_string())?
@@ -259,6 +471,7 @@ pub fn create(input: NewProject) -> Result<Project, String> {
 }
 
 fn update_in(conn: &Connection, id: i64, input: NewProject) -> Result<Project, String> {
+    ensure_editable(conn, id)?;
     let input = input.normalize()?;
     let transaction = conn
         .unchecked_transaction()
@@ -403,7 +616,7 @@ fn valid_repository_segment(segment: &str) -> bool {
     true
 }
 
-fn valid_tag_rule(rule: &str) -> bool {
+pub(crate) fn valid_tag_rule(rule: &str) -> bool {
     if rule.is_empty() || rule.len() > 128 {
         return false;
     }
@@ -425,6 +638,7 @@ fn update_build_in(
     id: i64,
     mut config: BuildConfig,
 ) -> Result<Project, String> {
+    ensure_editable(conn, id)?;
     config.image = config.image.trim().to_owned();
     config.tag_rule = config.tag_rule.trim().to_owned();
     if !valid_image_name(&config.image) {
@@ -486,6 +700,7 @@ pub fn update_build(id: i64, config: BuildConfig) -> Result<Project, String> {
 }
 
 fn set_service_in(conn: &Connection, id: i64, service: String) -> Result<Project, String> {
+    ensure_editable(conn, id)?;
     if service.is_empty() || service.len() > 256 {
         return Err("部署服务无效。".into());
     }
@@ -546,6 +761,7 @@ fn set_compose_files_in(
     id: i64,
     files: Vec<String>,
 ) -> Result<Project, String> {
+    ensure_editable(conn, id)?;
     let project = list_in(conn)
         .map_err(|err| err.to_string())?
         .into_iter()
@@ -605,12 +821,105 @@ pub fn add_compose_files(id: i64, selected: Vec<PathBuf>) -> Result<Project, Str
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildConfig, NewProject, create_in, delete_in, list_in, set_compose_files_in, set_hosts_in,
+        BuildConfig, NewProject, create_from_manifest_in, create_in, delete_in, list_in,
+        resolve_manifest_project, set_compose_files_in, set_hosts_in, set_hosts_inner,
         set_service_in, update_build_in, update_in,
     };
     use crate::database::initialize;
+    use crate::host_store::Host;
     use rusqlite::Connection;
     use std::fs;
+
+    #[test]
+    fn imports_developer_manifest_and_never_falls_back_to_stale_db_fields() {
+        let directory = std::env::temp_dir().join(format!(
+            "devingpanel-manifest-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("Dockerfile"), "FROM scratch\n").unwrap();
+        fs::write(
+            directory.join("compose.yaml"),
+            "services:\n  web:\n    image: ${DEVINGPANEL_IMAGE}\n",
+        )
+        .unwrap();
+        let manifest_path = directory.join("devingpanel.yaml");
+        fs::write(
+            &manifest_path,
+            "version: 1\nname: myapp\nbuild:\n  dockerfile: Dockerfile\n  image: myapp\n  tag: '{timestamp}'\n  platform: auto\n  args: {}\ndeploy:\n  compose:\n    files: [compose.yaml]\n  service: web\n  targets:\n    - group: prod\n      host: web-1\n",
+        ).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO hosts (id, name, address, port, username, auth, group_name, credential_id)
+            VALUES (4, 'web-1', '203.0.113.10', 22, 'deploy', 'password', 'prod', 'ref')",
+            [],
+        )
+        .unwrap();
+        let host = Host {
+            id: 4,
+            name: "web-1".into(),
+            address: "203.0.113.10".into(),
+            port: 22,
+            username: "deploy".into(),
+            group: "prod".into(),
+            auth: "password".into(),
+            trusted_fingerprint: None,
+        };
+        let id = create_from_manifest_in(&conn, &directory, std::slice::from_ref(&host)).unwrap();
+        assert!(create_from_manifest_in(&conn, &directory, std::slice::from_ref(&host)).is_err());
+        let raw = list_in(&conn).unwrap().remove(0);
+        assert_eq!(raw.id, id);
+        assert!(raw.manifest_mode);
+        assert_eq!(raw.host_ids, [4]);
+        let effective = resolve_manifest_project(&raw, std::slice::from_ref(&host)).unwrap();
+        assert_eq!(effective.host_ids, [4]);
+        assert_eq!(effective.compose_files, ["compose.yaml"]);
+        assert!(resolve_manifest_project(&raw, &[]).is_err());
+        let changed = fs::read_to_string(&manifest_path)
+            .unwrap()
+            .replace("host: web-1", "host: web-2");
+        fs::write(&manifest_path, changed).unwrap();
+        let mut renamed = host.clone();
+        renamed.id = 5;
+        renamed.name = "web-2".into();
+        assert!(resolve_manifest_project(&raw, &[renamed]).is_err());
+        fs::write(&manifest_path, "version: 1\ninvalid: true\n").unwrap();
+        assert!(resolve_manifest_project(&raw, &[host]).is_err());
+        fs::remove_file(manifest_path).unwrap();
+        assert!(resolve_manifest_project(&raw, &[]).is_err());
+        fs::remove_file(directory.join("Dockerfile")).unwrap();
+        fs::remove_file(directory.join("compose.yaml")).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_adoption_rolls_back_bindings_and_host_environment() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, path, dockerfile, image) VALUES (1, 'app', 'path', 'Dockerfile', 'app');
+             INSERT INTO hosts (id, name, address, port, username, auth, group_name, credential_id)
+             VALUES (1, 'old', '203.0.113.1', 22, 'root', 'password', 'prod', 'c1'),
+                    (2, 'new', '203.0.113.2', 22, 'root', 'password', 'prod', 'c2');
+             INSERT INTO project_hosts VALUES (1, 1, 0);
+             INSERT INTO project_env (project_id, host_id, ordinal, name, value)
+             VALUES (1, 1, 0, 'MODE', 'old');",
+        ).unwrap();
+        assert!(set_hosts_inner(&mut conn, 1, vec![2], Some(("wrong", "path"))).is_err());
+        let project = list_in(&conn).unwrap().remove(0);
+        assert_eq!(project.host_ids, [1]);
+        assert!(!project.manifest_mode);
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM project_env WHERE host_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "old");
+    }
 
     #[test]
     fn project_edits_preserve_identity_and_delete_local_relations() {
@@ -1031,7 +1340,7 @@ mod tests {
             [("A".into(), "1".into()), ("B".into(), "2".into())]
         );
         assert_eq!(list_in(&reopened).unwrap()[0].service, "web");
-        reopened.pragma_update(None, "user_version", 10).unwrap();
+        reopened.pragma_update(None, "user_version", 11).unwrap();
         assert!(initialize(&reopened).is_err());
         drop(reopened);
         set_compose_files_in(
@@ -1094,7 +1403,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         let project = &list_in(&conn).unwrap()[0];
         assert_eq!(project.image, "repo/app");
         assert_eq!(project.platform, "linux/arm64");

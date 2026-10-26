@@ -263,7 +263,7 @@ fn valid_address(address: &str) -> bool {
         })
 }
 
-fn list_in(conn: &Connection) -> rusqlite::Result<Vec<Host>> {
+pub(crate) fn list_in(conn: &Connection) -> rusqlite::Result<Vec<Host>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, address, port, username, group_name, auth, trusted_fingerprint FROM hosts WHERE deleting = 0 ORDER BY id DESC",
     )?;

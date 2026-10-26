@@ -26,6 +26,31 @@
 
 远端 tag 的加载前检查不是 Docker 原子预留；若其他进程恰在检查与 `docker load` 之间使用同名 tag，仍可能被覆盖。接入正式发布前必须解决这一竞态或改用不覆盖现有 tag 的加载/引用策略，不能把当前适配器视为完整发布安全门。
 
+项目根目录现可使用开发者维护的 `devingpanel.yaml`：项目页可直接导入目录；文件声明非秘密的构建、Compose、目标主机组/别名及发布顺序，操作人员看到只读摘要和配置状态，不需重新填写技术参数。主机凭据、可信指纹与敏感环境变量仍由管理员在本机安全存储中预置；目标缺失或重名时项目保留但标示需管理员处理。现有表单项目必须明确确认才迁移：已有 YAML 不覆盖，否则从非秘密配置生成；迁移后文件为唯一项目技术配置源，损坏/缺失不会回退数据库旧值。外部修改可手动重新读取，发布静态检查会重读文件并拒绝目标顺序漂移。当前只完成配置导入和预检接入，发布执行状态机仍未完成，“开始发布”继续禁用。
+
+开发者在代码目录根创建的最小清单示例（Compose 的 `web` 服务仍须使用 `image: ${DEVINGPANEL_IMAGE}`）：
+
+```yaml
+version: 1
+name: myapp
+build:
+  dockerfile: Dockerfile
+  image: myapp
+  tag: "{timestamp}"
+  platform: auto
+  args:
+    NODE_ENV: production
+deploy:
+  compose:
+    files: [compose.yaml]
+  service: web
+  targets:
+    - group: prod
+      host: web-1
+```
+
+`group/host` 是本机预先配置的主机别名，不是密码或服务器地址；新导入项目可自动绑定唯一匹配的已保存主机，后续 YAML 目标变化须管理员确认。无法匹配时导入仍保留项目并阻断发布。
+
 ## VPS 实机验证（2026-10-26）
 
 在用户通过 VPS 控制台独立核对 ED25519 主机指纹后，使用固定的主机密钥连接 `129.211.23.223:22`。系统 OpenSSH 密码登录、`uname`、根目录 `df -Pk /` 和 SFTP `pwd` 成功；服务器为 Debian Linux `x86_64`，根目录约有 47 GiB 可用空间。远端执行 `docker version` 与 `docker compose version` 均返回 `docker: command not found`。没有上传文件、修改服务器或尝试部署。此测试不等于应用内 SSH/SFTP 适配器验收；此为安装前的只读基线；随后在用户明确授权后完成安装和隔离传输测试。
@@ -50,6 +75,6 @@
 cargo run
 ```
 
-代码边界：`src/main.rs` 启动；`src/ui/` 呈现；`src/docker.rs` 和 `src/compose.rs` 负责本地 Docker/Compose；`src/release.rs` 负责发布前项目静态检查与镜像计划，`src/build.rs` 负责本机构建及镜像元数据核验；`src/ssh.rs` 负责经指纹核实的 SSH 能力测试与监控；`src/preferences.rs` 定位本机配置目录；`src/database.rs` 管理 SQLite 迁移；`src/project_store.rs`、`src/host_store.rs` 和 `src/env_store.rs` 保存配置。数据库文件为配置目录下的 `state.sqlite3`，schema v9；不保存 SSH 密码、私钥或敏感环境变量值。Build args 和非敏感环境变量值会明文保存，用户不得填写秘密。磁盘与凭据操作在后台执行，不阻塞 UI 绘制。
+代码边界：`src/main.rs` 启动；`src/ui/` 呈现；`src/docker.rs` 和 `src/compose.rs` 负责本地 Docker/Compose；`src/release.rs` 负责发布前项目静态检查与镜像计划，`src/build.rs` 负责本机构建及镜像元数据核验；`src/ssh.rs` 负责经指纹核实的 SSH 能力测试与监控；`src/preferences.rs` 定位本机配置目录；`src/database.rs` 管理 SQLite 迁移；`src/project_config.rs` 解析开发者清单，`src/project_store.rs`、`src/host_store.rs` 和 `src/env_store.rs` 保存本机配置。数据库文件为配置目录下的 `state.sqlite3`，schema v10；不保存 SSH 密码、私钥或敏感环境变量值。Build args 和非敏感环境变量值会明文保存，用户不得填写秘密。磁盘与凭据操作在后台执行，不阻塞 UI 绘制。
 
 浏览器原型仍按 `webui/README.md` 启动和测试。桌面视图以 `docs/design/` 与 `webui/test-results/screens/` 为对照；后续页面和交互应逐项比对，不将网页的 hash 路由、本地存储或模拟数据复制为桌面实现。当前桌面端只有 Windows 上的实机窗口与桌面/窄屏截图检查，尚未完成全部页面状态的视觉验收。

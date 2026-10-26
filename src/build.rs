@@ -810,6 +810,8 @@ mod tests {
             missing_compose_files: Vec::new(),
             build_args: Vec::new(),
             host_ids: Vec::new(),
+            manifest_mode: false,
+            config_error: None,
         };
         let image = PlannedImage {
             platform: "linux/amd64".into(),

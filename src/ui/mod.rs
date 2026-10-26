@@ -807,7 +807,12 @@ impl AppView {
                 .filter(|id| self.projects.iter().any(|p| p.id == *id))
                 .or_else(|| self.projects.first().map(|p| p.id));
             if let Some(id) = id {
-                if self.deploy_project_id != Some(id) {
+                if self.deploy_project_id != Some(id)
+                    || self
+                        .projects
+                        .iter()
+                        .any(|project| project.id == id && project.manifest_mode)
+                {
                     self.select_deploy_project(id, window, cx);
                 } else if let Some(project) = self.projects.iter().find(|project| project.id == id)
                 {
