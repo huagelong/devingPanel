@@ -366,8 +366,8 @@ pub fn prepare_single_host(
     Ok((project, host, image, initial_digest))
 }
 
-#[allow(dead_code)] // This stops before Compose up and never reports release success.
-pub fn run_single_host_until_validated(
+#[allow(dead_code)] // This stops before persisting a completed release and never reports success.
+pub fn run_single_host_until_checked(
     project_id: i64,
     host_id: i64,
     base_tag: &str,
@@ -487,12 +487,12 @@ pub fn run_single_host_until_validated(
     release_store::advance(&id, Phase::Staged, Phase::Validating)?;
     on_event("远端校验 Compose 配置");
     if let Err(error) = ssh::validate_staged_compose(
-        host,
+        host.clone(),
         &staged,
         project_id,
         &project.service,
         &built.reference,
-        cancel,
+        cancel.clone(),
     ) {
         let _ = release_store::settle(
             &id,
@@ -503,12 +503,68 @@ pub fn run_single_host_until_validated(
         return Err(error);
     }
     release_store::advance(&id, Phase::Validating, Phase::Validated)?;
-    release_store::settle(
-        &id,
-        Phase::Validated,
-        Outcome::Blocked,
-        "远端 Compose 配置已校验，启动与健康检查尚未实现",
-    )?;
+    release_store::advance(&id, Phase::Validated, Phase::Deploying)?;
+    on_event("远端启动 Compose 服务");
+    if let Err(error) = ssh::start_staged_compose(
+        host.clone(),
+        &staged,
+        project_id,
+        &project.service,
+        &built.reference,
+        &built.image_id,
+        cancel.clone(),
+    ) {
+        // A read-only reconnect can reveal partial effects but cannot justify a retry.
+        let observed = ssh::check_staged_compose(
+            host,
+            &staged,
+            project_id,
+            &project.service,
+            &built.reference,
+            &built.image_id,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let detail = match observed {
+            Ok(ssh::DeploymentState::Healthy) => "启动命令未确认，但目标容器健康；发布记录待核实",
+            Ok(ssh::DeploymentState::RunningUnverified) => {
+                "启动命令未确认，目标容器运行但就绪待核实"
+            }
+            Ok(ssh::DeploymentState::Failed) => "启动命令未确认，目标容器状态异常，需人工核实",
+            Err(_) => "启动结果待核实，禁止自动重试",
+        };
+        let _ = release_store::settle(&id, Phase::Deploying, Outcome::Unknown, detail);
+        return Err(error);
+    }
+    release_store::advance(&id, Phase::Deploying, Phase::Checking)?;
+    on_event("核对容器与健康状态");
+    let state = match ssh::check_staged_compose(
+        host,
+        &staged,
+        project_id,
+        &project.service,
+        &built.reference,
+        &built.image_id,
+        cancel,
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            let _ = release_store::settle(&id, Phase::Checking, Outcome::Unknown, "容器状态待核实");
+            return Err(error);
+        }
+    };
+    release_store::advance(&id, Phase::Checking, Phase::Checked)?;
+    let (outcome, detail) = match state {
+        ssh::DeploymentState::Healthy => (Outcome::Blocked, "容器健康，历史材料与恢复入口尚未实现"),
+        ssh::DeploymentState::RunningUnverified => (
+            Outcome::Blocked,
+            "容器运行中但无健康检查，历史材料与恢复入口尚未实现",
+        ),
+        ssh::DeploymentState::Failed => (
+            Outcome::Blocked,
+            "目标容器未运行、镜像不符或健康检查失败，需人工处理",
+        ),
+    };
+    release_store::settle(&id, Phase::Checked, outcome, detail)?;
     Ok(id)
 }
 

@@ -16,6 +16,9 @@ pub enum Phase {
     Staged,
     Validating,
     Validated,
+    Deploying,
+    Checking,
+    Checked,
 }
 
 impl Phase {
@@ -33,6 +36,9 @@ impl Phase {
             Self::Staged => "staged",
             Self::Validating => "validating",
             Self::Validated => "validated",
+            Self::Deploying => "deploying",
+            Self::Checking => "checking",
+            Self::Checked => "checked",
         }
     }
 }
@@ -153,6 +159,9 @@ fn advance_in(conn: &Connection, id: &str, from: Phase, to: Phase) -> Result<(),
             | (Phase::Staging, Phase::Staged)
             | (Phase::Staged, Phase::Validating)
             | (Phase::Validating, Phase::Validated)
+            | (Phase::Validated, Phase::Deploying)
+            | (Phase::Deploying, Phase::Checking)
+            | (Phase::Checking, Phase::Checked)
     ) {
         return Err("发布阶段转换无效。".into());
     }
@@ -336,6 +345,9 @@ mod tests {
             Phase::Staged,
             Phase::Validating,
             Phase::Validated,
+            Phase::Deploying,
+            Phase::Checking,
+            Phase::Checked,
         ];
         assert!(advance_in(&conn, &draft.id, Phase::Prepared, Phase::Validating).is_err());
         for pair in phases.windows(2) {
@@ -344,7 +356,7 @@ mod tests {
         settle_in(
             &conn,
             &draft.id,
-            Phase::Validated,
+            Phase::Checked,
             Outcome::Blocked,
             "启动尚未实现",
         )

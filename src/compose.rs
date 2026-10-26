@@ -157,6 +157,16 @@ fn validate_portability(raw: &Value, target_service: &str) -> Result<(), String>
     {
         return Err("部署服务必须精确使用 image: ${DEVINGPANEL_IMAGE}。".into());
     }
+    if let Some(target) = services.get(target_service)
+        && (target
+            .get("scale")
+            .is_some_and(|value| value.as_u64() != Some(1))
+            || target
+                .pointer("/deploy/replicas")
+                .is_some_and(|value| value.as_u64() != Some(1)))
+    {
+        return Err("当前仅支持部署服务的单个容器副本。".into());
+    }
     if raw.get("include").is_some() {
         return Err("暂不支持 Compose include。".into());
     }
@@ -463,6 +473,9 @@ mod tests {
         assert!(validate_portability(&base, "").is_ok());
         let mut modified = base.clone();
         modified["services"]["web"]["image"] = json!("${DEVINGPANEL_IMAGE:-fallback}");
+        assert!(validate_portability(&modified, "web").is_err());
+        let mut modified = base.clone();
+        modified["services"]["web"]["deploy"] = json!({"replicas": 2});
         assert!(validate_portability(&modified, "web").is_err());
         let mut modified = base.clone();
         modified["services"]["worker"]

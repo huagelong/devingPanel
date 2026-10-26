@@ -2305,7 +2305,6 @@ fn compose_config_command(
             shell_quote(&format!("{}/{}", staged.directory, relative))?
         ));
     }
-    command.push_str(" config --format json");
     Ok(command)
 }
 
@@ -2315,11 +2314,14 @@ fn verified_compose_config(text: &str, service: &str, reference: &str) -> Result
         .get("services")
         .and_then(Value::as_object)
         .ok_or("远端 Compose 配置缺少服务。")?;
-    if services
-        .get(service)
-        .and_then(|value| value.get("image"))
-        .and_then(Value::as_str)
-        != Some(reference)
+    let target = services.get(service).ok_or("目标服务不存在。")?;
+    if target.get("image").and_then(Value::as_str) != Some(reference)
+        || target
+            .get("scale")
+            .is_some_and(|value| value.as_u64() != Some(1))
+        || target
+            .pointer("/deploy/replicas")
+            .is_some_and(|value| value.as_u64() != Some(1))
         || services.values().any(|value| {
             value.get("build").is_some_and(|build| !build.is_null())
                 || value
@@ -2333,6 +2335,18 @@ fn verified_compose_config(text: &str, service: &str, reference: &str) -> Result
     Ok(())
 }
 
+fn valid_compose_service(service: &str) -> bool {
+    !service.is_empty()
+        && service.len() <= 256
+        && service
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && service
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
 async fn validate_staged_compose_on(
     material: ConnectionMaterial,
     staged: &StagedDeployment,
@@ -2341,14 +2355,17 @@ async fn validate_staged_compose_on(
     reference: &str,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    if service.is_empty() || service.len() > 256 || cancel.load(Ordering::Relaxed) {
+    if !valid_compose_service(service) || cancel.load(Ordering::Relaxed) {
         return Err("部署服务无效或配置校验已取消。".into());
     }
     let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
         .await
         .map_err(|_| "Compose 校验连接超时。")??;
     let endpoint = local_docker_endpoint(&handle).await?;
-    let command = compose_config_command(&endpoint, staged, project_id, reference)?;
+    let command = format!(
+        "{} config --format json",
+        compose_config_command(&endpoint, staged, project_id, reference)?
+    );
     let output = tokio::select! {
         _ = wait_cancel(cancel) => return Err("远端 Compose 校验已取消。".into()),
         result = tokio::time::timeout(Duration::from_secs(60), command_limited(&handle, &command, 128 * 1024 * 1024)) =>
@@ -2376,6 +2393,234 @@ pub fn validate_staged_compose(
         .map_err(|_| "无法初始化 Compose 校验环境。".to_owned())?
         .block_on(validate_staged_compose_on(
             material, staged, project_id, service, reference, &cancel,
+        ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeploymentState {
+    Healthy,
+    RunningUnverified,
+    Failed,
+}
+
+fn deployment_inspect_command(endpoint: &str, ids: &[String]) -> Result<String, String> {
+    if ids.is_empty() || ids.len() > 100 || ids.iter().any(|id| validate_container_id(id).is_err())
+    {
+        return Err("目标服务容器标识无效。".into());
+    }
+    let template = r#"{"Id":{{json .Id}},"Image":{{json .Image}},"ConfigImage":{{json .Config.Image}},"Status":{{json .State.Status}},"Health":{{with index .State "Health"}}{{json .Status}}{{else}}null{{end}}}"#;
+    Ok(docker_command(
+        endpoint,
+        &format!(
+            "container inspect --format {} {}",
+            shell_quote(template)?,
+            ids.join(" ")
+        ),
+    ))
+}
+
+fn inspect_deployment_state(
+    output: &str,
+    ids: &[String],
+    reference: &str,
+    image_id: &str,
+) -> Result<Option<DeploymentState>, String> {
+    let mut seen = HashSet::new();
+    let mut pending = false;
+    let mut unverified = false;
+    for line in output.lines() {
+        let row: Value = serde_json::from_str(line).map_err(|_| "容器状态无法解析。")?;
+        let id = row
+            .get("Id")
+            .and_then(Value::as_str)
+            .ok_or("容器 ID 缺失。")?;
+        if !ids.iter().any(|expected| id == expected) || !seen.insert(id.to_owned()) {
+            return Err("容器检查结果不完整或重复。".into());
+        }
+        if row.get("Image").and_then(Value::as_str) != Some(image_id)
+            || row.get("ConfigImage").and_then(Value::as_str) != Some(reference)
+        {
+            return Ok(Some(DeploymentState::Failed));
+        }
+        if row.get("Status").and_then(Value::as_str) != Some("running") {
+            return Ok(Some(DeploymentState::Failed));
+        }
+        match row.get("Health").and_then(Value::as_str) {
+            Some("healthy") => {}
+            Some("starting") => pending = true,
+            Some("unhealthy") => return Ok(Some(DeploymentState::Failed)),
+            None if row.get("Health").is_none_or(Value::is_null) => unverified = true,
+            _ => return Err("容器健康状态无法核实。".into()),
+        }
+    }
+    if seen.len() != ids.len() {
+        return Err("容器检查结果不完整或重复。".into());
+    }
+    if pending {
+        Ok(None)
+    } else if unverified {
+        Ok(Some(DeploymentState::RunningUnverified))
+    } else {
+        Ok(Some(DeploymentState::Healthy))
+    }
+}
+
+async fn inspect_target_containers(
+    handle: &client::Handle<HostKeyChecker>,
+    endpoint: &str,
+    staged: &StagedDeployment,
+    project_id: i64,
+    service: &str,
+    reference: &str,
+    image_id: &str,
+) -> Result<Option<DeploymentState>, String> {
+    let prefix = compose_config_command(endpoint, staged, project_id, reference)?;
+    let list = format!("{prefix} ps -a -q --no-trunc {}", shell_quote(service)?);
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        command_limited(handle, &list, 8192),
+    )
+    .await
+    .map_err(|_| "容器列表检查超时。")??;
+    let ids: Vec<String> = output.lines().map(str::to_owned).collect();
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    if ids.len() != 1 {
+        return Ok(Some(DeploymentState::Failed));
+    }
+    let inspect = deployment_inspect_command(endpoint, &ids)?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        command_limited(handle, &inspect, 64 * 1024),
+    )
+    .await
+    .map_err(|_| "容器检查超时。")??;
+    inspect_deployment_state(&output, &ids, reference, image_id)
+}
+
+async fn start_staged_compose_on(
+    material: ConnectionMaterial,
+    staged: &StagedDeployment,
+    project_id: i64,
+    service: &str,
+    reference: &str,
+    image_id: &str,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    if !valid_compose_service(service) {
+        return Err("部署服务无效。".into());
+    }
+    if image_id.len() != 71 {
+        return Err("镜像 ID 无效。".into());
+    }
+    validate_container_id(image_id.strip_prefix("sha256:").ok_or("镜像 ID 无效。")?)?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("部署已取消，尚未启动容器。".into());
+    }
+    let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+        .await
+        .map_err(|_| "部署连接超时。")??;
+    let endpoint = local_docker_endpoint(&handle).await?;
+    let prefix = compose_config_command(&endpoint, staged, project_id, reference)?;
+    let inspect = docker_command(
+        &endpoint,
+        &format!(
+            "image inspect --format '{{{{.Id}}}}' {}",
+            shell_quote(reference)?
+        ),
+    );
+    if archive_command(&handle, &inspect).await?.trim() != image_id {
+        return Err("远端镜像 tag 已变化，禁止启动。".into());
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("部署已取消，尚未启动容器。".into());
+    }
+    let up = format!(
+        "{prefix} up -d --no-build --pull never --no-deps {}",
+        shell_quote(service)?
+    );
+    tokio::select! {
+        _ = wait_cancel(cancel) => Err("远端启动已取消，执行结果待核实。".into()),
+        result = tokio::time::timeout(Duration::from_secs(5 * 60), command_limited(&handle, &up, 64 * 1024)) =>
+            result.map_err(|_| "远端启动超时，执行结果待核实。".to_owned())?
+                .map(|_| ())
+                .map_err(|_| "远端启动未确认成功，需核实容器状态。".into()),
+    }
+}
+
+async fn check_staged_compose_on(
+    material: ConnectionMaterial,
+    staged: &StagedDeployment,
+    project_id: i64,
+    service: &str,
+    reference: &str,
+    image_id: &str,
+    cancel: &AtomicBool,
+) -> Result<DeploymentState, String> {
+    if !valid_compose_service(service) {
+        return Err("部署服务无效。".into());
+    }
+    let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+        .await
+        .map_err(|_| "状态核实连接超时。")??;
+    let endpoint = local_docker_endpoint(&handle).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let state = inspect_target_containers(
+            &handle, &endpoint, staged, project_id, service, reference, image_id,
+        )
+        .await?;
+        if let Some(state) = state {
+            return Ok(state);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(DeploymentState::Failed);
+        }
+        tokio::select! {
+            _ = wait_cancel(cancel) => return Err("健康检查已取消，状态待核实。".into()),
+            _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+        }
+    }
+}
+
+#[allow(dead_code)] // The GUI release flow remains disabled until history and recovery are wired up.
+pub fn start_staged_compose(
+    expected_host: Host,
+    staged: &StagedDeployment,
+    project_id: i64,
+    service: &str,
+    reference: &str,
+    image_id: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let material = material_for(&expected_host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化远端部署环境。".to_owned())?
+        .block_on(start_staged_compose_on(
+            material, staged, project_id, service, reference, image_id, &cancel,
+        ))
+}
+
+#[allow(dead_code)] // Explicit read-only check, including after an uncertain start result.
+pub fn check_staged_compose(
+    expected_host: Host,
+    staged: &StagedDeployment,
+    project_id: i64,
+    service: &str,
+    reference: &str,
+    image_id: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<DeploymentState, String> {
+    let material = material_for(&expected_host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化状态核实环境。".to_owned())?
+        .block_on(check_staged_compose_on(
+            material, staged, project_id, service, reference, image_id, &cancel,
         ))
 }
 
@@ -2530,15 +2775,15 @@ pub fn load_uploaded_archive(
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerAction, DockerInstallSource, LogEvent, LogLineBuffer, TestResult,
+        ContainerAction, DeploymentState, DockerInstallSource, LogEvent, LogLineBuffer, TestResult,
         apt_candidates_use_source, cleanup_archive_command, container_command, cpu_counters,
         default_route_interface, disk_available, disk_percent, docker_install_commands,
         execute_container_action, execute_disk_prune, fetch_disk_preview, fetch_inventory,
-        fetch_monitor, follow_logs, image_size_bytes, memory_kib, merged_mirror_config,
-        mirrors_active, network_bytes, parse_disk_preview, parse_inventory, probe, safe_version,
-        same_connection_target, shell_quote, valid_docker_signing_key, validated_release_directory,
-        validated_release_file, validated_upload_directory, verified_compose_config,
-        verified_sha256,
+        fetch_monitor, follow_logs, image_size_bytes, inspect_deployment_state, memory_kib,
+        merged_mirror_config, mirrors_active, network_bytes, parse_disk_preview, parse_inventory,
+        probe, safe_version, same_connection_target, shell_quote, valid_docker_signing_key,
+        validated_release_directory, validated_release_file, validated_upload_directory,
+        verified_compose_config, verified_sha256,
     };
     use crate::host_store::{ConnectionMaterial, Host};
     use russh::server::{self, Auth, Msg, Server as _, Session};
@@ -2600,7 +2845,7 @@ mod tests {
         assert!(command.contains("DEVINGPANEL_IMAGE='sample/app:v1'"));
         assert!(command.contains("-p dp7"));
         assert!(command.contains("--env-file '/root/release'\"'\"'s/.env'"));
-        assert!(command.contains("config --format json"));
+        assert!(format!("{command} config --format json").contains("config --format json"));
         assert!(
             super::compose_config_command("unix:///var/run/docker.sock", &staged, 7, "app:tag;rm")
                 .is_err()
@@ -2610,6 +2855,14 @@ mod tests {
         assert!(verified_compose_config(json, "web", "sample/app:v2").is_err());
         assert!(verified_compose_config(json, "missing", "sample/app:v1").is_err());
         assert!(verified_compose_config("not json", "web", "sample/app:v1").is_err());
+        assert!(
+            verified_compose_config(
+                r#"{"services":{"web":{"image":"sample/app:v1","deploy":{"replicas":2}}}}"#,
+                "web",
+                "sample/app:v1"
+            )
+            .is_err()
+        );
         assert!(
             !verified_compose_config(json, "web", "sample/app:v2")
                 .unwrap_err()
@@ -2622,6 +2875,82 @@ mod tests {
                 "sample/app:v1"
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn container_check_rejects_wrong_image_and_distinguishes_health() {
+        let id = "a".repeat(64);
+        let image = format!("sha256:{}", "b".repeat(64));
+        let row = |status: &str, health: &str, image: &str| {
+            format!(
+                r#"{{"Id":"{id}","Image":"{image}","ConfigImage":"app:v1","Status":"{status}","Health":{health}}}"#
+            )
+        };
+        let ids = vec![id.clone()];
+        assert_eq!(
+            inspect_deployment_state(
+                &row("running", "\"healthy\"", &image),
+                &ids,
+                "app:v1",
+                &image
+            )
+            .unwrap(),
+            Some(DeploymentState::Healthy)
+        );
+        assert_eq!(
+            inspect_deployment_state(&row("running", "null", &image), &ids, "app:v1", &image)
+                .unwrap(),
+            Some(DeploymentState::RunningUnverified)
+        );
+        assert_eq!(
+            inspect_deployment_state(
+                &row("running", "\"starting\"", &image),
+                &ids,
+                "app:v1",
+                &image
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            inspect_deployment_state(
+                &row("running", "\"unhealthy\"", &image),
+                &ids,
+                "app:v1",
+                &image
+            )
+            .unwrap(),
+            Some(DeploymentState::Failed)
+        );
+        assert_eq!(
+            inspect_deployment_state(&row("exited", "null", &image), &ids, "app:v1", &image)
+                .unwrap(),
+            Some(DeploymentState::Failed)
+        );
+        assert_eq!(
+            inspect_deployment_state(
+                &row("running", "null", "sha256:wrong"),
+                &ids,
+                "app:v1",
+                &image
+            )
+            .unwrap(),
+            Some(DeploymentState::Failed)
+        );
+        assert!(inspect_deployment_state("", &ids, "app:v1", &image).is_err());
+        assert!(
+            inspect_deployment_state(
+                &row("running", "null", &image),
+                &[id, "c".repeat(64)],
+                "app:v1",
+                &image
+            )
+            .is_err()
+        );
+        assert!(
+            super::deployment_inspect_command("unix:///var/run/docker.sock", &["bad;id".into()])
+                .is_err()
         );
     }
 
