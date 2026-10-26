@@ -1,3 +1,4 @@
+use crate::build::{self, BuiltImage, SavedArchive};
 use crate::compose;
 use crate::docker;
 use crate::host_store::Host;
@@ -167,9 +168,58 @@ pub fn check_image_tags(
     Ok(planned)
 }
 
+fn verify_transfer(archive: &SavedArchive, uploaded: &ssh::UploadedArchive) -> Result<(), String> {
+    if archive.bytes != uploaded.bytes || archive.sha256 != uploaded.sha256 {
+        return Err("镜像归档传输前后校验值不一致，远端文件不可用于部署。".into());
+    }
+    Ok(())
+}
+
+fn finish_transfer(
+    archive: &SavedArchive,
+    uploaded: ssh::UploadedArchive,
+    cleanup: impl FnOnce(&ssh::UploadedArchive) -> Result<(), String>,
+) -> Result<ssh::UploadedArchive, String> {
+    if let Err(error) = verify_transfer(archive, &uploaded) {
+        return Err(match cleanup(&uploaded) {
+            Ok(()) => error,
+            Err(reason) => format!(
+                "{error}；远端临时目录 {} 清理失败：{reason}",
+                uploaded.directory
+            ),
+        });
+    }
+    Ok(uploaded)
+}
+
+#[allow(dead_code)] // The release coordinator will load this archive before deployment.
+pub fn transfer_built_image(
+    host: Host,
+    image: &BuiltImage,
+    cancel: Arc<AtomicBool>,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<ssh::UploadedArchive, String> {
+    let probe = ssh::test_host_snapshot(host.clone(), cancel.clone())?;
+    let platform = checked_platform(probe, &host.name, &image.platform)?;
+    if platform != image.platform {
+        return Err("目标主机架构与已构建镜像不匹配。".into());
+    }
+    let archive = build::save_image(image, cancel.clone())?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("镜像传输已取消。".into());
+    }
+    let uploaded = ssh::upload_archive(host.clone(), &archive.path, cancel, &mut progress)?;
+    finish_transfer(&archive, uploaded, |uploaded| {
+        ssh::cleanup_uploaded_archive(host, uploaded)
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{check_project_config, checked_platform, plan_images};
+    use super::{
+        check_project_config, checked_platform, finish_transfer, plan_images, verify_transfer,
+    };
+    use crate::build::SavedArchive;
     use crate::project_store::Project;
     use crate::ssh::TestResult;
 
@@ -245,6 +295,53 @@ mod tests {
                 "auto"
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn transfer_requires_matching_archive_size_and_digest() {
+        let archive = SavedArchive {
+            path: std::env::temp_dir().join(format!(
+                "devingpanel-nonexistent-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+            bytes: 100,
+            sha256: "a".repeat(64),
+        };
+        let mut uploaded = crate::ssh::UploadedArchive {
+            directory: "/tmp/devingpanel.0123456789abcdef0123456789abcdef".into(),
+            path: "/tmp/devingpanel.0123456789abcdef0123456789abcdef/image.tar".into(),
+            bytes: 100,
+            sha256: "a".repeat(64),
+        };
+        assert!(verify_transfer(&archive, &uploaded).is_ok());
+        uploaded.bytes += 1;
+        assert!(verify_transfer(&archive, &uploaded).is_err());
+        uploaded.bytes -= 1;
+        uploaded.sha256 = "b".repeat(64);
+        assert!(verify_transfer(&archive, &uploaded).is_err());
+        let mut cleanup_calls = 0;
+        let error = finish_transfer(&archive, uploaded, |_| {
+            cleanup_calls += 1;
+            Err("连接中断".into())
+        })
+        .err()
+        .unwrap();
+        assert_eq!(cleanup_calls, 1);
+        assert!(error.contains("清理失败"));
+        assert!(error.contains("/tmp/devingpanel."));
+
+        let uploaded = crate::ssh::UploadedArchive {
+            directory: "/tmp/devingpanel.0123456789abcdef0123456789abcdef".into(),
+            path: "/tmp/devingpanel.0123456789abcdef0123456789abcdef/image.tar".into(),
+            bytes: archive.bytes,
+            sha256: archive.sha256.clone(),
+        };
+        assert!(
+            finish_transfer(&archive, uploaded, |_| panic!(
+                "must not clean successful upload"
+            ))
+            .is_ok()
         );
     }
 
