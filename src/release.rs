@@ -288,6 +288,48 @@ fn source_digest(project: &Project) -> Result<String, String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn deployment_files(project: &Project) -> Result<Vec<ssh::DeploymentFile>, String> {
+    let root = Path::new(&project.path)
+        .canonicalize()
+        .map_err(|_| "项目目录不存在。")?;
+    let mut remote_paths = HashSet::new();
+    project
+        .compose_files
+        .iter()
+        .map(|relative| {
+            let remote_path = if cfg!(windows) {
+                relative.replace('\\', "/")
+            } else {
+                relative.clone()
+            };
+            ssh::validated_release_file(&remote_path)?;
+            if !remote_paths.insert(remote_path.clone()) {
+                return Err("Compose 文件映射到重复的远端路径。".into());
+            }
+            let path = root
+                .join(relative)
+                .canonicalize()
+                .map_err(|_| "Compose 文件不存在。")?;
+            if !path.starts_with(&root) || !path.is_file() {
+                return Err("Compose 文件越出项目目录。".into());
+            }
+            let mut bytes = Vec::new();
+            File::open(path)
+                .map_err(|_| "无法读取 Compose 文件。")?
+                .take(16 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "无法读取 Compose 文件。")?;
+            if bytes.len() > 16 * 1024 * 1024 {
+                return Err("Compose 文件过大。".into());
+            }
+            Ok(ssh::DeploymentFile {
+                path: remote_path,
+                bytes,
+            })
+        })
+        .collect()
+}
+
 #[allow(dead_code)] // The GUI release coordinator will call this after deployment is wired up.
 pub fn prepare_single_host(
     project_id: i64,
@@ -324,8 +366,8 @@ pub fn prepare_single_host(
     Ok((project, host, image, initial_digest))
 }
 
-#[allow(dead_code)] // This stops before Compose deployment and never reports release success.
-pub fn run_single_host_until_loaded(
+#[allow(dead_code)] // This stops before Compose up and never reports release success.
+pub fn run_single_host_until_staged(
     project_id: i64,
     host_id: i64,
     base_tag: &str,
@@ -334,6 +376,11 @@ pub fn run_single_host_until_loaded(
 ) -> Result<String, String> {
     let (project, host, image, digest) =
         prepare_single_host(project_id, host_id, base_tag, cancel.clone())?;
+    let files = deployment_files(&project)?;
+    let env_file = env_store::deployment_env_file(project_id, host_id)?;
+    if source_digest(&project_store::effective(project_id)?)? != digest {
+        return Err("项目文件在冻结部署材料期间变化，请重新开始。".into());
+    }
     let id = uuid::Uuid::new_v4().to_string();
     release_store::create(&Intent {
         id: id.clone(),
@@ -387,7 +434,7 @@ pub fn run_single_host_until_loaded(
         &uploaded,
         &built.reference,
         &built.platform,
-        cancel,
+        cancel.clone(),
     ) {
         let _ = release_store::settle(
             &id,
@@ -398,7 +445,7 @@ pub fn run_single_host_until_loaded(
         return Err(error);
     }
     release_store::advance(&id, Phase::Loading, Phase::Loaded)?;
-    if let Err(error) = ssh::cleanup_uploaded_archive(host, &uploaded) {
+    if let Err(error) = ssh::cleanup_uploaded_archive(host.clone(), &uploaded) {
         release_store::settle(
             &id,
             Phase::Loaded,
@@ -408,11 +455,33 @@ pub fn run_single_host_until_loaded(
         return Err(error);
     }
     release_store::advance(&id, Phase::Loaded, Phase::AwaitingDeployment)?;
+    release_store::advance(&id, Phase::AwaitingDeployment, Phase::Staging)?;
+    on_event("上传 Compose 和环境配置");
+    let staged = match ssh::stage_deployment(host, project_id, &id, &files, &env_file, cancel) {
+        Ok(staged) => staged,
+        Err(error) => {
+            let _ = release_store::settle(
+                &id,
+                Phase::Staging,
+                Outcome::Unknown,
+                "部署文件上传结果待核实",
+            );
+            return Err(error);
+        }
+    };
+    if staged.compose_files.len() != files.len()
+        || staged.env_path.is_empty()
+        || staged.directory.is_empty()
+    {
+        release_store::settle(&id, Phase::Staging, Outcome::Unknown, "远端部署文件待核实")?;
+        return Err("远端部署文件状态不完整。".into());
+    }
+    release_store::advance(&id, Phase::Staging, Phase::Staged)?;
     release_store::settle(
         &id,
-        Phase::AwaitingDeployment,
+        Phase::Staged,
         Outcome::Blocked,
-        "镜像已加载，Compose 部署尚未实现",
+        "镜像与部署文件已上传，Compose 执行尚未实现",
     )?;
     Ok(id)
 }
@@ -420,8 +489,8 @@ pub fn run_single_host_until_loaded(
 #[cfg(test)]
 mod tests {
     use super::{
-        check_project_config, checked_platform, finish_transfer, plan_images, source_digest,
-        verify_transfer,
+        check_project_config, checked_platform, deployment_files, finish_transfer, plan_images,
+        source_digest, verify_transfer,
     };
     use crate::build::SavedArchive;
     use crate::project_store::Project;
@@ -444,6 +513,32 @@ mod tests {
             manifest_mode: false,
             config_error: None,
         }
+    }
+
+    #[test]
+    fn rejects_duplicate_normalized_compose_destinations() {
+        let dir = std::env::temp_dir().join(format!(
+            "devingpanel-compose-path-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(dir.join("deploy")).unwrap();
+        std::fs::write(dir.join("deploy/compose.yaml"), "services: {}\n").unwrap();
+        let mut project = project();
+        project.path = dir.to_string_lossy().into_owned();
+        project.compose_files = vec!["deploy/compose.yaml".into(), "deploy/compose.yaml".into()];
+        assert!(deployment_files(&project).err().unwrap().contains("重复"));
+        if cfg!(windows) {
+            project.compose_files[1] = "deploy\\compose.yaml".into();
+            assert!(deployment_files(&project).err().unwrap().contains("重复"));
+        }
+        project.compose_files.pop();
+        assert_eq!(
+            deployment_files(&project).unwrap()[0].path,
+            "deploy/compose.yaml"
+        );
+        std::fs::remove_file(dir.join("deploy/compose.yaml")).unwrap();
+        std::fs::remove_dir(dir.join("deploy")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

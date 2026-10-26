@@ -133,6 +133,13 @@ pub fn check_deployment_environment(project_id: i64, host_ids: &[i64]) -> Result
     })
 }
 
+pub fn deployment_env_file(project_id: i64, host_id: i64) -> Result<Vec<u8>, String> {
+    let conn = connect()?;
+    with_credential_lock(|| {
+        render_for_host_in(&conn, project_id, host_id, read_secret).map(String::into_bytes)
+    })
+}
+
 pub(crate) fn cleanup_pending_in(
     conn: &Connection,
     delete: impl Fn(&str) -> Result<(), String>,

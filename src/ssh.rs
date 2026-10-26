@@ -8,7 +8,7 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -221,6 +221,59 @@ pub struct UploadedArchive {
     pub bytes: u64,
     pub sha256: String,
     pub image_ids: Vec<String>,
+}
+
+pub struct DeploymentFile {
+    pub path: String,
+    pub bytes: Vec<u8>,
+}
+
+pub struct StagedDeployment {
+    pub directory: String,
+    pub compose_files: Vec<String>,
+    pub env_path: String,
+}
+
+pub(crate) fn validated_release_file(path: &str) -> Result<(), String> {
+    if path.is_empty()
+        || path.len() > 512
+        || path == ".env"
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+    {
+        return Err("发布文件相对路径无效。".into());
+    }
+    Ok(())
+}
+
+fn validated_release_directory(
+    home: &str,
+    project_id: i64,
+    task_id: &str,
+) -> Result<String, String> {
+    if project_id <= 0
+        || home.len() > 256
+        || !home.starts_with('/')
+        || home.split('/').skip(1).any(|part| {
+            part.is_empty() || matches!(part, "." | "..") || part.chars().any(char::is_control)
+        })
+    {
+        return Err("远端 HOME 路径不支持安全部署。".into());
+    }
+    let id = uuid::Uuid::parse_str(task_id).map_err(|_| "发布任务 ID 无效。")?;
+    Ok(format!(
+        "{home}/.local/share/devingpanel/projects/{project_id}/releases/{id}"
+    ))
+}
+
+fn shell_quote(value: &str) -> Result<String, String> {
+    if value.is_empty() || value.len() > 2048 || value.chars().any(char::is_control) {
+        return Err("远端路径包含无效字符。".into());
+    }
+    Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
 }
 
 fn validated_upload_directory(raw: &str) -> Result<String, String> {
@@ -2013,6 +2066,211 @@ pub fn cleanup_uploaded_archive(
         })
 }
 
+async fn write_staged_file(
+    handle: &client::Handle<HostKeyChecker>,
+    sftp: &SftpSession,
+    path: &str,
+    bytes: &[u8],
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let mut remote = tokio::time::timeout(
+        Duration::from_secs(10),
+        sftp.open_with_flags_and_attributes(
+            path.to_owned(),
+            OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+            FileAttributes {
+                permissions: Some(0o600),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .map_err(|_| "远端部署文件创建超时。")?
+    .map_err(|_| "无法创建远端部署文件。")?;
+    for chunk in bytes.chunks(64 * 1024) {
+        tokio::select! {
+            _ = wait_cancel(cancel) => return Err("部署文件上传已取消，结果待核实。".into()),
+            result = tokio::time::timeout(Duration::from_secs(60), remote.write_all(chunk)) =>
+                result.map_err(|_| "远端部署文件写入超时。")?
+                    .map_err(|_| "远端部署文件写入失败。")?,
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(30), remote.close())
+        .await
+        .map_err(|_| "远端部署文件关闭超时。")?
+        .map_err(|_| "远端部署文件关闭失败。")?;
+    let metadata = tokio::time::timeout(Duration::from_secs(10), sftp.metadata(path.to_owned()))
+        .await
+        .map_err(|_| "远端部署文件属性检查超时。")?
+        .map_err(|_| "无法核对远端部署文件属性。")?;
+    if metadata.len() != bytes.len() as u64
+        || metadata
+            .permissions
+            .is_none_or(|mode| mode & 0o777 != 0o600)
+    {
+        return Err("远端部署文件大小或权限不符合要求。".into());
+    }
+    let command = format!("sha256sum -- {}", shell_quote(path)?);
+    let remote_digest = verified_sha256(
+        &archive_command_with_timeout(handle, &command, Duration::from_secs(60)).await?,
+    )?;
+    if remote_digest != format!("{:x}", Sha256::digest(bytes)) {
+        return Err("远端部署文件 SHA-256 校验失败。".into());
+    }
+    Ok(())
+}
+
+async fn stage_deployment_on(
+    material: ConnectionMaterial,
+    project_id: i64,
+    task_id: &str,
+    files: &[DeploymentFile],
+    env_file: &[u8],
+    cancel: &AtomicBool,
+) -> Result<StagedDeployment, String> {
+    if files.is_empty() || files[0].path.contains('/') || env_file.len() > 1024 * 1024 {
+        return Err("部署文件列表或 .env 无效。".into());
+    }
+    let mut seen = HashSet::new();
+    let mut total = env_file.len();
+    for file in files {
+        validated_release_file(&file.path)?;
+        if !seen.insert(file.path.as_str()) || file.bytes.len() > 16 * 1024 * 1024 {
+            return Err("部署文件重复或过大。".into());
+        }
+        total = total.saturating_add(file.bytes.len());
+    }
+    if total > 64 * 1024 * 1024 || cancel.load(Ordering::Relaxed) {
+        return Err("部署文件总量过大或操作已取消。".into());
+    }
+    let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+        .await
+        .map_err(|_| "部署文件 SSH 连接超时。")??;
+    let home = archive_command(&handle, "sh -c 'printf %s \"$HOME\"'").await?;
+    let directory = validated_release_directory(&home, project_id, task_id)?;
+    let parent = directory.rsplit_once('/').unwrap().0;
+    let quoted_parent = shell_quote(parent)?;
+    let quoted_directory = shell_quote(&directory)?;
+    let create = archive_command(&handle, &format!(
+        "umask 077; mkdir -p -- {quoted_parent} && mkdir -m 700 -- {quoted_directory} && test \"$(stat -c %a -- {quoted_directory})\" = 700"
+    )).await;
+    if let Err(error) = create {
+        let cleanup = archive_command(&handle, &format!("rmdir -- {quoted_directory}")).await;
+        return Err(if cleanup.is_ok() {
+            format!("创建远端发布目录失败：{error}。")
+        } else {
+            format!("创建远端发布目录失败：{error}；请核对 {directory} 是否残留。")
+        });
+    }
+    let mut paths = Vec::new();
+    let mut subdirs = Vec::new();
+    let result = async {
+        let channel = tokio::time::timeout(Duration::from_secs(10), handle.channel_open_session())
+            .await
+            .map_err(|_| "部署 SFTP 会话建立超时。")?
+            .map_err(|_| "无法打开部署 SFTP 会话。")?;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            channel.request_subsystem(true, "sftp"),
+        )
+        .await
+        .map_err(|_| "部署 SFTP 子系统启动超时。")?
+        .map_err(|_| "远端 SFTP 不可用。")?;
+        let sftp = tokio::time::timeout(
+            Duration::from_secs(10),
+            SftpSession::new(channel.into_stream()),
+        )
+        .await
+        .map_err(|_| "部署 SFTP 协议握手超时。")?
+        .map_err(|_| "部署 SFTP 协议握手失败。")?;
+        for file in files {
+            let mut cursor = directory.clone();
+            if let Some((parent, _)) = file.path.rsplit_once('/') {
+                for part in parent.split('/') {
+                    cursor.push('/');
+                    cursor.push_str(part);
+                    if !subdirs.contains(&cursor) {
+                        subdirs.push(cursor.clone());
+                        archive_command(
+                            &handle,
+                            &format!("mkdir -m 700 -- {}", shell_quote(&cursor)?),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            let path = format!("{directory}/{}", file.path);
+            paths.push(path.clone());
+            write_staged_file(&handle, &sftp, &path, &file.bytes, cancel).await?;
+        }
+        let env_path = format!("{directory}/.env");
+        paths.push(env_path.clone());
+        write_staged_file(&handle, &sftp, &env_path, env_file, cancel).await?;
+        let _ = sftp.close().await;
+        Ok::<_, String>(StagedDeployment {
+            directory: directory.clone(),
+            compose_files: files.iter().map(|file| file.path.clone()).collect(),
+            env_path,
+        })
+    }
+    .await;
+    if result.is_err() {
+        let cleanup = cleanup_staged_paths(&handle, &directory, &paths, &subdirs).await;
+        let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+        return result.map_err(|error| match cleanup {
+            Ok(()) => error,
+            Err(_) => format!("{error}；发布目录 {directory} 可能残留，请人工核对。"),
+        });
+    }
+    let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+    result
+}
+
+async fn cleanup_staged_paths(
+    handle: &client::Handle<HostKeyChecker>,
+    directory: &str,
+    files: &[String],
+    subdirs: &[String],
+) -> Result<(), String> {
+    for path in files.iter().rev() {
+        archive_command(handle, &format!("rm -f -- {}", shell_quote(path)?)).await?;
+    }
+    for path in subdirs.iter().rev() {
+        let quoted = shell_quote(path)?;
+        archive_command(
+            handle,
+            &format!("rmdir -- {quoted} || (test ! -e {quoted} && test ! -L {quoted})"),
+        )
+        .await?;
+    }
+    let quoted = shell_quote(directory)?;
+    archive_command(
+        handle,
+        &format!("rmdir -- {quoted} || (test ! -e {quoted} && test ! -L {quoted})"),
+    )
+    .await?;
+    Ok(())
+}
+
+#[allow(dead_code)] // The release coordinator will call this before Compose config/up.
+pub fn stage_deployment(
+    expected_host: Host,
+    project_id: i64,
+    task_id: &str,
+    files: &[DeploymentFile],
+    env_file: &[u8],
+    cancel: Arc<AtomicBool>,
+) -> Result<StagedDeployment, String> {
+    let material = material_for(&expected_host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化部署文件传输环境。".to_owned())?
+        .block_on(stage_deployment_on(
+            material, project_id, task_id, files, env_file, &cancel,
+        ))
+}
+
 fn validated_load_target(
     archive: &UploadedArchive,
     reference: &str,
@@ -2170,8 +2428,8 @@ mod tests {
         execute_container_action, execute_disk_prune, fetch_disk_preview, fetch_inventory,
         fetch_monitor, follow_logs, image_size_bytes, memory_kib, merged_mirror_config,
         mirrors_active, network_bytes, parse_disk_preview, parse_inventory, probe, safe_version,
-        same_connection_target, valid_docker_signing_key, validated_upload_directory,
-        verified_sha256,
+        same_connection_target, shell_quote, valid_docker_signing_key, validated_release_directory,
+        validated_release_file, validated_upload_directory, verified_sha256,
     };
     use crate::host_store::{ConnectionMaterial, Host};
     use russh::server::{self, Auth, Msg, Server as _, Session};
@@ -2184,6 +2442,37 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
+
+    #[test]
+    fn deployment_paths_are_private_and_cannot_escape_the_release_root() {
+        let id = uuid::Uuid::new_v4().to_string();
+        assert!(
+            validated_release_directory("/root", 1, &id)
+                .unwrap()
+                .ends_with(&format!("/projects/1/releases/{id}"))
+        );
+        for home in ["/root/../other", "/", "relative", "/root\n"] {
+            assert!(validated_release_directory(home, 1, &id).is_err());
+        }
+        for path in [
+            ".env",
+            "../config.yml",
+            "dir/../config.yml",
+            "C:\\config.yml",
+            "a//b",
+            "/absolute.yml",
+        ] {
+            assert!(validated_release_file(path).is_err());
+        }
+        assert!(validated_release_file("compose.yml").is_ok());
+        assert!(validated_release_file("deploy/compose.prod.yml").is_ok());
+        assert!(validated_release_file("deploy/发布 配置's.yaml").is_ok());
+        assert_eq!(
+            shell_quote("/root user/发布's.yaml").unwrap(),
+            "'/root user/发布'\"'\"'s.yaml'"
+        );
+        assert!(validated_release_directory("/root user", 1, &id).is_ok());
+    }
 
     #[test]
     fn mirror_config_preserves_other_keys_and_recognizes_active_values() {
@@ -2296,6 +2585,51 @@ mod tests {
                     progress.last(),
                     Some(&(bytes.len() as u64, bytes.len() as u64))
                 );
+                let task_id = uuid::Uuid::new_v4().to_string();
+                let files = vec![
+                    super::DeploymentFile {
+                        path: "compose.yaml".into(),
+                        bytes: b"services:\n  web:\n    image: ${DEVINGPANEL_IMAGE}\n".to_vec(),
+                    },
+                    super::DeploymentFile {
+                        path: "deploy/发布 配置's.yaml".into(),
+                        bytes: b"services:\n  web:\n    restart: unless-stopped\n".to_vec(),
+                    },
+                ];
+                let staged = super::stage_deployment_on(
+                    material(),
+                    987654321,
+                    &task_id,
+                    &files,
+                    b"MODE=\"smoke\"\n",
+                    &AtomicBool::new(false),
+                )
+                .await
+                .unwrap();
+                let handle = super::trusted_handle(material()).await.unwrap();
+                let paths = files
+                    .iter()
+                    .map(|file| format!("{}/{}", staged.directory, file.path))
+                    .chain(std::iter::once(staged.env_path.clone()))
+                    .collect::<Vec<_>>();
+                super::cleanup_staged_paths(
+                    &handle,
+                    &staged.directory,
+                    &paths,
+                    &[format!("{}/deploy", staged.directory)],
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{}: {error}", staged.directory));
+                let project_dir = staged.directory.rsplit_once("/releases/").unwrap().0;
+                super::archive_command(
+                    &handle,
+                    &format!("rmdir -- {project_dir}/releases {project_dir}"),
+                )
+                .await
+                .unwrap();
+                let _ = handle
+                    .disconnect(russh::Disconnect::ByApplication, "", "en")
+                    .await;
             });
     }
 

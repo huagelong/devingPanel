@@ -12,6 +12,8 @@ pub enum Phase {
     Loading,
     Loaded,
     AwaitingDeployment,
+    Staging,
+    Staged,
 }
 
 impl Phase {
@@ -25,6 +27,8 @@ impl Phase {
             Self::Loading => "loading",
             Self::Loaded => "loaded",
             Self::AwaitingDeployment => "awaiting_deployment",
+            Self::Staging => "staging",
+            Self::Staged => "staged",
         }
     }
 }
@@ -141,6 +145,8 @@ fn advance_in(conn: &Connection, id: &str, from: Phase, to: Phase) -> Result<(),
             | (Phase::Uploaded, Phase::Loading)
             | (Phase::Loading, Phase::Loaded)
             | (Phase::Loaded, Phase::AwaitingDeployment)
+            | (Phase::AwaitingDeployment, Phase::Staging)
+            | (Phase::Staging, Phase::Staged)
     ) {
         return Err("发布阶段转换无效。".into());
     }
