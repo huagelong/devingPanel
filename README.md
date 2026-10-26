@@ -51,6 +51,8 @@ deploy:
 
 `group/host` 是本机预先配置的主机别名，不是密码或服务器地址；新导入项目可自动绑定唯一匹配的已保存主机，后续 YAML 目标变化须管理员确认。无法匹配时导入仍保留项目并阻断发布。
 
+发布层新增 SQLite 持久化任务意图和单主机阶段转换：预检重读 YAML/Compose/Dockerfile，记录项目文件摘要与可信主机快照，随后可在内部协调本机构建、SFTP 传输、远端镜像加载和归档清理。未知或阻断结果保留任务记录并阻止同项目再次启动；项目/主机有未核实任务时拒绝删除，主机连接配置也不能改动。项目删除与任务创建使用 SQLite 即时写锁避免检查后竞态，构建后重新读取当前项目设置以拒绝配置漂移。当前协调器在镜像加载后明确停于“等待部署”且不报告发布成功；Compose/.env 远端部署、健康检查、历史可恢复材料和 GUI 实时执行仍未实现，因此入口保持禁用。摘要只用于发现配置漂移，不保存可能含字面量秘密的 Compose 源文件。完整中断/恢复路径待实机验证。
+
 ## VPS 实机验证（2026-10-26）
 
 在用户通过 VPS 控制台独立核对 ED25519 主机指纹后，使用固定的主机密钥连接 `129.211.23.223:22`。系统 OpenSSH 密码登录、`uname`、根目录 `df -Pk /` 和 SFTP `pwd` 成功；服务器为 Debian Linux `x86_64`，根目录约有 47 GiB 可用空间。远端执行 `docker version` 与 `docker compose version` 均返回 `docker: command not found`。没有上传文件、修改服务器或尝试部署。此测试不等于应用内 SSH/SFTP 适配器验收；此为安装前的只读基线；随后在用户明确授权后完成安装和隔离传输测试。
@@ -75,6 +77,6 @@ deploy:
 cargo run
 ```
 
-代码边界：`src/main.rs` 启动；`src/ui/` 呈现；`src/docker.rs` 和 `src/compose.rs` 负责本地 Docker/Compose；`src/release.rs` 负责发布前项目静态检查与镜像计划，`src/build.rs` 负责本机构建及镜像元数据核验；`src/ssh.rs` 负责经指纹核实的 SSH 能力测试与监控；`src/preferences.rs` 定位本机配置目录；`src/database.rs` 管理 SQLite 迁移；`src/project_config.rs` 解析开发者清单，`src/project_store.rs`、`src/host_store.rs` 和 `src/env_store.rs` 保存本机配置。数据库文件为配置目录下的 `state.sqlite3`，schema v10；不保存 SSH 密码、私钥或敏感环境变量值。Build args 和非敏感环境变量值会明文保存，用户不得填写秘密。磁盘与凭据操作在后台执行，不阻塞 UI 绘制。
+代码边界：`src/main.rs` 启动；`src/ui/` 呈现；`src/docker.rs` 和 `src/compose.rs` 负责本地 Docker/Compose；`src/release.rs` 负责发布预检与阶段协调、`src/release_store.rs` 持久化任务阶段，`src/build.rs` 负责本机构建及镜像元数据核验；`src/ssh.rs` 负责经指纹核实的 SSH 能力测试与监控；`src/preferences.rs` 定位本机配置目录；`src/database.rs` 管理 SQLite 迁移；`src/project_config.rs` 解析开发者清单，`src/project_store.rs`、`src/host_store.rs` 和 `src/env_store.rs` 保存本机配置。数据库文件为配置目录下的 `state.sqlite3`，schema v11；不保存 SSH 密码、私钥或敏感环境变量值。Build args 和非敏感环境变量值会明文保存，用户不得填写秘密。磁盘与凭据操作在后台执行，不阻塞 UI 绘制。
 
 浏览器原型仍按 `webui/README.md` 启动和测试。桌面视图以 `docs/design/` 与 `webui/test-results/screens/` 为对照；后续页面和交互应逐项比对，不将网页的 hash 路由、本地存储或模拟数据复制为桌面实现。当前桌面端只有 Windows 上的实机窗口与桌面/窄屏截图检查，尚未完成全部页面状态的视觉验收。

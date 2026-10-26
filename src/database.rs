@@ -87,7 +87,28 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
          CREATE UNIQUE INDEX project_env_common_name ON project_env(project_id, name) WHERE host_id IS NULL;
          CREATE UNIQUE INDEX project_env_host_name ON project_env(project_id, host_id, name) WHERE host_id IS NOT NULL;
          CREATE TABLE pending_env_credentials (credential_id TEXT PRIMARY KEY);
-         PRAGMA user_version = 10;
+         CREATE TABLE release_tasks (
+             id TEXT PRIMARY KEY,
+             project_id INTEGER NOT NULL,
+             host_id INTEGER NOT NULL,
+             project_name TEXT NOT NULL,
+             host_name TEXT NOT NULL,
+             host_address TEXT NOT NULL,
+             host_port INTEGER NOT NULL,
+             host_username TEXT NOT NULL,
+             host_auth TEXT NOT NULL,
+             host_fingerprint TEXT NOT NULL,
+             image_reference TEXT NOT NULL,
+             platform TEXT NOT NULL,
+             config_sha256 TEXT NOT NULL,
+             phase TEXT NOT NULL,
+             outcome TEXT NOT NULL CHECK (outcome IN ('running', 'failed', 'unknown', 'blocked', 'complete')),
+             detail TEXT NOT NULL DEFAULT '',
+             started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );
+         CREATE UNIQUE INDEX release_task_active_project ON release_tasks(project_id) WHERE outcome IN ('running', 'unknown', 'blocked');
+         PRAGMA user_version = 11;
          COMMIT;",
         ),
         1 => {
@@ -203,13 +224,40 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             )?;
             initialize(conn)
         }
-        9 => conn.execute_batch(
-            "BEGIN;
+        9 => {
+            conn.execute_batch("BEGIN;
              ALTER TABLE projects ADD COLUMN manifest_mode INTEGER NOT NULL DEFAULT 0;
              PRAGMA user_version = 10;
+             COMMIT;")?;
+            initialize(conn)
+        }
+        10 => conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE release_tasks (
+                 id TEXT PRIMARY KEY,
+                 project_id INTEGER NOT NULL,
+                 host_id INTEGER NOT NULL,
+                 project_name TEXT NOT NULL,
+                 host_name TEXT NOT NULL,
+                 host_address TEXT NOT NULL,
+                 host_port INTEGER NOT NULL,
+                 host_username TEXT NOT NULL,
+                 host_auth TEXT NOT NULL,
+                 host_fingerprint TEXT NOT NULL,
+                 image_reference TEXT NOT NULL,
+                 platform TEXT NOT NULL,
+                 config_sha256 TEXT NOT NULL,
+                 phase TEXT NOT NULL,
+                 outcome TEXT NOT NULL CHECK (outcome IN ('running', 'failed', 'unknown', 'blocked', 'complete')),
+                 detail TEXT NOT NULL DEFAULT '',
+                 started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );
+             CREATE UNIQUE INDEX release_task_active_project ON release_tasks(project_id) WHERE outcome IN ('running', 'unknown', 'blocked');
+             PRAGMA user_version = 11;
              COMMIT;",
         ),
-        10 => Ok(()),
+        11 => Ok(()),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }
@@ -232,7 +280,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         let name: String = conn
             .query_row("SELECT name FROM projects", [], |row| row.get(0))
             .unwrap();
@@ -282,7 +330,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         let pending: String = conn
             .query_row("SELECT credential_id FROM pending_credentials", [], |row| {
                 row.get(0)
@@ -312,7 +360,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         conn.execute(
             "INSERT INTO project_hosts (project_id, host_id, ordinal) VALUES (3, 5, 0)",
             [],
@@ -338,7 +386,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         let host_id: i64 = conn
             .query_row("SELECT host_id FROM project_hosts", [], |row| row.get(0))
             .unwrap();
@@ -364,5 +412,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(mode, 0);
+    }
+
+    #[test]
+    fn upgrades_version_ten_with_release_intent_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA user_version = 10;").unwrap();
+        initialize(&conn).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 11);
+        let tables: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'release_tasks'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(tables, 1);
     }
 }

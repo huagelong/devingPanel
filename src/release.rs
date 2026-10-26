@@ -1,11 +1,19 @@
 use crate::build::{self, BuiltImage, SavedArchive};
 use crate::compose;
 use crate::docker;
+use crate::env_store;
+use crate::host_store;
 use crate::host_store::Host;
+use crate::project_config;
 use crate::project_store::{self, NewProject, Project};
+use crate::release_store::{self, Intent, Outcome, Phase};
 use crate::ssh::{self, TestResult};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::collections::HashSet;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -231,10 +239,189 @@ pub fn transfer_built_image(
     Ok(uploaded)
 }
 
+fn source_digest(project: &Project) -> Result<String, String> {
+    let root = Path::new(&project.path)
+        .canonicalize()
+        .map_err(|_| "项目目录不存在。")?;
+    let metadata = serde_json::json!({
+        "name": project.name,
+        "dockerfile": project.dockerfile,
+        "image": project.image,
+        "tag_rule": project.tag_rule,
+        "platform": project.platform,
+        "service": project.service,
+        "compose_files": project.compose_files,
+        "build_args": project.build_args,
+        "host_ids": project.host_ids,
+    });
+    let mut digest = Sha256::new();
+    digest.update(serde_json::to_vec(&metadata).map_err(|_| "无法核对项目配置。")?);
+    let mut paths = Vec::new();
+    if project.manifest_mode {
+        paths.push(project_config::FILE_NAME.to_owned());
+    }
+    paths.push(project.dockerfile.clone());
+    paths.extend(project.compose_files.iter().cloned());
+    for relative in paths {
+        let file = root
+            .join(&relative)
+            .canonicalize()
+            .map_err(|_| format!("项目文件不存在：{relative}"))?;
+        if !file.starts_with(&root) || !file.is_file() {
+            return Err("项目文件越出代码目录。".into());
+        }
+        let mut source = File::open(file)
+            .map_err(|_| "无法读取项目文件。")?
+            .take(16 * 1024 * 1024 + 1);
+        let mut bytes = Vec::new();
+        source
+            .read_to_end(&mut bytes)
+            .map_err(|_| "无法读取项目文件。")?;
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err("项目文件过大。".into());
+        }
+        digest.update((relative.len() as u64).to_le_bytes());
+        digest.update(relative.as_bytes());
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+#[allow(dead_code)] // The GUI release coordinator will call this after deployment is wired up.
+pub fn prepare_single_host(
+    project_id: i64,
+    host_id: i64,
+    base_tag: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<(Project, Host, PlannedImage, String), String> {
+    let project = project_store::effective(project_id)?;
+    check_project_config(&project, &[host_id])?;
+    env_store::check_deployment_environment(project_id, &[host_id])?;
+    let (hosts, _) = host_store::list()?;
+    let host = hosts
+        .iter()
+        .find(|host| host.id == host_id)
+        .cloned()
+        .ok_or("目标主机不存在。")?;
+    let initial_digest = source_digest(&project)?;
+    let targets = probe_targets(&project, &[host_id], &hosts, cancel.clone())?;
+    let image = plan_images(&project, base_tag, &targets)?
+        .into_iter()
+        .next()
+        .ok_or("无法规划构建镜像。")?;
+    if !docker::build_platforms()?.contains(&image.platform) {
+        return Err("本机 default 构建器不支持目标平台。".into());
+    }
+    if docker::image_reference_exists(&image.reference)? {
+        return Err("本地镜像 tag 已存在，请更换发布标识。".into());
+    }
+    if cancel.load(Ordering::Relaxed)
+        || source_digest(&project_store::effective(project_id)?)? != initial_digest
+    {
+        return Err("项目配置在预检期间变化或预检已取消，请重新开始。".into());
+    }
+    Ok((project, host, image, initial_digest))
+}
+
+#[allow(dead_code)] // This stops before Compose deployment and never reports release success.
+pub fn run_single_host_until_loaded(
+    project_id: i64,
+    host_id: i64,
+    base_tag: &str,
+    cancel: Arc<AtomicBool>,
+    mut on_event: impl FnMut(&str),
+) -> Result<String, String> {
+    let (project, host, image, digest) =
+        prepare_single_host(project_id, host_id, base_tag, cancel.clone())?;
+    let id = uuid::Uuid::new_v4().to_string();
+    release_store::create(&Intent {
+        id: id.clone(),
+        project_id,
+        project_name: project.name.clone(),
+        host: host.clone(),
+        image_reference: image.reference.clone(),
+        platform: image.platform.clone(),
+        config_sha256: digest.clone(),
+    })?;
+    release_store::advance(&id, Phase::Prepared, Phase::Building)?;
+    on_event("本机构建");
+    let built = match build::build_image(&project, &image, cancel.clone(), |line| on_event(line)) {
+        Ok(built) => built,
+        Err(error) => {
+            let _ = release_store::settle(&id, Phase::Building, Outcome::Unknown, "构建结果待核实");
+            return Err(error.message);
+        }
+    };
+    release_store::advance(&id, Phase::Building, Phase::Built)?;
+    if project_store::effective(project_id)
+        .and_then(|current| source_digest(&current))
+        .as_deref()
+        != Ok(digest.as_str())
+    {
+        release_store::settle(&id, Phase::Built, Outcome::Failed, "项目文件在构建期间变化")?;
+        return Err("项目文件在构建期间变化，未开始上传。".into());
+    }
+    release_store::advance(&id, Phase::Built, Phase::Uploading)?;
+    on_event("传输镜像");
+    let uploaded =
+        match transfer_built_image(host.clone(), &built, cancel.clone(), |sent, total| {
+            on_event(&format!("镜像传输 {sent}/{total} 字节"))
+        }) {
+            Ok(uploaded) => uploaded,
+            Err(error) => {
+                let _ = release_store::settle(
+                    &id,
+                    Phase::Uploading,
+                    Outcome::Unknown,
+                    "传输结果待核实",
+                );
+                return Err(error);
+            }
+        };
+    release_store::advance(&id, Phase::Uploading, Phase::Uploaded)?;
+    release_store::advance(&id, Phase::Uploaded, Phase::Loading)?;
+    on_event("远端加载镜像");
+    if let Err(error) = ssh::load_uploaded_archive(
+        host.clone(),
+        &uploaded,
+        &built.reference,
+        &built.platform,
+        cancel,
+    ) {
+        let _ = release_store::settle(
+            &id,
+            Phase::Loading,
+            Outcome::Unknown,
+            "远端镜像加载结果待核实",
+        );
+        return Err(error);
+    }
+    release_store::advance(&id, Phase::Loading, Phase::Loaded)?;
+    if let Err(error) = ssh::cleanup_uploaded_archive(host, &uploaded) {
+        release_store::settle(
+            &id,
+            Phase::Loaded,
+            Outcome::Unknown,
+            "镜像已加载，但临时归档清理待核实",
+        )?;
+        return Err(error);
+    }
+    release_store::advance(&id, Phase::Loaded, Phase::AwaitingDeployment)?;
+    release_store::settle(
+        &id,
+        Phase::AwaitingDeployment,
+        Outcome::Blocked,
+        "镜像已加载，Compose 部署尚未实现",
+    )?;
+    Ok(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        check_project_config, checked_platform, finish_transfer, plan_images, verify_transfer,
+        check_project_config, checked_platform, finish_transfer, plan_images, source_digest,
+        verify_transfer,
     };
     use crate::build::SavedArchive;
     use crate::project_store::Project;
@@ -257,6 +444,30 @@ mod tests {
             manifest_mode: false,
             config_error: None,
         }
+    }
+
+    #[test]
+    fn source_digest_changes_with_compose_and_manifest_inputs() {
+        let dir = std::env::temp_dir().join(format!(
+            "devingpanel-digest-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(dir.join("compose.yaml"), "services: {}\n").unwrap();
+        let mut project = project();
+        project.path = dir.to_string_lossy().into_owned();
+        let before = source_digest(&project).unwrap();
+        std::fs::write(dir.join("compose.yaml"), "services: {web: {image: app}}\n").unwrap();
+        assert_ne!(before, source_digest(&project).unwrap());
+        project.manifest_mode = true;
+        assert!(source_digest(&project).is_err());
+        std::fs::write(dir.join("devingpanel.yaml"), "version: 1\n").unwrap();
+        assert_ne!(before, source_digest(&project).unwrap());
+        std::fs::remove_file(dir.join("devingpanel.yaml")).unwrap();
+        std::fs::remove_file(dir.join("compose.yaml")).unwrap();
+        std::fs::remove_file(dir.join("Dockerfile")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

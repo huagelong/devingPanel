@@ -2,7 +2,7 @@ use crate::database::connect;
 use crate::env_store;
 use crate::preferences;
 use keyring::{Entry, Error as KeyringError};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use std::fs::{File, OpenOptions};
 use std::net::IpAddr;
 use std::sync::{Mutex, MutexGuard};
@@ -415,7 +415,10 @@ fn cleanup_deleting_with(
     };
     let mut failed = 0;
     for (id, credential_id) in deleting {
-        if delete(&credential_id).is_err() || finalize_host_deletion(conn, id).is_err() {
+        if !matches!(unresolved_host_tasks(conn, id), Ok(0))
+            || delete(&credential_id).is_err()
+            || finalize_host_deletion(conn, id).is_err()
+        {
             failed += 1;
         }
     }
@@ -424,9 +427,20 @@ fn cleanup_deleting_with(
 
 fn finalize_host_deletion(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     let transaction = conn.unchecked_transaction()?;
+    if unresolved_host_tasks(&transaction, id)? != 0 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
     env_store::queue_for_host(&transaction, id)?;
     transaction.execute("DELETE FROM hosts WHERE id = ?1 AND deleting = 1", [id])?;
     transaction.commit()
+}
+
+fn unresolved_host_tasks(conn: &Connection, id: i64) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM release_tasks WHERE host_id = ?1 AND outcome IN ('running', 'unknown', 'blocked')",
+        [id],
+        |row| row.get(0),
+    )
 }
 
 fn insert_in(
@@ -522,9 +536,11 @@ fn update_in(
     new_credential_id: Option<&str>,
 ) -> Result<Host, String> {
     let (input, port) = input.normalize()?;
-    let transaction = conn
-        .unchecked_transaction()
+    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|err| err.to_string())?;
+    if unresolved_host_tasks(&transaction, id).map_err(|err| err.to_string())? != 0 {
+        return Err("主机有未核实的发布任务，不能修改连接配置。".into());
+    }
     let conflicts: bool = transaction
         .query_row(
             "SELECT EXISTS (
@@ -626,15 +642,22 @@ fn delete_in(
     id: i64,
     delete: impl Fn(&str) -> Result<(), String>,
 ) -> Result<(), String> {
-    let credential_id: String = conn
+    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|err| err.to_string())?;
+    let credential_id: String = transaction
         .query_row(
             "SELECT credential_id FROM hosts WHERE id = ?1 AND deleting = 0",
             [id],
             |row| row.get(0),
         )
         .map_err(|_| "主机不存在。")?;
-    conn.execute("UPDATE hosts SET deleting = 1 WHERE id = ?1", [id])
+    if unresolved_host_tasks(&transaction, id).map_err(|err| err.to_string())? != 0 {
+        return Err("主机有未核实的发布任务，不能删除或清理凭据。".into());
+    }
+    transaction
+        .execute("UPDATE hosts SET deleting = 1 WHERE id = ?1", [id])
         .map_err(|err| err.to_string())?;
+    transaction.commit().map_err(|err| err.to_string())?;
     if delete(&credential_id).is_err() {
         return Err("凭据清理未完成；主机已标记待删除，下次启动重试。".into());
     }
@@ -665,6 +688,52 @@ mod tests {
         atomic::{AtomicBool, Ordering},
         mpsc,
     };
+
+    #[test]
+    fn unresolved_release_prevents_host_and_credential_deletion() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO hosts (id, name, address, port, username, auth, group_name, credential_id, trusted_fingerprint)
+             VALUES (2, 'web', '203.0.113.10', 22, 'root', 'password', 'prod', 'ref', 'SHA256:known');
+             INSERT INTO release_tasks (id, project_id, host_id, project_name, host_name, host_address,
+               host_port, host_username, host_auth, host_fingerprint, image_reference, platform,
+               config_sha256, phase, outcome)
+             VALUES ('task', 1, 2, 'app', 'web', '203.0.113.10', 22, 'root', 'password',
+               'SHA256:known', 'app:v1', 'linux/amd64',
+               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'uploading', 'unknown');",
+        ).unwrap();
+        assert!(delete_in(&conn, 2, |_| panic!("credential must stay available")).is_err());
+        assert!(
+            update_in(
+                &conn,
+                2,
+                HostUpdate {
+                    name: "renamed".into(),
+                    address: "203.0.113.10".into(),
+                    port: "22".into(),
+                    username: "root".into(),
+                    group: "prod".into(),
+                    auth: "password".into(),
+                    credential: None,
+                },
+                None
+            )
+            .is_err()
+        );
+        let deleting: i64 = conn
+            .query_row("SELECT deleting FROM hosts WHERE id = 2", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(deleting, 0);
+        conn.execute(
+            "UPDATE release_tasks SET outcome = 'failed' WHERE id = 'task'",
+            [],
+        )
+        .unwrap();
+        delete_in(&conn, 2, |_| Ok(())).unwrap();
+    }
 
     #[cfg(windows)]
     #[test]

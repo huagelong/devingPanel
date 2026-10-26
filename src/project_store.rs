@@ -2,7 +2,7 @@ use crate::database::connect;
 use crate::env_store;
 use crate::host_store::with_credential_lock;
 use crate::project_config;
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, Row, Transaction, TransactionBehavior, params};
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone)]
@@ -514,9 +514,16 @@ pub fn update(id: i64, input: NewProject) -> Result<Project, String> {
 }
 
 fn delete_in(conn: &Connection, id: i64) -> Result<(), String> {
-    let transaction = conn
-        .unchecked_transaction()
+    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|err| err.to_string())?;
+    let unresolved: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM release_tasks WHERE project_id = ?1 AND outcome IN ('running', 'unknown', 'blocked')",
+        [id],
+        |row| row.get(0),
+    ).map_err(|err| err.to_string())?;
+    if unresolved != 0 {
+        return Err("项目有未核实的发布任务，不能删除。".into());
+    }
     env_store::queue_for_project(&transaction, id).map_err(|err| err.to_string())?;
     if transaction
         .execute("DELETE FROM projects WHERE id = ?1", [id])
@@ -989,6 +996,20 @@ mod tests {
         conn.execute("INSERT INTO project_hosts VALUES (?1, 5, 0)", [first.id])
             .unwrap();
         assert!(delete_in(&conn, 999).is_err());
+        conn.execute(
+            "INSERT INTO release_tasks (id, project_id, host_id, project_name, host_name, host_address,
+             host_port, host_username, host_auth, host_fingerprint, image_reference, platform,
+             config_sha256, phase, outcome)
+             VALUES ('task', ?1, 5, 'app', 'host', 'host.example', 22, 'root', 'password',
+             'SHA256:known', 'app:v1', 'linux/amd64', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'loading', 'unknown')",
+            [first.id],
+        ).unwrap();
+        assert!(delete_in(&conn, first.id).is_err());
+        conn.execute(
+            "UPDATE release_tasks SET outcome = 'failed' WHERE id = 'task'",
+            [],
+        )
+        .unwrap();
         delete_in(&conn, first.id).unwrap();
         assert_eq!(list_in(&conn).unwrap()[0].id, other.id);
         let relations: i64 = conn
@@ -1340,7 +1361,7 @@ mod tests {
             [("A".into(), "1".into()), ("B".into(), "2".into())]
         );
         assert_eq!(list_in(&reopened).unwrap()[0].service, "web");
-        reopened.pragma_update(None, "user_version", 11).unwrap();
+        reopened.pragma_update(None, "user_version", 12).unwrap();
         assert!(initialize(&reopened).is_err());
         drop(reopened);
         set_compose_files_in(
@@ -1403,7 +1424,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         let project = &list_in(&conn).unwrap()[0];
         assert_eq!(project.image, "repo/app");
         assert_eq!(project.platform, "linux/arm64");

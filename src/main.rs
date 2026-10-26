@@ -8,6 +8,7 @@ mod preferences;
 mod project_config;
 mod project_store;
 mod release;
+mod release_store;
 mod ssh;
 mod ui;
 
