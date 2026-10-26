@@ -511,7 +511,7 @@ pub fn run_single_host_until_checked(
         project_id,
         &project.service,
         &built.reference,
-        &built.image_id,
+        &uploaded.image_ids,
         cancel.clone(),
     ) {
         // A read-only reconnect can reveal partial effects but cannot justify a retry.
@@ -521,7 +521,7 @@ pub fn run_single_host_until_checked(
             project_id,
             &project.service,
             &built.reference,
-            &built.image_id,
+            &uploaded.image_ids,
             Arc::new(AtomicBool::new(false)),
         );
         let detail = match observed {
@@ -543,7 +543,7 @@ pub fn run_single_host_until_checked(
         project_id,
         &project.service,
         &built.reference,
-        &built.image_id,
+        &uploaded.image_ids,
         cancel,
     ) {
         Ok(state) => state,

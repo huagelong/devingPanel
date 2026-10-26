@@ -2403,6 +2403,20 @@ pub enum DeploymentState {
     Failed,
 }
 
+fn validate_deployment_image_ids(ids: &[String]) -> Result<(), String> {
+    if ids.is_empty()
+        || ids.len() > 4
+        || ids.iter().any(|id| {
+            id.len() != 71
+                || !id.starts_with("sha256:")
+                || !id[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return Err("镜像 ID 无效。".into());
+    }
+    Ok(())
+}
+
 fn deployment_inspect_command(endpoint: &str, ids: &[String]) -> Result<String, String> {
     if ids.is_empty() || ids.len() > 100 || ids.iter().any(|id| validate_container_id(id).is_err())
     {
@@ -2423,7 +2437,7 @@ fn inspect_deployment_state(
     output: &str,
     ids: &[String],
     reference: &str,
-    image_id: &str,
+    image_ids: &[String],
 ) -> Result<Option<DeploymentState>, String> {
     let mut seen = HashSet::new();
     let mut pending = false;
@@ -2437,7 +2451,10 @@ fn inspect_deployment_state(
         if !ids.iter().any(|expected| id == expected) || !seen.insert(id.to_owned()) {
             return Err("容器检查结果不完整或重复。".into());
         }
-        if row.get("Image").and_then(Value::as_str) != Some(image_id)
+        if !row
+            .get("Image")
+            .and_then(Value::as_str)
+            .is_some_and(|id| image_ids.iter().any(|expected| expected == id))
             || row.get("ConfigImage").and_then(Value::as_str) != Some(reference)
         {
             return Ok(Some(DeploymentState::Failed));
@@ -2472,7 +2489,7 @@ async fn inspect_target_containers(
     project_id: i64,
     service: &str,
     reference: &str,
-    image_id: &str,
+    image_ids: &[String],
 ) -> Result<Option<DeploymentState>, String> {
     let prefix = compose_config_command(endpoint, staged, project_id, reference)?;
     let list = format!("{prefix} ps -a -q --no-trunc {}", shell_quote(service)?);
@@ -2496,7 +2513,7 @@ async fn inspect_target_containers(
     )
     .await
     .map_err(|_| "容器检查超时。")??;
-    inspect_deployment_state(&output, &ids, reference, image_id)
+    inspect_deployment_state(&output, &ids, reference, image_ids)
 }
 
 async fn start_staged_compose_on(
@@ -2505,16 +2522,13 @@ async fn start_staged_compose_on(
     project_id: i64,
     service: &str,
     reference: &str,
-    image_id: &str,
+    image_ids: &[String],
     cancel: &AtomicBool,
 ) -> Result<(), String> {
     if !valid_compose_service(service) {
         return Err("部署服务无效。".into());
     }
-    if image_id.len() != 71 {
-        return Err("镜像 ID 无效。".into());
-    }
-    validate_container_id(image_id.strip_prefix("sha256:").ok_or("镜像 ID 无效。")?)?;
+    validate_deployment_image_ids(image_ids)?;
     if cancel.load(Ordering::Relaxed) {
         return Err("部署已取消，尚未启动容器。".into());
     }
@@ -2530,7 +2544,8 @@ async fn start_staged_compose_on(
             shell_quote(reference)?
         ),
     );
-    if archive_command(&handle, &inspect).await?.trim() != image_id {
+    let remote_id = archive_command(&handle, &inspect).await?;
+    if !image_ids.iter().any(|id| id == remote_id.trim()) {
         return Err("远端镜像 tag 已变化，禁止启动。".into());
     }
     if cancel.load(Ordering::Relaxed) {
@@ -2555,7 +2570,7 @@ async fn check_staged_compose_on(
     project_id: i64,
     service: &str,
     reference: &str,
-    image_id: &str,
+    image_ids: &[String],
     cancel: &AtomicBool,
 ) -> Result<DeploymentState, String> {
     if !valid_compose_service(service) {
@@ -2568,7 +2583,7 @@ async fn check_staged_compose_on(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
         let state = inspect_target_containers(
-            &handle, &endpoint, staged, project_id, service, reference, image_id,
+            &handle, &endpoint, staged, project_id, service, reference, image_ids,
         )
         .await?;
         if let Some(state) = state {
@@ -2591,7 +2606,7 @@ pub fn start_staged_compose(
     project_id: i64,
     service: &str,
     reference: &str,
-    image_id: &str,
+    image_ids: &[String],
     cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let material = material_for(&expected_host)?;
@@ -2600,7 +2615,7 @@ pub fn start_staged_compose(
         .build()
         .map_err(|_| "无法初始化远端部署环境。".to_owned())?
         .block_on(start_staged_compose_on(
-            material, staged, project_id, service, reference, image_id, &cancel,
+            material, staged, project_id, service, reference, image_ids, &cancel,
         ))
 }
 
@@ -2611,7 +2626,7 @@ pub fn check_staged_compose(
     project_id: i64,
     service: &str,
     reference: &str,
-    image_id: &str,
+    image_ids: &[String],
     cancel: Arc<AtomicBool>,
 ) -> Result<DeploymentState, String> {
     let material = material_for(&expected_host)?;
@@ -2620,7 +2635,7 @@ pub fn check_staged_compose(
         .build()
         .map_err(|_| "无法初始化状态核实环境。".to_owned())?
         .block_on(check_staged_compose_on(
-            material, staged, project_id, service, reference, image_id, &cancel,
+            material, staged, project_id, service, reference, image_ids, &cancel,
         ))
 }
 
@@ -2882,6 +2897,9 @@ mod tests {
     fn container_check_rejects_wrong_image_and_distinguishes_health() {
         let id = "a".repeat(64);
         let image = format!("sha256:{}", "b".repeat(64));
+        let archived_ids = vec![format!("sha256:{}", "c".repeat(64)), image.clone()];
+        assert!(super::validate_deployment_image_ids(&archived_ids).is_ok());
+        assert!(super::validate_deployment_image_ids(&[]).is_err());
         let row = |status: &str, health: &str, image: &str| {
             format!(
                 r#"{{"Id":"{id}","Image":"{image}","ConfigImage":"app:v1","Status":"{status}","Health":{health}}}"#
@@ -2893,14 +2911,19 @@ mod tests {
                 &row("running", "\"healthy\"", &image),
                 &ids,
                 "app:v1",
-                &image
+                &archived_ids
             )
             .unwrap(),
             Some(DeploymentState::Healthy)
         );
         assert_eq!(
-            inspect_deployment_state(&row("running", "null", &image), &ids, "app:v1", &image)
-                .unwrap(),
+            inspect_deployment_state(
+                &row("running", "null", &image),
+                &ids,
+                "app:v1",
+                std::slice::from_ref(&image)
+            )
+            .unwrap(),
             Some(DeploymentState::RunningUnverified)
         );
         assert_eq!(
@@ -2908,7 +2931,7 @@ mod tests {
                 &row("running", "\"starting\"", &image),
                 &ids,
                 "app:v1",
-                &image
+                std::slice::from_ref(&image)
             )
             .unwrap(),
             None
@@ -2918,14 +2941,19 @@ mod tests {
                 &row("running", "\"unhealthy\"", &image),
                 &ids,
                 "app:v1",
-                &image
+                std::slice::from_ref(&image)
             )
             .unwrap(),
             Some(DeploymentState::Failed)
         );
         assert_eq!(
-            inspect_deployment_state(&row("exited", "null", &image), &ids, "app:v1", &image)
-                .unwrap(),
+            inspect_deployment_state(
+                &row("exited", "null", &image),
+                &ids,
+                "app:v1",
+                std::slice::from_ref(&image)
+            )
+            .unwrap(),
             Some(DeploymentState::Failed)
         );
         assert_eq!(
@@ -2933,18 +2961,20 @@ mod tests {
                 &row("running", "null", "sha256:wrong"),
                 &ids,
                 "app:v1",
-                &image
+                std::slice::from_ref(&image)
             )
             .unwrap(),
             Some(DeploymentState::Failed)
         );
-        assert!(inspect_deployment_state("", &ids, "app:v1", &image).is_err());
+        assert!(
+            inspect_deployment_state("", &ids, "app:v1", std::slice::from_ref(&image)).is_err()
+        );
         assert!(
             inspect_deployment_state(
                 &row("running", "null", &image),
                 &[id, "c".repeat(64)],
                 "app:v1",
-                &image
+                std::slice::from_ref(&image)
             )
             .is_err()
         );
