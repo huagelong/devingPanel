@@ -2271,6 +2271,114 @@ pub fn stage_deployment(
         ))
 }
 
+fn compose_config_command(
+    endpoint: &str,
+    staged: &StagedDeployment,
+    project_id: i64,
+    reference: &str,
+) -> Result<String, String> {
+    let (image, tag) = reference.rsplit_once(':').ok_or("镜像引用无效。")?;
+    if project_id <= 0
+        || !crate::project_store::valid_image_name(image)
+        || tag.is_empty()
+        || tag.len() > 128
+        || !tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+        || staged.compose_files.is_empty()
+        || staged.compose_files[0].contains('/')
+        || staged.env_path != format!("{}/.env", staged.directory)
+    {
+        return Err("待校验部署配置无效。".into());
+    }
+    let directory = shell_quote(&staged.directory)?;
+    let mut command = format!(
+        "env DEVINGPANEL_IMAGE={} {} -p dp{project_id} --project-directory {directory} --env-file {}",
+        shell_quote(reference)?,
+        docker_command(endpoint, "compose"),
+        shell_quote(&staged.env_path)?
+    );
+    for relative in &staged.compose_files {
+        validated_release_file(relative)?;
+        command.push_str(&format!(
+            " -f {}",
+            shell_quote(&format!("{}/{}", staged.directory, relative))?
+        ));
+    }
+    command.push_str(" config --format json");
+    Ok(command)
+}
+
+fn verified_compose_config(text: &str, service: &str, reference: &str) -> Result<(), String> {
+    let config: Value = serde_json::from_str(text).map_err(|_| "远端 Compose 配置无法解析。")?;
+    let services = config
+        .get("services")
+        .and_then(Value::as_object)
+        .ok_or("远端 Compose 配置缺少服务。")?;
+    if services
+        .get(service)
+        .and_then(|value| value.get("image"))
+        .and_then(Value::as_str)
+        != Some(reference)
+        || services.values().any(|value| {
+            value.get("build").is_some_and(|build| !build.is_null())
+                || value
+                    .get("image")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+        })
+    {
+        return Err("远端 Compose 镜像或构建配置与发布计划不一致。".into());
+    }
+    Ok(())
+}
+
+async fn validate_staged_compose_on(
+    material: ConnectionMaterial,
+    staged: &StagedDeployment,
+    project_id: i64,
+    service: &str,
+    reference: &str,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    if service.is_empty() || service.len() > 256 || cancel.load(Ordering::Relaxed) {
+        return Err("部署服务无效或配置校验已取消。".into());
+    }
+    let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+        .await
+        .map_err(|_| "Compose 校验连接超时。")??;
+    let endpoint = local_docker_endpoint(&handle).await?;
+    let command = compose_config_command(&endpoint, staged, project_id, reference)?;
+    let output = tokio::select! {
+        _ = wait_cancel(cancel) => return Err("远端 Compose 校验已取消。".into()),
+        result = tokio::time::timeout(Duration::from_secs(60), command_limited(&handle, &command, 128 * 1024 * 1024)) =>
+            result.map_err(|_| "远端 Compose 校验超时。")?
+                .map_err(|_| "远端 Compose 校验失败，请检查上传的文件和环境配置。")?,
+    };
+    verified_compose_config(&output, service, reference)?;
+    let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+    Ok(())
+}
+
+#[allow(dead_code)] // The release coordinator stops after validation until deployment is wired up.
+pub fn validate_staged_compose(
+    expected_host: Host,
+    staged: &StagedDeployment,
+    project_id: i64,
+    service: &str,
+    reference: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let material = material_for(&expected_host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化 Compose 校验环境。".to_owned())?
+        .block_on(validate_staged_compose_on(
+            material, staged, project_id, service, reference, &cancel,
+        ))
+}
+
 fn validated_load_target(
     archive: &UploadedArchive,
     reference: &str,
@@ -2429,7 +2537,8 @@ mod tests {
         fetch_monitor, follow_logs, image_size_bytes, memory_kib, merged_mirror_config,
         mirrors_active, network_bytes, parse_disk_preview, parse_inventory, probe, safe_version,
         same_connection_target, shell_quote, valid_docker_signing_key, validated_release_directory,
-        validated_release_file, validated_upload_directory, verified_sha256,
+        validated_release_file, validated_upload_directory, verified_compose_config,
+        verified_sha256,
     };
     use crate::host_store::{ConnectionMaterial, Host};
     use russh::server::{self, Auth, Msg, Server as _, Session};
@@ -2472,6 +2581,48 @@ mod tests {
             "'/root user/发布'\"'\"'s.yaml'"
         );
         assert!(validated_release_directory("/root user", 1, &id).is_ok());
+    }
+
+    #[test]
+    fn compose_validation_checks_exact_target_without_exposing_environment() {
+        let staged = super::StagedDeployment {
+            directory: "/root/release's".into(),
+            compose_files: vec!["compose.yaml".into(), "deploy/发布 配置's.yaml".into()],
+            env_path: "/root/release's/.env".into(),
+        };
+        let command = super::compose_config_command(
+            "unix:///var/run/docker.sock",
+            &staged,
+            7,
+            "sample/app:v1",
+        )
+        .unwrap();
+        assert!(command.contains("DEVINGPANEL_IMAGE='sample/app:v1'"));
+        assert!(command.contains("-p dp7"));
+        assert!(command.contains("--env-file '/root/release'\"'\"'s/.env'"));
+        assert!(command.contains("config --format json"));
+        assert!(
+            super::compose_config_command("unix:///var/run/docker.sock", &staged, 7, "app:tag;rm")
+                .is_err()
+        );
+        let json = r#"{"services":{"web":{"image":"sample/app:v1","environment":{"PASSWORD":"secret"}},"worker":{"image":"redis:7"}}}"#;
+        assert!(verified_compose_config(json, "web", "sample/app:v1").is_ok());
+        assert!(verified_compose_config(json, "web", "sample/app:v2").is_err());
+        assert!(verified_compose_config(json, "missing", "sample/app:v1").is_err());
+        assert!(verified_compose_config("not json", "web", "sample/app:v1").is_err());
+        assert!(
+            !verified_compose_config(json, "web", "sample/app:v2")
+                .unwrap_err()
+                .contains("secret")
+        );
+        assert!(
+            verified_compose_config(
+                r#"{"services":{"web":{"image":"sample/app:v1","build":"."}}}"#,
+                "web",
+                "sample/app:v1"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2602,6 +2753,16 @@ mod tests {
                     &task_id,
                     &files,
                     b"MODE=\"smoke\"\n",
+                    &AtomicBool::new(false),
+                )
+                .await
+                .unwrap();
+                super::validate_staged_compose_on(
+                    material(),
+                    &staged,
+                    987654321,
+                    "web",
+                    "devingpanel/smoke:v1",
                     &AtomicBool::new(false),
                 )
                 .await

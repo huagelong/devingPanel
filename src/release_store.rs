@@ -14,6 +14,8 @@ pub enum Phase {
     AwaitingDeployment,
     Staging,
     Staged,
+    Validating,
+    Validated,
 }
 
 impl Phase {
@@ -29,6 +31,8 @@ impl Phase {
             Self::AwaitingDeployment => "awaiting_deployment",
             Self::Staging => "staging",
             Self::Staged => "staged",
+            Self::Validating => "validating",
+            Self::Validated => "validated",
         }
     }
 }
@@ -147,6 +151,8 @@ fn advance_in(conn: &Connection, id: &str, from: Phase, to: Phase) -> Result<(),
             | (Phase::Loaded, Phase::AwaitingDeployment)
             | (Phase::AwaitingDeployment, Phase::Staging)
             | (Phase::Staging, Phase::Staged)
+            | (Phase::Staged, Phase::Validating)
+            | (Phase::Validating, Phase::Validated)
     ) {
         return Err("发布阶段转换无效。".into());
     }
@@ -308,5 +314,41 @@ mod tests {
         conn.execute("DELETE FROM projects WHERE id = 1", [])
             .unwrap();
         assert!(create_in(&conn, &draft).is_err());
+    }
+
+    #[test]
+    fn compose_validation_requires_staged_files_and_stops_before_deployment() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        seed(&conn);
+        let draft = intent();
+        create_in(&conn, &draft).unwrap();
+        let phases = [
+            Phase::Prepared,
+            Phase::Building,
+            Phase::Built,
+            Phase::Uploading,
+            Phase::Uploaded,
+            Phase::Loading,
+            Phase::Loaded,
+            Phase::AwaitingDeployment,
+            Phase::Staging,
+            Phase::Staged,
+            Phase::Validating,
+            Phase::Validated,
+        ];
+        assert!(advance_in(&conn, &draft.id, Phase::Prepared, Phase::Validating).is_err());
+        for pair in phases.windows(2) {
+            advance_in(&conn, &draft.id, pair[0], pair[1]).unwrap();
+        }
+        settle_in(
+            &conn,
+            &draft.id,
+            Phase::Validated,
+            Outcome::Blocked,
+            "启动尚未实现",
+        )
+        .unwrap();
+        assert!(create_in(&conn, &intent()).is_err());
     }
 }

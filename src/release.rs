@@ -367,7 +367,7 @@ pub fn prepare_single_host(
 }
 
 #[allow(dead_code)] // This stops before Compose up and never reports release success.
-pub fn run_single_host_until_staged(
+pub fn run_single_host_until_validated(
     project_id: i64,
     host_id: i64,
     base_tag: &str,
@@ -457,7 +457,14 @@ pub fn run_single_host_until_staged(
     release_store::advance(&id, Phase::Loaded, Phase::AwaitingDeployment)?;
     release_store::advance(&id, Phase::AwaitingDeployment, Phase::Staging)?;
     on_event("上传 Compose 和环境配置");
-    let staged = match ssh::stage_deployment(host, project_id, &id, &files, &env_file, cancel) {
+    let staged = match ssh::stage_deployment(
+        host.clone(),
+        project_id,
+        &id,
+        &files,
+        &env_file,
+        cancel.clone(),
+    ) {
         Ok(staged) => staged,
         Err(error) => {
             let _ = release_store::settle(
@@ -477,11 +484,30 @@ pub fn run_single_host_until_staged(
         return Err("远端部署文件状态不完整。".into());
     }
     release_store::advance(&id, Phase::Staging, Phase::Staged)?;
+    release_store::advance(&id, Phase::Staged, Phase::Validating)?;
+    on_event("远端校验 Compose 配置");
+    if let Err(error) = ssh::validate_staged_compose(
+        host,
+        &staged,
+        project_id,
+        &project.service,
+        &built.reference,
+        cancel,
+    ) {
+        let _ = release_store::settle(
+            &id,
+            Phase::Validating,
+            Outcome::Unknown,
+            "远端 Compose 配置待核实",
+        );
+        return Err(error);
+    }
+    release_store::advance(&id, Phase::Validating, Phase::Validated)?;
     release_store::settle(
         &id,
-        Phase::Staged,
+        Phase::Validated,
         Outcome::Blocked,
-        "镜像与部署文件已上传，Compose 执行尚未实现",
+        "远端 Compose 配置已校验，启动与健康检查尚未实现",
     )?;
     Ok(id)
 }
