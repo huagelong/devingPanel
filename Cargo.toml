@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.92"
 
 [dependencies]
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 gpui-kit = "0.8.0"
 keyring = "4.2"

@@ -461,9 +461,9 @@ impl AppView {
     }
 
     fn open_edit_host_dialog(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.host_installing == Some(id) {
+        if self.host_installing == Some(id) || self.host_mirror_configuring == Some(id) {
             window.push_notification(
-                Notification::warning("Docker 安装期间不可编辑主机连接配置。"),
+                Notification::warning("Docker 配置操作期间不可编辑主机连接配置。"),
                 cx,
             );
             return;
@@ -640,9 +640,12 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.host_installing == Some(id) {
+        if self.host_installing == Some(id) || self.host_mirror_configuring == Some(id) {
             dialog.submitting.set(false);
-            window.push_notification(Notification::warning("Docker 安装期间不可修改主机。"), cx);
+            window.push_notification(
+                Notification::warning("Docker 配置操作期间不可修改主机。"),
+                cx,
+            );
             return;
         }
         cx.spawn_in(window, async move |view, cx| {
@@ -697,7 +700,10 @@ impl AppView {
     }
 
     fn test_host(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.host_testing.is_some() || self.host_installing.is_some() {
+        if self.host_testing.is_some()
+            || self.host_installing.is_some()
+            || self.host_mirror_configuring.is_some()
+        {
             return;
         }
         self.host_testing = Some(id);
@@ -893,6 +899,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         if self.host_installing.is_some()
+            || self.host_mirror_configuring.is_some()
             || !matches!(
                 self.host_tests.get(&id),
                 Some(HostTestState::DockerMissing { .. })
@@ -960,6 +967,100 @@ impl AppView {
                     Ok(()) => {
                         window.push_notification(
                             Notification::success("Docker 已安装；正在重新测试连接"),
+                            app,
+                        );
+                        let _ = view.update(app, |view, cx| view.test_host(id, window, cx));
+                    }
+                    Err(error) => window.push_notification(Notification::error(error), app),
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_mirror_config(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.host_installing.is_some() || self.host_mirror_configuring.is_some() {
+            return;
+        }
+        let Some(host) = self.hosts.iter().find(|host| host.id == id) else {
+            return;
+        };
+        if host.username != "root"
+            || host.trusted_fingerprint.is_none()
+            || !matches!(
+                self.host_tests.get(&id),
+                Some(HostTestState::Connected { stale: false, .. })
+            )
+        {
+            return;
+        }
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm_view = view.clone();
+            dialog
+                .title("配置 Docker Hub 镜像源")
+                .w(px(560.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child("将保留 daemon.json 中其他设置，仅将 registry-mirrors 设置为：")
+                        .child("https://docker.1panel.live")
+                        .child("https://docker.m.daocloud.io")
+                        .child("操作会重启 Docker；如果有运行中的容器，将阻断而不修改。公共镜像源可能记录镜像名称，生产镜像请优先使用受控 Registry 并固定 digest。"),
+                )
+                .footer(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(Button::new("mirror-cancel").label("取消").on_click(
+                            |_, window, cx| window.close_dialog(cx),
+                        ))
+                        .child(Button::new("mirror-confirm").primary().label("确认配置").on_click(
+                            move |_, window, cx| {
+                                window.close_dialog(cx);
+                                let _ = confirm_view.update(cx, |view, cx| {
+                                    view.start_mirror_config(id, window, cx)
+                                });
+                            },
+                        )),
+                )
+        });
+    }
+
+    fn start_mirror_config(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.host_installing.is_some() || self.host_mirror_configuring.is_some() {
+            return;
+        }
+        let Some(host) = self.hosts.iter().find(|host| host.id == id).cloned() else {
+            return;
+        };
+        self.host_mirror_configuring = Some(id);
+        self.host_mirror_error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { ssh::configure_registry_mirrors(host, |_| {}) })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.host_mirror_configuring = None;
+                    if let Err(error) = &result {
+                        view.host_mirror_error = Some((id, error.clone()));
+                    }
+                    cx.notify();
+                });
+                match result {
+                    Ok(ssh::MirrorConfigResult::AlreadyConfigured) => window.push_notification(
+                        Notification::success("Docker 镜像源已一致，无需重启"),
+                        app,
+                    ),
+                    Ok(ssh::MirrorConfigResult::Updated) => {
+                        window.push_notification(
+                            Notification::success("Docker 镜像源已配置并验证"),
                             app,
                         );
                         let _ = view.update(app, |view, cx| view.test_host(id, window, cx));
@@ -1128,8 +1229,11 @@ impl AppView {
     }
 
     fn confirm_host_delete(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.host_installing == Some(id) {
-            window.push_notification(Notification::warning("Docker 安装期间不可删除主机。"), cx);
+        if self.host_installing == Some(id) || self.host_mirror_configuring == Some(id) {
+            window.push_notification(
+                Notification::warning("Docker 配置操作期间不可删除主机。"),
+                cx,
+            );
             return;
         }
         let Some(host) = self.hosts.iter().find(|host| host.id == id) else {
@@ -1219,9 +1323,12 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.host_installing == Some(id) {
+        if self.host_installing == Some(id) || self.host_mirror_configuring == Some(id) {
             submitting.set(false);
-            window.push_notification(Notification::warning("Docker 安装期间不可删除主机。"), cx);
+            window.push_notification(
+                Notification::warning("Docker 配置操作期间不可删除主机。"),
+                cx,
+            );
             return;
         }
         cx.spawn_in(window, async move |view, cx| {
@@ -1996,6 +2103,11 @@ impl AppView {
                 Some(HostTestState::DockerMissing { os_id, os_version, architecture: Some(platform), .. })
                     if os_id == "debian" && os_version == "13" && platform == "linux/amd64"
             );
+        let mirror_available = host.username == "root"
+            && matches!(
+                self.host_tests.get(&id),
+                Some(HostTestState::Connected { stale: false, .. })
+            );
         div()
             .flex()
             .flex_col()
@@ -2130,6 +2242,28 @@ impl AppView {
                                         .when(self.host_installing == Some(id), |el| {
                                             el.child(self.host_install_stage.clone().unwrap_or_else(|| "安装中…".into()))
                                         }),
+                                )
+                            })
+                            .when(mirror_available, |el| {
+                                el.child(
+                                    div()
+                                        .border_1()
+                                        .border_color(self.palette().border)
+                                        .rounded_lg()
+                                        .p_4()
+                                        .flex()
+                                        .flex_col()
+                                        .items_start()
+                                        .gap_3()
+                                        .child("Docker Hub 镜像源")
+                                        .child("已实测候选：1Panel、DaoCloud。配置时保留其他 daemon 设置；会重启 Docker，运行容器不为空则阻断。")
+                                        .when_some(self.host_mirror_error.as_ref().filter(|(failed_id, _)| *failed_id == id), |el, (_, error)| {
+                                            el.child(div().text_color(self.palette().destructive).child(error.clone()))
+                                        })
+                                        .child(Button::new("mirror-config-open")
+                                            .label(if self.host_mirror_configuring == Some(id) { "正在配置镜像源…" } else { "配置镜像源" })
+                                            .disabled(self.host_installing.is_some() || self.host_mirror_configuring.is_some())
+                                            .on_click(cx.listener(move |view, _, window, cx| view.confirm_mirror_config(id, window, cx)))),
                                 )
                             })
                             .child(div().text_color(color).child(format!(

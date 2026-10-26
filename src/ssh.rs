@@ -1,4 +1,5 @@
 use crate::host_store::{self, ConnectionMaterial, Host};
+use base64::Engine as _;
 use russh::client;
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{ChannelMsg, Disconnect};
@@ -62,6 +63,45 @@ impl DockerInstallSource {
 }
 
 const DOCKER_GPG_FINGERPRINT: &str = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88";
+pub const VERIFIED_REGISTRY_MIRRORS: [&str; 2] =
+    ["https://docker.1panel.live", "https://docker.m.daocloud.io"];
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum MirrorConfigResult {
+    AlreadyConfigured,
+    Updated,
+}
+
+fn merged_mirror_config(existing: Option<&str>) -> Result<Option<Vec<u8>>, String> {
+    let mut config = match existing {
+        Some(text) => serde_json::from_str::<Value>(text)
+            .map_err(|_| "现有 Docker daemon.json 不是有效 JSON，未修改。")?,
+        None => Value::Object(Default::default()),
+    };
+    let object = config
+        .as_object_mut()
+        .ok_or("现有 Docker daemon.json 不是对象，未修改。")?;
+    let mirrors = VERIFIED_REGISTRY_MIRRORS
+        .iter()
+        .map(|mirror| Value::String((*mirror).into()))
+        .collect::<Vec<_>>();
+    if object.get("registry-mirrors") == Some(&Value::Array(mirrors.clone())) {
+        return Ok(None);
+    }
+    object.insert("registry-mirrors".into(), Value::Array(mirrors));
+    serde_json::to_vec_pretty(&config)
+        .map(Some)
+        .map_err(|_| "无法生成 Docker daemon.json。".into())
+}
+
+fn mirrors_active(text: &str) -> bool {
+    serde_json::from_str::<Vec<String>>(text.trim()).is_ok_and(|actual| {
+        actual
+            .iter()
+            .map(|url| url.trim_end_matches('/'))
+            .eq(VERIFIED_REGISTRY_MIRRORS)
+    })
+}
 
 fn valid_docker_signing_key(text: &str) -> bool {
     text.lines().filter(|line| line.starts_with("pub:")).count() == 1
@@ -1325,6 +1365,239 @@ pub fn install_docker(
     }
 }
 
+async fn configure_mirrors_on(
+    material: ConnectionMaterial,
+    on_stage: &mut dyn FnMut(&str),
+) -> Result<MirrorConfigResult, String> {
+    if material.host.username != "root" {
+        return Err("配置 Docker 镜像源需要 root 登录。".into());
+    }
+    let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+        .await
+        .map_err(|_| "镜像源配置 SSH 连接超时。")??;
+    if archive_command(&handle, "id -u").await?.trim() != "0" {
+        return Err("远端登录用户不是 root，未修改 Docker 配置。".into());
+    }
+    let endpoint = tokio::time::timeout(Duration::from_secs(10), local_docker_endpoint(&handle))
+        .await
+        .map_err(|_| "无法核对远端 Docker 端点。")??;
+    if endpoint != "unix:///var/run/docker.sock"
+        || archive_command(
+            &handle,
+            "sh -c 'test -S /var/run/docker.sock && systemctl is-active docker'",
+        )
+        .await?
+        .trim()
+            != "active"
+    {
+        return Err("当前 Docker context 不是系统 docker.service 的默认 socket，拒绝重启。".into());
+    }
+    let status_command = "sh -c 'if test -L /etc/docker/daemon.json; then echo symlink; elif test -f /etc/docker/daemon.json; then echo file; elif test -e /etc/docker/daemon.json; then echo other; else echo absent; fi'";
+    let status = archive_command(&handle, status_command).await?;
+    let original = match status.trim() {
+        "file" => Some(
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                command_limited(&handle, "cat -- /etc/docker/daemon.json", 64 * 1024),
+            )
+            .await
+            .map_err(|_| "读取现有 Docker 配置超时。")??,
+        ),
+        "absent" => None,
+        _ => return Err("现有 Docker daemon.json 路径不是普通文件，未修改。".into()),
+    };
+    let update = merged_mirror_config(original.as_deref())?;
+    if update.is_none() {
+        let active = archive_command(
+            &handle,
+            &docker_command(
+                &endpoint,
+                "info --format '{{json .RegistryConfig.Mirrors}}'",
+            ),
+        )
+        .await?;
+        if mirrors_active(&active) {
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+            return Ok(MirrorConfigResult::AlreadyConfigured);
+        }
+    }
+    let bytes = match update {
+        Some(bytes) => bytes,
+        None => original.as_ref().unwrap().as_bytes().to_vec(),
+    };
+    if bytes.len() > 64 * 1024 {
+        return Err("Docker daemon.json 太大，未修改。".into());
+    }
+    let running = archive_command(&handle, &docker_command(&endpoint, "ps -q")).await?;
+    if !running.trim().is_empty() {
+        return Err("主机存在运行中的容器，重启 Docker 会中断服务；未修改配置。".into());
+    }
+    if archive_command(&handle, "sh -c 'test -d /run/systemd/system && command -v base64 >/dev/null && command -v dockerd >/dev/null && echo ready'")
+        .await?
+        .trim() != "ready"
+    {
+        return Err("主机缺少 systemd、base64 或 dockerd，未修改配置。".into());
+    }
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let temp = format!("/etc/docker/.devingpanel-{nonce}.json");
+    let backup = format!("/etc/docker/.devingpanel-{nonce}.bak");
+    let new_digest = format!("{:x}", Sha256::digest(&bytes));
+    let old_digest = original
+        .as_ref()
+        .map(|text| format!("{:x}", Sha256::digest(text.as_bytes())));
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    on_stage("准备并验证 Docker 配置");
+    if let Err(error) = archive_command(
+        &handle,
+        &format!("sh -c 'umask 077; test ! -e {temp} && printf %s {encoded} | base64 -d > {temp}'"),
+    )
+    .await
+    {
+        let _ = archive_command(&handle, &format!("rm -f -- {temp}")).await;
+        return Err(error);
+    }
+    let lock = "/etc/docker/.devingpanel-mirror.lock";
+    if archive_command(&handle, &format!("mkdir -m 700 -- {lock}"))
+        .await
+        .is_err()
+    {
+        let _ = archive_command(&handle, &format!("rm -f -- {temp}")).await;
+        return Err(format!(
+            "另一客户端正在配置 Docker，或上次操作残留锁 {lock}；未修改配置。"
+        ));
+    }
+    let result = async {
+        archive_command(&handle, &format!("dockerd --validate --config-file {temp}")).await?;
+        let current = archive_command(&handle, status_command).await?;
+        if current.trim() != status.trim() {
+            return Err("Docker 配置在操作期间发生变化，未覆盖。".into());
+        }
+        if !archive_command(&handle, &docker_command(&endpoint, "ps -q"))
+            .await?
+            .trim()
+            .is_empty()
+        {
+            return Err("配置期间出现运行中的容器，未重启 Docker。".into());
+        }
+        if let Some(original_text) = &original {
+            let initial = verified_sha256(
+                &archive_command(&handle, "sha256sum -- /etc/docker/daemon.json").await?,
+            )?;
+            let local = format!("{:x}", Sha256::digest(original_text.as_bytes()));
+            if initial != local {
+                return Err("Docker 配置在操作期间发生变化，未覆盖。".into());
+            }
+            archive_command(
+                &handle,
+                &format!("cp -p -- /etc/docker/daemon.json {backup} && chmod 600 -- {backup}"),
+            )
+            .await?;
+        }
+        archive_command(&handle, &format!("mv -T -- {temp} /etc/docker/daemon.json")).await?;
+        Ok::<_, String>(())
+    }
+    .await;
+    if let Err(error) = result {
+        let current = async {
+            match archive_command(&handle, status_command).await?.trim() {
+                "absent" => Ok(None),
+                "file" => verified_sha256(
+                    &archive_command(&handle, "sha256sum -- /etc/docker/daemon.json").await?,
+                )
+                .map(Some),
+                _ => Err("Docker 配置路径已变化。".into()),
+            }
+        }
+        .await;
+        match current {
+            Ok(Some(digest)) if digest == new_digest => {}
+            Ok(digest) if digest == old_digest => {
+                let _ = archive_command(&handle, &format!("rm -f -- {temp} {backup}")).await;
+                let _ = archive_command(&handle, &format!("rmdir -- {lock}")).await;
+                return Err(error);
+            }
+            _ => {
+                return Err(format!(
+                    "{error}；Docker 配置结果待核实，请检查 {temp}、{backup}、daemon.json 和 {lock}。"
+                ));
+            }
+        }
+    }
+    on_stage("重启并验证 Docker");
+    let restart = tokio::time::timeout(
+        Duration::from_secs(90),
+        command_limited(&handle, "systemctl restart docker", 4096),
+    )
+    .await;
+    if restart.is_err() {
+        return Err(if original.is_some() {
+            format!("Docker 重启超时，结果待核实；请核对备份 {backup} 和锁 {lock}。")
+        } else {
+            format!("Docker 重启超时，结果待核实；请核对 daemon.json、服务状态和锁 {lock}。")
+        });
+    }
+    let verified = async {
+        restart.unwrap()?;
+        if archive_command(&handle, "systemctl is-active docker")
+            .await?
+            .trim()
+            != "active"
+        {
+            return Err("Docker 服务未启动。".into());
+        }
+        let active = archive_command(
+            &handle,
+            &docker_command(
+                &endpoint,
+                "info --format '{{json .RegistryConfig.Mirrors}}'",
+            ),
+        )
+        .await?;
+        if !mirrors_active(&active) {
+            return Err("Docker 未加载预期镜像源。".into());
+        }
+        Ok::<_, String>(())
+    }
+    .await;
+    if let Err(error) = verified {
+        let restore = if original.is_some() {
+            format!("mv -T -- {backup} /etc/docker/daemon.json && systemctl restart docker")
+        } else {
+            "rm -f -- /etc/docker/daemon.json && systemctl restart docker".into()
+        };
+        return match archive_command_with_timeout(&handle, &restore, Duration::from_secs(90)).await
+        {
+            Ok(_) => {
+                let _ = archive_command(&handle, &format!("rmdir -- {lock}")).await;
+                Err(format!("{error}；原 Docker 配置已恢复。"))
+            }
+            Err(_) => Err(format!(
+                "{error}；自动恢复失败，需在 VPS 核对 {backup} 和 {lock}。"
+            )),
+        };
+    }
+    if original.is_some() {
+        let _ = archive_command(&handle, &format!("rm -f -- {backup}")).await;
+    }
+    archive_command(&handle, &format!("rmdir -- {lock}"))
+        .await
+        .map_err(|_| format!("Docker 镜像源已生效，但锁 {lock} 未清理；请人工核对。"))?;
+    let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+    Ok(MirrorConfigResult::Updated)
+}
+
+pub fn configure_registry_mirrors(
+    expected_host: Host,
+    mut on_stage: impl FnMut(&str),
+) -> Result<MirrorConfigResult, String> {
+    let material = material_for(&expected_host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化 Docker 镜像源配置环境。".to_owned())?
+        .block_on(configure_mirrors_on(material, &mut on_stage))
+}
+
 async fn fetch_inventory(material: ConnectionMaterial) -> Result<Inventory, String> {
     let handle = trusted_handle(material).await?;
     let endpoint = local_docker_endpoint(&handle).await?;
@@ -1895,9 +2168,10 @@ mod tests {
         apt_candidates_use_source, cleanup_archive_command, container_command, cpu_counters,
         default_route_interface, disk_available, disk_percent, docker_install_commands,
         execute_container_action, execute_disk_prune, fetch_disk_preview, fetch_inventory,
-        fetch_monitor, follow_logs, image_size_bytes, memory_kib, network_bytes,
-        parse_disk_preview, parse_inventory, probe, safe_version, same_connection_target,
-        valid_docker_signing_key, validated_upload_directory, verified_sha256,
+        fetch_monitor, follow_logs, image_size_bytes, memory_kib, merged_mirror_config,
+        mirrors_active, network_bytes, parse_disk_preview, parse_inventory, probe, safe_version,
+        same_connection_target, valid_docker_signing_key, validated_upload_directory,
+        verified_sha256,
     };
     use crate::host_store::{ConnectionMaterial, Host};
     use russh::server::{self, Auth, Msg, Server as _, Session};
@@ -1910,6 +2184,27 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
+
+    #[test]
+    fn mirror_config_preserves_other_keys_and_recognizes_active_values() {
+        let original = r#"{"log-driver":"json-file","registry-mirrors":["https://old.example"]}"#;
+        let updated = merged_mirror_config(Some(original)).unwrap().unwrap();
+        let row: serde_json::Value = serde_json::from_slice(&updated).unwrap();
+        assert_eq!(row["log-driver"], "json-file");
+        assert_eq!(row["registry-mirrors"][0], "https://docker.1panel.live");
+        assert_eq!(row["registry-mirrors"][1], "https://docker.m.daocloud.io");
+        assert!(
+            merged_mirror_config(Some(std::str::from_utf8(&updated).unwrap()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(merged_mirror_config(Some("[]")).is_err());
+        assert!(merged_mirror_config(Some("not json")).is_err());
+        assert!(mirrors_active(
+            r#"["https://docker.1panel.live/","https://docker.m.daocloud.io/"]"#
+        ));
+        assert!(!mirrors_active(r#"["https://untrusted.example/"]"#));
+    }
 
     #[test]
     #[ignore = "requires an explicitly configured real VPS; creates and removes one private temporary upload"]
@@ -1960,6 +2255,12 @@ mod tests {
                 let _ = policy_handle
                     .disconnect(russh::Disconnect::ByApplication, "", "en")
                     .await;
+                assert_eq!(
+                    super::configure_mirrors_on(material(), &mut |_| panic!("must not restart"))
+                        .await
+                        .unwrap(),
+                    super::MirrorConfigResult::AlreadyConfigured
+                );
                 let path = std::env::temp_dir().join(format!(
                     "devingpanel-vps-upload-{}",
                     uuid::Uuid::new_v4().simple()

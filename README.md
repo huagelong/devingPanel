@@ -40,6 +40,8 @@
 
 用户提供 Docker Hub 镜像源名单后，从 VPS 逐个检查 `/v2/`：`docker.1panel.live` 返回 200，`docker.m.daocloud.io` 与阿里云地址返回可继续鉴权的 401，南京大学地址返回 403，网易/中科大地址 DNS 失败，`dockerproxy.com` 与 `registry.docker-cn.com` 超时。1Panel 与 DaoCloud 均实际拉取了相同 digest 的小型 BusyBox 镜像，随后仅将这两个已验证地址写入此前不存在的 VPS `/etc/docker/daemon.json`。配置经 `dockerd --validate` 通过，重启后 Docker/containerd 正常、镜像源出现在 `docker info`，默认 `docker pull busybox:latest` 成功；测试镜像均已清理，容器数仍为 0。此为这台 VPS 在测试时的连通性，不保证公共镜像源持续可用或内容可信；生产 Compose 依赖建议使用受控 Registry 并固定镜像 digest。客户端的一键安装流程仍不自动设置公共镜像加速器。
 
+主机详情“基本信息”现提供独立的“配置镜像源”操作：显式确认后仅合并 `daemon.json` 的 `registry-mirrors` 为已实测的 1Panel/DaoCloud，保留其他 JSON 字段；运行中容器或不可信配置文件阻断操作。写入前后核对原配置、校验 daemon 配置和服务状态，失败尝试恢复原配置；配置已一致时不重启。远端私有锁避免本应用并发改写；外部管理员不遵守此锁时仍需协调维护窗口，超时后可能留下需人工核实的备份与锁。应用内 russh 在这台 VPS 验证了“已一致”路径，修改/失败恢复路径仍待隔离实机验收。不会把用户提供但未通过拉取的其他公开地址默认写入代码。
+
 ## 本地运行
 
 先安装 Rust 1.92+ MSVC 工具链、Visual Studio C++ Build Tools（含 Windows SDK）及 CMake。其他平台的系统依赖见 [GPUI Kit 安装说明](https://gpui-kit.com/docs/installation)。
