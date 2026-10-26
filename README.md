@@ -57,6 +57,8 @@ deploy:
 
 测试仓库 `D:\code\devinggo4vb` 的单主机链路已在可信 VPS 完成构建、SFTP 上传、`docker load`、Compose 配置校验、目标服务启动与只读核实。实测发现本机 Docker Desktop 镜像 ID 和远端加载后的 ID 不同，现依据已核验归档中的配置/平台 manifest ID 验证远端 tag 与容器。测试容器退出码 1（非 OOM），日志分类提示 Redis 连接超时，任务记录为 `checked/blocked`，未宣称发布成功或自动重试；测试容器和镜像暂留远端以便人工核对。测试项目仅将 8070 映射到远端本机 `127.0.0.1:18070`；本机现有数据库和 Redis 容器未被操作。
 
+随后测试项目改用独立 Compose PostgreSQL/Redis 与测试专用 Dockerfile：镜像内配置只指向 `db:5432` 和 `redis:6379`，依赖容器仅加入内部网络，不发布端口；Web 同时加入独立前端网络，仅将 8070 绑定到 VPS 本机 `127.0.0.1:18070`。实机依赖均 healthy，应用的 Compose 健康检查也 healthy，从 VPS 本机请求 `/api.json` 返回 HTTP 200。内部协调器仍将这次健康运行记录为 `checked/blocked`，因为可恢复版本历史与人工处理入口未完成；且依赖容器在本次测试中是事先手动启动的，尚不代表一键发布可自行编排整个多服务项目。测试栈留在 VPS 供核对。
+
 在用户通过 VPS 控制台独立核对 ED25519 主机指纹后，使用固定的主机密钥连接 `129.211.23.223:22`。系统 OpenSSH 密码登录、`uname`、根目录 `df -Pk /` 和 SFTP `pwd` 成功；服务器为 Debian Linux `x86_64`，根目录约有 47 GiB 可用空间。远端执行 `docker version` 与 `docker compose version` 均返回 `docker: command not found`。没有上传文件、修改服务器或尝试部署。此测试不等于应用内 SSH/SFTP 适配器验收；此为安装前的只读基线；随后在用户明确授权后完成安装和隔离传输测试。
 
 主机测试现将可信 SSH 已连通但 Docker 命令缺失与认证/daemon 失败区分，主机详情“基本信息”按 WebUI 的警告卡片提供安装引导。仅 Debian 13 x86_64、root 和已确认指纹可在二次确认后选择腾讯云 Docker CE 镜像或官方 apt 源一键安装；安装前核对 Docker 官方 GPG 主密钥指纹，以 `Signed-By` 限制仓库并按所选域名固定 Docker 包优先级、核对 apt 候选来源，`apt --no-remove` 不自动移除已有包，完成后重新测试 Docker/Compose。其他系统只显示人工安装提示。已在 VPS 只读确认腾讯云镜像与官方仓库的 Debian 13 元数据和密钥可访问，镜像密钥与官方密钥字节一致；**已在 VPS 实际安装** Docker CE/CLI 29.9.2、containerd.io 2.4.2、Buildx 0.38.1 和 Compose 5.6.1，daemon 与 containerd 服务均正常。安装中退出客户端或 SSH 中断可能留下部分软件源/包，需要人工核对，不自动重跑；Docker Hub 镜像加速不预设第三方代理；Compose 中其他公共服务镜像仍可能需要可信 Registry/云厂商专属加速地址或预置镜像。当前发布按钮依然禁用。
