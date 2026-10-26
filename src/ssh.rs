@@ -1471,6 +1471,149 @@ pub fn cleanup_uploaded_archive(
         })
 }
 
+fn validated_load_target(
+    archive: &UploadedArchive,
+    reference: &str,
+    image_id: &str,
+    platform: &str,
+) -> Result<(), String> {
+    let directory = validated_upload_directory(&archive.directory)?;
+    if archive.path != format!("{directory}/image.tar")
+        || archive.bytes == 0
+        || archive.sha256.len() != 64
+        || !archive.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("远端镜像归档信息无效。".into());
+    }
+    let (image, tag) = reference.rsplit_once(':').ok_or("镜像引用无效。")?;
+    if !crate::project_store::valid_image_name(image)
+        || tag.is_empty()
+        || tag.len() > 128
+        || !tag
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        || !tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+        || image_id.len() != 71
+        || !image_id.starts_with("sha256:")
+        || !image_id[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !matches!(platform, "linux/amd64" | "linux/arm64")
+    {
+        return Err("待加载镜像引用、ID 或架构无效。".into());
+    }
+    Ok(())
+}
+
+fn verified_loaded_image(text: &str, image_id: &str, platform: &str) -> Result<(), String> {
+    let row: Value = serde_json::from_str(text).map_err(|_| "远端镜像元数据无效，结果待核实。")?;
+    let actual = format!(
+        "{}/{}",
+        row.get("Os").and_then(Value::as_str).unwrap_or_default(),
+        row.get("Architecture")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    );
+    if row.get("Id").and_then(Value::as_str) != Some(image_id) || actual != platform {
+        return Err("远端镜像 ID 或架构与本机构建结果不一致，禁止部署。".into());
+    }
+    Ok(())
+}
+
+async fn load_archive(
+    material: ConnectionMaterial,
+    archive: &UploadedArchive,
+    reference: &str,
+    image_id: &str,
+    platform: &str,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    validated_load_target(archive, reference, image_id, platform)?;
+    let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+        .await
+        .map_err(|_| "远端镜像加载连接超时。")??;
+    let endpoint = tokio::time::timeout(Duration::from_secs(10), local_docker_endpoint(&handle))
+        .await
+        .map_err(|_| "远端 Docker 端点检查超时。")??;
+    let host_platform = linux_platform(&archive_command(&handle, "uname -m").await?);
+    let daemon_platform = archive_command(
+        &handle,
+        &docker_command(&endpoint, "info --format '{{.OSType}}/{{.Architecture}}'"),
+    )
+    .await?;
+    let daemon_platform = match daemon_platform.trim() {
+        "linux/x86_64" | "linux/amd64" => Some("linux/amd64"),
+        "linux/aarch64" | "linux/arm64" => Some("linux/arm64"),
+        _ => None,
+    };
+    if host_platform != Some(platform) || daemon_platform != Some(platform) {
+        return Err("远端主机或 Docker daemon 架构与待加载镜像不一致。".into());
+    }
+    let checksum_command = format!("sha256sum -- {}", archive.path);
+    let digest = tokio::select! {
+        _ = wait_cancel(cancel) => return Err("远端归档复核已取消，尚未加载镜像。".into()),
+        result = archive_command_with_timeout(&handle, &checksum_command, Duration::from_secs(60 * 60)) =>
+            verified_sha256(&result?)?,
+    };
+    if digest != archive.sha256 {
+        return Err("远端镜像归档校验值已变化，禁止加载。".into());
+    }
+    let existing = archive_command(
+        &handle,
+        &docker_command(
+            &endpoint,
+            &format!("image ls --filter reference={reference} --format '{{{{.Repository}}}}:{{{{.Tag}}}}'"),
+        ),
+    )
+    .await?;
+    if existing.lines().any(|line| line == reference) {
+        return Err("远端镜像 tag 已存在，禁止覆盖。".into());
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("远端镜像加载已取消，尚未执行。".into());
+    }
+    let load = docker_command(&endpoint, &format!("image load --input {}", archive.path));
+    tokio::select! {
+        _ = wait_cancel(cancel) => return Err("远端镜像加载已取消，结果待核实；请保留临时归档。".into()),
+        result = tokio::time::timeout(Duration::from_secs(60 * 60), command_limited(&handle, &load, 64 * 1024)) =>
+            result.map_err(|_| "远端镜像加载超时，结果待核实；请保留临时归档。")?
+                .map_err(|_| "远端镜像加载失败或连接中断，结果待核实；请保留临时归档。")?,
+    };
+    let inspect_format = concat!(
+        "image inspect --format '",
+        r#"{"Id":{{json .Id}},"Os":{{json .Os}},"Architecture":{{json .Architecture}}}"#,
+        "' "
+    );
+    let inspect = docker_command(&endpoint, &format!("{inspect_format}{reference}"));
+    let result = archive_command(&handle, &inspect)
+        .await
+        .map_err(|_| "远端镜像加载后无法核对元数据，结果待核实。")?;
+    verified_loaded_image(&result, image_id, platform)?;
+    let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+    Ok(())
+}
+
+#[allow(dead_code)] // The release coordinator will call this before deploying Compose.
+pub fn load_uploaded_archive(
+    expected_host: Host,
+    archive: &UploadedArchive,
+    reference: &str,
+    image_id: &str,
+    platform: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    validated_load_target(archive, reference, image_id, platform)?;
+    let material = material_for(&expected_host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化远端镜像加载环境。".to_owned())?
+        .block_on(load_archive(
+            material, archive, reference, image_id, platform, &cancel,
+        ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1767,6 +1910,8 @@ mod tests {
         upload_channels: Arc<tokio::sync::Mutex<HashMap<ChannelId, Channel<Msg>>>>,
         upload_files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         upload_fail_write: Arc<AtomicBool>,
+        load_tag_exists: Arc<AtomicBool>,
+        load_no_exit: Arc<AtomicBool>,
     }
 
     struct MemorySftp {
@@ -2013,6 +2158,25 @@ mod tests {
                 session.close(channel)?;
                 return Ok(());
             }
+            if data == br#"docker --host unix:///var/run/docker.sock image inspect --format '{"Id":{{json .Id}},"Os":{{json .Os}},"Architecture":{{json .Architecture}}}' app:load-test"# {
+                let response = format!(
+                    "{{\"Id\":\"sha256:{}\",\"Os\":\"linux\",\"Architecture\":\"amd64\"}}\n",
+                    "a".repeat(64)
+                );
+                session.channel_success(channel)?;
+                session.data(channel, response.into_bytes())?;
+                session.exit_status_request(channel, 0)?;
+                session.eof(channel)?;
+                session.close(channel)?;
+                return Ok(());
+            }
+            if data.starts_with(b"docker --host unix:///var/run/docker.sock image load --input ")
+                && self.load_no_exit.load(Ordering::SeqCst)
+            {
+                session.channel_success(channel)?;
+                session.close(channel)?;
+                return Ok(());
+            }
             if data == b"docker --host unix:///var/run/docker.sock logs --follow --tail 1000 --timestamps abc123" {
                 session.channel_success(channel)?;
                 session.data(channel, b"2026-10-26 stdout".to_vec())?;
@@ -2072,6 +2236,19 @@ mod tests {
                 b"docker --host unix:///var/run/docker.sock ps --all --format '{{json .}}'" => b"{\"ID\":\"abc123\",\"Names\":\"web\",\"Image\":\"app:v1\",\"Status\":\"Up\",\"State\":\"running\",\"Ports\":\"\"}\n".as_slice(),
                 b"docker --host unix:///var/run/docker.sock ps --filter status=running --format '{{json .}}'" => b"{\"ID\":\"abc123\",\"Names\":\"web\",\"Image\":\"app:v1\",\"Status\":\"Up\",\"State\":\"running\",\"Ports\":\"\"}\n".as_slice(),
                 b"docker --host unix:///var/run/docker.sock image ls --format '{{json .}}'" => b"{\"Repository\":\"app\",\"Tag\":\"v1\",\"Size\":\"180MB\",\"CreatedSince\":\"now\"}\n".as_slice(),
+                b"docker --host unix:///var/run/docker.sock image ls --filter reference=app:load-test --format '{{.Repository}}:{{.Tag}}'" => if self.load_tag_exists.load(Ordering::SeqCst) {
+                    b"app:load-test\n".as_slice()
+                } else {
+                    b"".as_slice()
+                },
+                command if command.starts_with(b"docker --host unix:///var/run/docker.sock image load --input ") => {
+                    let path = std::str::from_utf8(command.strip_prefix(b"docker --host unix:///var/run/docker.sock image load --input ").unwrap()).map_err(|_| russh::Error::Disconnect)?;
+                    if !self.upload_files.lock().unwrap().contains_key(path) {
+                        return Err(russh::Error::Disconnect);
+                    }
+                    self.operations.lock().unwrap().push(String::from_utf8_lossy(data).into_owned());
+                    b"Loaded image: app:load-test\n".as_slice()
+                }
                 b"docker --host unix:///var/run/docker.sock stats --no-stream --all --format '{{json .}}'" => b"{\"ID\":\"abc123\",\"CPUPerc\":\"1%\",\"MemUsage\":\"10MiB / 1GiB\"}\n".as_slice(),
                 b"docker --host unix:///var/run/docker.sock stats --no-stream --format '{{json .}}'" => b"{\"ID\":\"abc123\",\"CPUPerc\":\"1%\",\"MemUsage\":\"10MiB / 1GiB\"}\n".as_slice(),
                 b"cat /proc/net/route" => b"Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\neth0 00000000 0100007F 0003 0 0 100 00000000 0 0 0\n".as_slice(),
@@ -2127,6 +2304,8 @@ mod tests {
         let upload_sftp = Arc::new(AtomicBool::new(false));
         let upload_files = Arc::new(Mutex::new(HashMap::new()));
         let upload_fail_write = Arc::new(AtomicBool::new(false));
+        let load_tag_exists = Arc::new(AtomicBool::new(false));
+        let load_no_exit = Arc::new(AtomicBool::new(false));
         let config = Arc::new(server::Config {
             keys: vec![key],
             auth_rejection_time: Duration::from_millis(10),
@@ -2153,6 +2332,8 @@ mod tests {
             upload_channels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             upload_files: upload_files.clone(),
             upload_fail_write: upload_fail_write.clone(),
+            load_tag_exists: load_tag_exists.clone(),
+            load_no_exit: load_no_exit.clone(),
         };
         let running = server.run_on_socket(config, &listener);
         let handle = running.handle();
@@ -2389,6 +2570,125 @@ mod tests {
                 progress.last(),
                 Some(&(bytes.len() as u64, bytes.len() as u64))
             );
+            Box::pin(async {
+                let image_id = format!("sha256:{}", "a".repeat(64));
+                assert!(
+                    super::load_archive(
+                        material(Some(fingerprint.clone())),
+                        &upload,
+                        "app;bad:tag",
+                        &image_id,
+                        "linux/amd64",
+                        &AtomicBool::new(false),
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_eq!(operations.lock().unwrap().len(), 5);
+                wrong_daemon_arch.store(true, Ordering::SeqCst);
+                assert!(
+                    super::load_archive(
+                        material(Some(fingerprint.clone())),
+                        &upload,
+                        "app:load-test",
+                        &image_id,
+                        "linux/amd64",
+                        &AtomicBool::new(false),
+                    )
+                    .await
+                    .is_err()
+                );
+                wrong_daemon_arch.store(false, Ordering::SeqCst);
+                let altered = super::UploadedArchive {
+                    directory: upload.directory.clone(),
+                    path: upload.path.clone(),
+                    bytes: upload.bytes,
+                    sha256: "b".repeat(64),
+                };
+                assert!(
+                    super::load_archive(
+                        material(Some(fingerprint.clone())),
+                        &altered,
+                        "app:load-test",
+                        &image_id,
+                        "linux/amd64",
+                        &AtomicBool::new(false),
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_eq!(operations.lock().unwrap().len(), 5);
+                load_tag_exists.store(true, Ordering::SeqCst);
+                assert!(
+                    super::load_archive(
+                        material(Some(fingerprint.clone())),
+                        &upload,
+                        "app:load-test",
+                        &image_id,
+                        "linux/amd64",
+                        &AtomicBool::new(false),
+                    )
+                    .await
+                    .is_err()
+                );
+                load_tag_exists.store(false, Ordering::SeqCst);
+                assert_eq!(operations.lock().unwrap().len(), 5);
+                let cancelled = AtomicBool::new(true);
+                assert!(
+                    super::load_archive(
+                        material(Some(fingerprint.clone())),
+                        &upload,
+                        "app:load-test",
+                        &image_id,
+                        "linux/amd64",
+                        &cancelled,
+                    )
+                    .await
+                    .unwrap_err()
+                    .contains("尚未加载")
+                );
+                load_no_exit.store(true, Ordering::SeqCst);
+                let uncertain = super::load_archive(
+                    material(Some(fingerprint.clone())),
+                    &upload,
+                    "app:load-test",
+                    &image_id,
+                    "linux/amd64",
+                    &AtomicBool::new(false),
+                )
+                .await
+                .unwrap_err();
+                load_no_exit.store(false, Ordering::SeqCst);
+                assert!(uncertain.contains("待核实"));
+                assert!(upload_files.lock().unwrap().contains_key(&upload.path));
+                assert_eq!(operations.lock().unwrap().len(), 5);
+                super::load_archive(
+                    material(Some(fingerprint.clone())),
+                    &upload,
+                    "app:load-test",
+                    &image_id,
+                    "linux/amd64",
+                    &AtomicBool::new(false),
+                )
+                .await
+                .unwrap();
+                assert_eq!(operations.lock().unwrap().len(), 6);
+                let wrong_id = format!("sha256:{}", "b".repeat(64));
+                assert!(
+                    super::load_archive(
+                        material(Some(fingerprint.clone())),
+                        &upload,
+                        "app:load-test",
+                        &wrong_id,
+                        "linux/amd64",
+                        &AtomicBool::new(false),
+                    )
+                    .await
+                    .unwrap_err()
+                    .contains("禁止部署")
+                );
+            })
+            .await;
             let transfer_handle = super::trusted_handle(material(Some(fingerprint.clone())))
                 .await
                 .unwrap();
