@@ -3,8 +3,10 @@ use crate::preferences;
 use crate::project_store::{NewProject, Project};
 use crate::release::PlannedImage;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
     Arc,
@@ -12,6 +14,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 
 #[allow(dead_code)] // Wired into release execution after remote transfer is available.
 pub struct BuiltImage {
@@ -20,6 +23,19 @@ pub struct BuiltImage {
     pub image_id: String,
     pub has_healthcheck: bool,
     pub logs: Vec<String>,
+}
+
+#[allow(dead_code)] // The release coordinator will pass this to the SFTP adapter.
+pub struct SavedArchive {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+impl Drop for SavedArchive {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 #[allow(dead_code)] // Wired into release execution after remote transfer is available.
@@ -390,9 +406,140 @@ pub fn build_image(
     })
 }
 
+async fn write_archive(
+    mut command: std::process::Command,
+    path: &Path,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = tokio::process::Command::from(command)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| "无法启动本地 Docker 镜像导出。")?;
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path).map_err(|_| "无法创建本地镜像归档。")?;
+    let mut file = tokio::fs::File::from_std(file);
+    let deadline = Instant::now() + Duration::from_secs(60 * 60);
+    let result = {
+        let copy = tokio::io::copy(&mut stdout, &mut file);
+        tokio::pin!(copy);
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                break Err("镜像导出已取消。".into());
+            }
+            if Instant::now() >= deadline {
+                break Err("镜像导出超时。".into());
+            }
+            tokio::select! {
+                result = &mut copy => break result.map(|_| ()).map_err(|_| "本地镜像归档写入失败。".into()),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+            }
+        }
+    };
+    if let Err(error) = result {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        return Err(error);
+    }
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            return Err("镜像导出已取消。".into());
+        }
+        if Instant::now() >= exit_deadline {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            return Err("Docker 导出进程退出超时，结果待核实。".into());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+            Err(_) => return Err("Docker 导出进程状态待核实。".into()),
+        }
+    };
+    if !status.success() {
+        return Err("本地 Docker 镜像导出失败。".into());
+    }
+    file.flush().await.map_err(|_| "无法刷新镜像归档。")?;
+    file.sync_all().await.map_err(|_| "无法保存镜像归档。")?;
+    Ok(())
+}
+
+#[allow(dead_code)] // Called by the release coordinator after a successful local build.
+pub fn save_image(image: &BuiltImage, cancel: Arc<AtomicBool>) -> Result<SavedArchive, String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err("镜像导出已取消。".into());
+    }
+    let endpoint = docker::local_engine_endpoint()?;
+    let (before, _) = inspect_built_image(&endpoint, &image.reference, &image.platform)?;
+    if before != image.image_id {
+        return Err("本地镜像引用已变化，导出已阻断。".into());
+    }
+    let path = std::env::temp_dir().join(format!(
+        "devingpanel-image-{}.tar",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut archive = SavedArchive {
+        path,
+        bytes: 0,
+        sha256: String::new(),
+    };
+    let mut command = docker::command_for_endpoint(&endpoint);
+    command.args([
+        "image",
+        "save",
+        "--platform",
+        &image.platform,
+        &image.reference,
+    ]);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化镜像导出环境。")?
+        .block_on(write_archive(command, &archive.path, &cancel))?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("镜像导出已取消。".into());
+    }
+    let (after, _) = inspect_built_image(&endpoint, &image.reference, &image.platform)?;
+    if after != before {
+        return Err("导出期间本地镜像引用已变化，归档不可信。".into());
+    }
+    let mut file = File::open(&archive.path).map_err(|_| "无法校验镜像归档。")?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("镜像归档校验已取消。".into());
+        }
+        let size = std::io::Read::read(&mut file, &mut buffer).map_err(|_| "无法读取镜像归档。")?;
+        if size == 0 {
+            break;
+        }
+        archive.bytes += size as u64;
+        digest.update(&buffer[..size]);
+    }
+    if archive.bytes == 0 {
+        return Err("本地镜像归档为空。".into());
+    }
+    archive.sha256 = format!("{:x}", digest.finalize());
+    Ok(archive)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BuildLineBuffer, build_image, execute_build, sanitized_line};
+    use super::{
+        BuildLineBuffer, SavedArchive, build_image, execute_build, sanitized_line, save_image,
+        write_archive,
+    };
     use crate::project_store::Project;
     use crate::release::PlannedImage;
     use std::collections::VecDeque;
@@ -474,6 +621,41 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_archive_export_stops_promptly() {
+        let path = std::env::temp_dir().join(format!(
+            "devingpanel-archive-cancel-{}.tar",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let cancel = AtomicBool::new(true);
+        #[cfg(windows)]
+        let command = {
+            let mut command = std::process::Command::new("powershell");
+            command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 5"]);
+            command
+        };
+        #[cfg(not(windows))]
+        let command = {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", "sleep 5"]);
+            command
+        };
+        let start = Instant::now();
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(write_archive(command, &path, &cancel));
+        assert!(result.unwrap_err().contains("取消"));
+        assert!(start.elapsed() < Duration::from_secs(4));
+        drop(SavedArchive {
+            path: path.clone(),
+            bytes: 0,
+            sha256: String::new(),
+        });
+        assert!(!path.exists());
+    }
+
+    #[test]
     #[ignore = "creates and removes one uniquely tagged local Docker image"]
     fn builds_and_inspects_isolated_local_image() {
         let dir = std::env::temp_dir().join(format!("deving-panel-build-{}", uuid::Uuid::new_v4()));
@@ -511,6 +693,16 @@ mod tests {
         let result = build_image(&project, &image, Arc::new(AtomicBool::new(false)), |_| {
             streamed_lines += 1;
         });
+        let saved = result.as_ref().ok().map(|built| {
+            let archive = save_image(built, Arc::new(AtomicBool::new(false))).unwrap();
+            assert!(archive.bytes > 0);
+            use sha2::Digest;
+            let actual = sha2::Sha256::digest(std::fs::read(&archive.path).unwrap());
+            assert_eq!(archive.sha256, format!("{actual:x}"));
+            let path = archive.path.clone();
+            drop(archive);
+            assert!(!path.exists());
+        });
         let removal = crate::docker::command_for_endpoint(&endpoint)
             .args(["image", "rm", &reference])
             .stdout(std::process::Stdio::null())
@@ -526,6 +718,7 @@ mod tests {
         assert!(built.image_id.starts_with("sha256:"));
         assert!(!built.has_healthcheck);
         assert!(streamed_lines > 0);
+        assert!(saved.is_some());
         assert!(removal.success(), "isolated test image was not removed");
     }
 }

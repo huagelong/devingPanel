@@ -18,6 +18,8 @@
 - 已在一台 Debian VPS 上用系统 OpenSSH 客户端验证经独立核对的 ED25519 主机指纹、密码登录、只读命令及 SFTP 登录；尚未用应用内 `russh` 验证真实 VPS 的连接、监控、私钥认证或上传。macOS/Linux 客户端兼容性、完整 Compose 配置语义校验、发布执行、容器操作、除主题外的设置写入和跨平台打包仍待验证。即使已绑定主机，发布入口仍禁用，直到发布预检及执行完成。
 - `docs/architecture.md` 中的平台与技术选型仍需按 PoC 验证；能够在 Windows 编译不代表 macOS/Linux 已验收。
 
+本地镜像导出适配器可在核对镜像 ID 与平台后，经固定本机 Docker socket 执行 `docker image save`，将流写入独占的临时归档；取消、超时或失败时删除文件，成功后记录字节数与 SHA-256，归档对象释放时删除文件。已用隔离的无网络镜像实测构建、导出和清理。它尚未与 SFTP、远端 `docker load` 或发布执行状态机连接；应用崩溃后的本地临时归档清理也待实现，不得据此启用发布按钮。
+
 ## VPS 只读验证（2026-10-26）
 
 在用户通过 VPS 控制台独立核对 ED25519 主机指纹后，使用固定的主机密钥连接 `129.211.23.223:22`。系统 OpenSSH 密码登录、`uname`、根目录 `df -Pk /` 和 SFTP `pwd` 成功；服务器为 Debian Linux `x86_64`，根目录约有 47 GiB 可用空间。远端执行 `docker version` 与 `docker compose version` 均返回 `docker: command not found`。没有上传文件、修改服务器或尝试部署。此测试不等于应用内 SSH/SFTP 适配器验收；该 VPS 安装并启动 Docker Engine 与 Compose 之前，发布预检理应阻断，不能用于镜像传输和部署验证。
