@@ -119,7 +119,9 @@ fn parse_build_platforms(text: &str) -> Result<Vec<String>, String> {
             .and_then(serde_json::Value::as_array)
             .ok_or("Buildx 构建器节点信息无效。")?;
         for node in nodes {
-            if node.get("Status").and_then(serde_json::Value::as_str) != Some("running") {
+            if node.get("Status").and_then(serde_json::Value::as_str) != Some("running")
+                || node.get("Endpoint").and_then(serde_json::Value::as_str) != Some("default")
+            {
                 continue;
             }
             for platform in node
@@ -141,7 +143,11 @@ fn parse_build_platforms(text: &str) -> Result<Vec<String>, String> {
 
 pub fn build_platforms() -> Result<Vec<String>, String> {
     let endpoint = local_engine_endpoint()?;
-    let mut child = command_for_endpoint(&endpoint)
+    build_platforms_on(&endpoint)
+}
+
+pub fn build_platforms_on(endpoint: &str) -> Result<Vec<String>, String> {
+    let mut child = command_for_endpoint(endpoint)
         .args(["buildx", "ls", "--format", "{{json .}}"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -293,8 +299,8 @@ mod tests {
     #[test]
     fn reads_only_local_default_builder_platforms() {
         let rows = concat!(
-            "{\"Name\":\"remote\",\"Driver\":\"remote\",\"Current\":true,\"Nodes\":[{\"Status\":\"running\",\"Platforms\":[\"linux/arm64\"]}]}\n",
-            "{\"Name\":\"default\",\"Driver\":\"docker\",\"Current\":false,\"Nodes\":[{\"Status\":\"stopped\",\"Platforms\":[\"linux/arm64\"]},{\"Status\":\"running\",\"Platforms\":[\"linux/amd64\",\"linux/amd64/v2\"]}]}\n"
+            "{\"Name\":\"remote\",\"Driver\":\"remote\",\"Current\":true,\"Nodes\":[{\"Status\":\"running\",\"Endpoint\":\"remote\",\"Platforms\":[\"linux/arm64\"]}]}\n",
+            "{\"Name\":\"default\",\"Driver\":\"docker\",\"Current\":false,\"Nodes\":[{\"Status\":\"stopped\",\"Endpoint\":\"default\",\"Platforms\":[\"linux/arm64\"]},{\"Status\":\"running\",\"Endpoint\":\"default\",\"Platforms\":[\"linux/amd64\",\"linux/amd64/v2\"]}]}\n"
         );
         assert_eq!(parse_build_platforms(rows).unwrap(), vec!["linux/amd64"]);
         assert!(parse_build_platforms("not-json").is_err());

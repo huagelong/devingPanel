@@ -1,15 +1,15 @@
 use crate::docker;
+use crate::preferences;
 use crate::project_store::{NewProject, Project};
 use crate::release::PlannedImage;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::io::Read;
+use std::fs::{File, OpenOptions};
 use std::process::Stdio;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::thread;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 
@@ -34,8 +34,14 @@ fn sanitized_line(bytes: &[u8], build_args: &[(String, String)]) -> String {
         .filter(|ch| *ch == '\t' || !ch.is_control())
         .collect();
     for (_, value) in build_args {
-        if !value.is_empty() {
-            line = line.replace(value, "[已隐藏]");
+        for fragment in value.lines() {
+            let fragment: String = fragment
+                .chars()
+                .filter(|ch| *ch == '\t' || !ch.is_control())
+                .collect();
+            if !fragment.is_empty() {
+                line = line.replace(&fragment, "[已隐藏]");
+            }
         }
     }
     line
@@ -72,10 +78,11 @@ impl BuildLineBuffer {
         logs: &mut VecDeque<String>,
         on_log: &mut dyn FnMut(&str),
     ) {
-        let mut text = sanitized_line(&self.pending, args);
-        if self.truncated {
-            text.push_str(" …[单行截断]");
-        }
+        let text = if self.truncated {
+            "[单行过长，已隐藏]".into()
+        } else {
+            sanitized_line(&self.pending, args)
+        };
         on_log(&text);
         if logs.len() == 1000 {
             logs.pop_front();
@@ -97,42 +104,67 @@ impl BuildLineBuffer {
     }
 }
 
+fn acquire_build_lock(cancel: &AtomicBool) -> Result<File, String> {
+    let directory = preferences::data_dir().ok_or("无法确定本机配置目录。")?;
+    std::fs::create_dir_all(&directory).map_err(|_| "无法准备构建锁目录。")?;
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(directory.join("local-build.lock"))
+        .map_err(|_| "无法打开本机构建锁。")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("构建已取消。".into());
+        }
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50))
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err("另一客户端正在构建，请稍后重试。".into());
+            }
+            Err(_) => return Err("无法锁定本机构建。".into()),
+        }
+    }
+}
+
 fn inspect_built_image(
     endpoint: &str,
     reference: &str,
     platform: &str,
 ) -> Result<(String, bool), String> {
-    let mut child = docker::command_for_endpoint(endpoint)
+    let mut command = docker::command_for_endpoint(endpoint);
+    command
         .args(["image", "inspect", "--format",
             r#"{"Id":{{json .Id}},"Os":{{json .Os}},"Architecture":{{json .Architecture}},"Healthcheck":{{json (index .Config "Healthcheck")}}}"#,
             reference])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| "无法检查已构建镜像。")?;
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .take(64 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "无法读取镜像元数据。")?;
-        Ok::<_, &str>(bytes)
-    });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("构建后镜像核验超时，结果待核实。".into());
-            }
-        }
-    };
-    let bytes = reader.join().map_err(|_| "无法读取镜像元数据。")??;
-    if bytes.len() > 64 * 1024 || !status.success() {
+        .stderr(Stdio::null());
+    let output = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化镜像核验环境。")?
+        .block_on(async {
+            let mut command = tokio::process::Command::from(command);
+            command.kill_on_drop(true);
+            let mut child = command.spawn().map_err(|_| "无法检查已构建镜像。")?;
+            let stdout = child.stdout.take().expect("stdout was piped");
+            let mut limited = stdout.take(64 * 1024 + 1);
+            let mut bytes = Vec::new();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let (read, status) =
+                    tokio::try_join!(limited.read_to_end(&mut bytes), child.wait(),)
+                        .map_err(|_| "无法读取镜像元数据。")?;
+                Ok::<_, &str>((read, status, bytes))
+            })
+            .await
+            .map_err(|_| "构建后镜像核验超时，结果待核实。")?
+        })?;
+    let (read, status, bytes) = output;
+    if read > 64 * 1024 || !status.success() {
         return Err("构建后镜像元数据不可用，结果待核实。".into());
     }
     let row: Value = serde_json::from_slice(&bytes).map_err(|_| "构建后镜像元数据无效。")?;
@@ -277,11 +309,30 @@ pub fn build_image(
     {
         return Err(fail("构建目标镜像或平台无效。".into(), Vec::new()));
     }
+    let _build_lock = acquire_build_lock(&cancel).map_err(|message| fail(message, Vec::new()))?;
+    let cancelled = || cancel.load(Ordering::Relaxed);
     let endpoint = docker::local_engine_endpoint().map_err(|message| fail(message, Vec::new()))?;
+    if cancelled() {
+        return Err(fail("构建已取消。".into(), Vec::new()));
+    }
+    let platforms =
+        docker::build_platforms_on(&endpoint).map_err(|message| fail(message, Vec::new()))?;
+    if cancelled() {
+        return Err(fail("构建已取消。".into(), Vec::new()));
+    }
+    if !platforms.contains(&image.platform) {
+        return Err(fail(
+            "本机 default 构建器不支持目标平台。".into(),
+            Vec::new(),
+        ));
+    }
     if docker::image_reference_exists_on(&endpoint, &image.reference)
         .map_err(|message| fail(message, Vec::new()))?
     {
         return Err(fail("本地镜像 tag 已存在，构建已阻断。".into(), Vec::new()));
+    }
+    if cancelled() {
+        return Err(fail("构建已取消。".into(), Vec::new()));
     }
     let mut command = docker::command_for_endpoint(&endpoint);
     command
@@ -321,9 +372,15 @@ pub fn build_image(
             &cancel,
             &mut on_log,
         ))?;
+    if cancelled() {
+        return Err(fail("构建已取消，镜像结果待核实。".into(), logs));
+    }
     let (image_id, has_healthcheck) =
         inspect_built_image(&endpoint, &image.reference, &image.platform)
             .map_err(|message| fail(message, logs.clone()))?;
+    if cancelled() {
+        return Err(fail("构建已取消，镜像结果待核实。".into(), logs));
+    }
     Ok(BuiltImage {
         reference: image.reference.clone(),
         platform: image.platform.clone(),
@@ -335,10 +392,56 @@ pub fn build_image(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_image, sanitized_line};
+    use super::{BuildLineBuffer, build_image, execute_build, sanitized_line};
     use crate::project_store::Project;
     use crate::release::PlannedImage;
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::collections::VecDeque;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn streams_output_and_cancels_build_promptly() {
+        let cancel = AtomicBool::new(false);
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = std::process::Command::new("powershell");
+            command.args([
+                "-NoProfile",
+                "-Command",
+                "Write-Output ready; Start-Sleep -Seconds 5",
+            ]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", "printf 'ready\\n'; sleep 5"]);
+            command
+        };
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let start = Instant::now();
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(execute_build(command, &[], &cancel, &mut |line| {
+                if line == "ready" {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }));
+        assert!(start.elapsed() < Duration::from_secs(4));
+        let failure = match result {
+            Err(failure) => failure,
+            Ok(_) => panic!("cancelled build must not succeed"),
+        };
+        assert!(failure.message.contains("取消"));
+        assert!(failure.logs.iter().any(|line| line == "ready"));
+    }
 
     #[test]
     fn masks_build_arg_values_in_retained_log() {
@@ -349,6 +452,25 @@ mod tests {
             ),
             "TOKEN=[已隐藏][31m"
         );
+    }
+
+    #[test]
+    fn fragmented_and_long_build_lines_never_echo_unredacted_fragments() {
+        let mut buffer = BuildLineBuffer::default();
+        let mut logs = VecDeque::new();
+        let mut shown = Vec::new();
+        let args = [("TOKEN".into(), "first\nsecond".into())];
+        let mut display = |line: &str| shown.push(line.to_owned());
+        buffer.push(b"value=fir", &args, &mut logs, &mut display);
+        buffer.push(b"st\nvalue=second\n", &args, &mut logs, &mut display);
+        assert_eq!(
+            logs.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["value=[已隐藏]", "value=[已隐藏]"]
+        );
+        buffer.push(&vec![b'x'; 17 * 1024], &args, &mut logs, &mut display);
+        buffer.push(b"\n", &args, &mut logs, &mut display);
+        assert_eq!(shown.last().unwrap(), "[单行过长，已隐藏]");
+        assert_eq!(logs.len(), 3);
     }
 
     #[test]

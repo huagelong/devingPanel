@@ -3,7 +3,10 @@ use russh::client;
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{ChannelMsg, Disconnect};
 use russh_sftp::client::RawSftpSession;
+use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex,
@@ -11,6 +14,7 @@ use std::sync::{
     mpsc::SyncSender,
 };
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub enum TestResult {
     NeedsTrust {
@@ -62,6 +66,32 @@ pub struct MonitorSnapshot {
     pub disk_percent: f64,
     pub network_bytes_per_sec: Option<(f64, f64)>,
     pub containers: Option<Vec<ContainerInfo>>,
+}
+
+#[allow(dead_code)] // The transfer phase will consume this after release execution is wired up.
+pub struct UploadedArchive {
+    pub directory: String,
+    pub path: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+fn validated_upload_directory(raw: &str) -> Result<String, String> {
+    let name = raw
+        .strip_prefix("/tmp/devingpanel.")
+        .ok_or("远端临时目录路径无效。")?;
+    if name.len() != 32 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("远端临时目录路径无效。".into());
+    }
+    Ok(format!("/tmp/devingpanel.{name}"))
+}
+
+fn verified_sha256(text: &str) -> Result<String, String> {
+    let digest = text.split_whitespace().next().ok_or("远端校验值缺失。")?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("远端校验值无效。".into());
+    }
+    Ok(digest.to_ascii_lowercase())
 }
 
 #[derive(Debug)]
@@ -1196,23 +1226,297 @@ pub fn stream_logs(
     });
 }
 
+async fn archive_command(
+    handle: &client::Handle<HostKeyChecker>,
+    text: &str,
+) -> Result<String, String> {
+    archive_command_with_timeout(handle, text, Duration::from_secs(10)).await
+}
+
+async fn archive_command_with_timeout(
+    handle: &client::Handle<HostKeyChecker>,
+    text: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    tokio::time::timeout(timeout, command_limited(handle, text, 4096))
+        .await
+        .map_err(|_| "远端文件操作超时。")?
+}
+
+async fn upload_to_directory(
+    handle: &client::Handle<HostKeyChecker>,
+    source: &std::path::Path,
+    directory: &str,
+    size: u64,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<UploadedArchive, String> {
+    let channel = tokio::time::timeout(Duration::from_secs(10), handle.channel_open_session())
+        .await
+        .map_err(|_| "SFTP 会话建立超时。")?
+        .map_err(|_| "无法打开 SFTP 会话。")?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        channel.request_subsystem(true, "sftp"),
+    )
+    .await
+    .map_err(|_| "SFTP 子系统启动超时。")?
+    .map_err(|_| "远端 SFTP 服务不可用。")?;
+    let sftp = tokio::time::timeout(
+        Duration::from_secs(10),
+        SftpSession::new(channel.into_stream()),
+    )
+    .await
+    .map_err(|_| "SFTP 协议握手超时。")?
+    .map_err(|_| "SFTP 协议握手失败。")?;
+    let path = format!("{directory}/image.tar");
+    let mut remote = tokio::time::timeout(
+        Duration::from_secs(10),
+        sftp.open_with_flags_and_attributes(
+            path.clone(),
+            OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+            FileAttributes {
+                permissions: Some(0o600),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .map_err(|_| "远端镜像文件创建超时。")?
+    .map_err(|_| "无法在远端临时目录创建镜像文件。")?;
+    let mut local = tokio::fs::File::open(source)
+        .await
+        .map_err(|_| "无法读取本地镜像归档。")?;
+    let mut hasher = Sha256::new();
+    let mut copied = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    let deadline = std::time::Instant::now() + Duration::from_secs(60 * 60);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("镜像传输超时，远端临时文件待清理。".into());
+        }
+        let read = tokio::select! {
+            _ = wait_cancel(cancel) => return Err("镜像传输已取消。".into()),
+            result = tokio::time::timeout(Duration::from_secs(60), local.read(&mut buffer)) =>
+                result.map_err(|_| "本地镜像读取超时。")?
+                    .map_err(|_| "无法读取本地镜像归档。")?,
+        };
+        if read == 0 {
+            break;
+        }
+        tokio::select! {
+            _ = wait_cancel(cancel) => return Err("镜像传输已取消。".into()),
+            result = tokio::time::timeout(Duration::from_secs(60), remote.write_all(&buffer[..read])) =>
+                result.map_err(|_| "远端镜像写入超时。")?
+                    .map_err(|_| "远端镜像写入失败。")?,
+        }
+        hasher.update(&buffer[..read]);
+        copied += read as u64;
+        if copied > size {
+            return Err("本地镜像归档在传输期间发生变化。".into());
+        }
+        progress(copied.min(size - 1), size);
+    }
+    if copied != size {
+        return Err("本地镜像归档在传输期间发生变化。".into());
+    }
+    tokio::select! {
+        _ = wait_cancel(cancel) => return Err("镜像传输已取消，远端结果待核实。".into()),
+        result = tokio::time::timeout(Duration::from_secs(30), remote.close()) =>
+            result.map_err(|_| "远端镜像文件关闭超时，结果待核实。")?
+                .map_err(|_| "远端镜像文件关闭失败。")?,
+    }
+    let metadata = tokio::select! {
+        _ = wait_cancel(cancel) => return Err("镜像传输已取消，远端结果待核实。".into()),
+        result = tokio::time::timeout(Duration::from_secs(10), sftp.metadata(path.clone())) =>
+            result.map_err(|_| "远端镜像属性检查超时。")?
+                .map_err(|_| "无法核实远端镜像文件属性。")?,
+    };
+    let _ = sftp.close().await;
+    if metadata.len() != size {
+        return Err("远端镜像大小与本地不符。".into());
+    }
+    if metadata
+        .permissions
+        .is_none_or(|mode| mode & 0o777 != 0o600)
+    {
+        return Err("远端镜像文件权限未达到 600，传输已阻断。".into());
+    }
+    let local_digest = format!("{:x}", hasher.finalize());
+    let checksum_command = format!("sha256sum -- {path}");
+    let remote_digest = tokio::select! {
+        _ = wait_cancel(cancel) => return Err("镜像校验已取消，远端结果待核实。".into()),
+        result = archive_command_with_timeout(handle, &checksum_command, Duration::from_secs(60 * 60)) =>
+            verified_sha256(&result?)?,
+    };
+    if local_digest != remote_digest {
+        return Err("远端镜像 SHA-256 与本地不符。".into());
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("镜像校验已取消，远端结果待核实。".into());
+    }
+    progress(size, size);
+    Ok(UploadedArchive {
+        directory: directory.to_owned(),
+        path,
+        bytes: size,
+        sha256: local_digest,
+    })
+}
+
+fn cleanup_archive_command(directory: &str) -> Result<String, String> {
+    let directory = validated_upload_directory(directory)?;
+    Ok(format!(
+        "rm -f -- {directory}/image.tar && (rmdir -- {directory} || (test ! -e {directory} && test ! -L {directory}))"
+    ))
+}
+
+async fn transfer_archive(
+    material: ConnectionMaterial,
+    source: &std::path::Path,
+    size: u64,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<UploadedArchive, String> {
+    let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+        .await
+        .map_err(|_| "SSH 连接超时，传输未开始。")??;
+    let available_kib = disk_available(&archive_command(&handle, "df -Pk /tmp").await?)?;
+    if size.saturating_add(64 * 1024 * 1024) > available_kib.saturating_mul(1024) {
+        return Err("远端 /tmp 可用空间不足，传输未开始。".into());
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("镜像传输已取消，传输未开始。".into());
+    }
+    let directory = validated_upload_directory(&format!(
+        "/tmp/devingpanel.{}",
+        uuid::Uuid::new_v4().simple()
+    ))?;
+    let create = archive_command(&handle, &format!(
+        "mkdir -m 700 -- {directory} && chmod 700 -- {directory} && test \"$(stat -c %a -- {directory})\" = 700"
+    )).await;
+    if let Err(error) = create {
+        // A timed-out mkdir may have succeeded; the random path is known, so try to remove it.
+        let _ = archive_command(&handle, &format!("rmdir -- {directory}")).await;
+        return Err(format!(
+            "无法安全创建远端临时目录：{error}；请核对 {directory} 是否残留。"
+        ));
+    }
+    let result = tokio::time::timeout(
+        Duration::from_secs(2 * 60 * 60 + 60),
+        upload_to_directory(&handle, source, &directory, size, cancel, progress),
+    )
+    .await
+    .unwrap_or_else(|_| Err("镜像传输超时，远端结果待核实。".to_owned()));
+    if result.is_err() {
+        let cleanup = archive_command(&handle, &cleanup_archive_command(&directory)?).await;
+        let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+        return result.map_err(|error| match cleanup {
+            Ok(_) => error,
+            Err(_) => format!("{error}；临时目录 {directory} 可能残留，请到主机核对。"),
+        });
+    }
+    let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+    result
+}
+
+#[allow(dead_code)] // The release coordinator will call this after docker save is implemented.
+pub fn upload_archive(
+    expected_host: Host,
+    source: &std::path::Path,
+    cancel: Arc<AtomicBool>,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<UploadedArchive, String> {
+    let material = material_for(&expected_host)?;
+    let size = std::fs::metadata(source)
+        .map_err(|_| "本地镜像归档不存在。")?
+        .len();
+    if size == 0 {
+        return Err("本地镜像归档为空。".into());
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化传输环境。".to_owned())?
+        .block_on(transfer_archive(
+            material,
+            source,
+            size,
+            &cancel,
+            &mut progress,
+        ))
+}
+
+#[allow(dead_code)] // The release coordinator calls this after docker load or on retry.
+pub fn cleanup_uploaded_archive(
+    expected_host: Host,
+    archive: &UploadedArchive,
+) -> Result<(), String> {
+    let directory = validated_upload_directory(&archive.directory)?;
+    if archive.path != format!("{directory}/image.tar") {
+        return Err("远端归档路径无效，未执行清理。".into());
+    }
+    let material = material_for(&expected_host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化远端清理环境。".to_owned())?
+        .block_on(async {
+            let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+                .await
+                .map_err(|_| "SSH 清理连接超时。")??;
+            archive_command(&handle, &cleanup_archive_command(&directory)?).await?;
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+            Ok(())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerAction, LogEvent, LogLineBuffer, TestResult, container_command, cpu_counters,
-        default_route_interface, disk_available, disk_percent, execute_container_action,
-        execute_disk_prune, fetch_disk_preview, fetch_inventory, fetch_monitor, follow_logs,
-        image_size_bytes, memory_kib, network_bytes, parse_disk_preview, parse_inventory, probe,
-        safe_version, same_connection_target,
+        ContainerAction, LogEvent, LogLineBuffer, TestResult, cleanup_archive_command,
+        container_command, cpu_counters, default_route_interface, disk_available, disk_percent,
+        execute_container_action, execute_disk_prune, fetch_disk_preview, fetch_inventory,
+        fetch_monitor, follow_logs, image_size_bytes, memory_kib, network_bytes,
+        parse_disk_preview, parse_inventory, probe, safe_version, same_connection_target,
+        validated_upload_directory, verified_sha256,
     };
     use crate::host_store::{ConnectionMaterial, Host};
     use russh::server::{self, Auth, Msg, Server as _, Session};
     use russh::{Channel, ChannelId};
+    use russh_sftp::protocol::{Attrs, FileAttributes, Handle, OpenFlags, Status, StatusCode};
+    use sha2::Digest;
+    use std::collections::HashMap;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
+
+    #[test]
+    fn upload_paths_and_checksums_reject_untrusted_remote_output() {
+        let directory =
+            validated_upload_directory("/tmp/devingpanel.a1b2c3d4e5f60718293a4b5c6d7e8f90")
+                .unwrap();
+        assert_eq!(
+            cleanup_archive_command(&directory).unwrap(),
+            "rm -f -- /tmp/devingpanel.a1b2c3d4e5f60718293a4b5c6d7e8f90/image.tar && (rmdir -- /tmp/devingpanel.a1b2c3d4e5f60718293a4b5c6d7e8f90 || (test ! -e /tmp/devingpanel.a1b2c3d4e5f60718293a4b5c6d7e8f90 && test ! -L /tmp/devingpanel.a1b2c3d4e5f60718293a4b5c6d7e8f90))"
+        );
+        for text in [
+            "/tmp/other.a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "/tmp/devingpanel.a1b2c3d4e5f60718293a4b5c6d7e8f9;",
+            "/tmp/devingpanel.abcdefghi",
+            "/tmp/devingpanel.a1b2c3d4e5f60718293a4b5c6d7e8f90/extra",
+        ] {
+            assert!(validated_upload_directory(text).is_err());
+        }
+        let digest = "a".repeat(64);
+        assert_eq!(
+            verified_sha256(&format!("{digest}  /tmp/archive\n")).unwrap(),
+            digest
+        );
+        assert!(verified_sha256("oops /tmp/archive\n").is_err());
+    }
 
     #[test]
     fn log_line_buffer_preserves_utf8_boundaries_and_limits_lines() {
@@ -1459,6 +1763,92 @@ mod tests {
         sftp_channels: Vec<ChannelId>,
         sftp_pending: Vec<u8>,
         sftp_version: Arc<AtomicUsize>,
+        upload_sftp: Arc<AtomicBool>,
+        upload_channels: Arc<tokio::sync::Mutex<HashMap<ChannelId, Channel<Msg>>>>,
+        upload_files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        upload_fail_write: Arc<AtomicBool>,
+    }
+
+    struct MemorySftp {
+        files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        fail_write: Arc<AtomicBool>,
+    }
+
+    impl russh_sftp::server::Handler for MemorySftp {
+        type Error = StatusCode;
+
+        fn unimplemented(&self) -> Self::Error {
+            StatusCode::OpUnsupported
+        }
+
+        async fn open(
+            &mut self,
+            id: u32,
+            filename: String,
+            flags: OpenFlags,
+            attrs: FileAttributes,
+        ) -> Result<Handle, Self::Error> {
+            if !flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE)
+                || attrs.permissions != Some(0o600)
+            {
+                return Err(StatusCode::PermissionDenied);
+            }
+            let mut files = self.files.lock().unwrap();
+            if files.contains_key(&filename) {
+                return Err(StatusCode::Failure);
+            }
+            files.insert(filename.clone(), Vec::new());
+            Ok(Handle {
+                id,
+                handle: filename,
+            })
+        }
+
+        async fn write(
+            &mut self,
+            id: u32,
+            handle: String,
+            offset: u64,
+            bytes: Vec<u8>,
+        ) -> Result<Status, Self::Error> {
+            if self.fail_write.load(Ordering::SeqCst) {
+                return Err(StatusCode::PermissionDenied);
+            }
+            let mut files = self.files.lock().unwrap();
+            let data = files.get_mut(&handle).ok_or(StatusCode::NoSuchFile)?;
+            if offset != data.len() as u64 {
+                return Err(StatusCode::Failure);
+            }
+            data.extend_from_slice(&bytes);
+            Ok(Status {
+                id,
+                status_code: StatusCode::Ok,
+                error_message: String::new(),
+                language_tag: String::new(),
+            })
+        }
+
+        async fn close(&mut self, id: u32, _: String) -> Result<Status, Self::Error> {
+            Ok(Status {
+                id,
+                status_code: StatusCode::Ok,
+                error_message: String::new(),
+                language_tag: String::new(),
+            })
+        }
+
+        async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+            let files = self.files.lock().unwrap();
+            let data = files.get(&path).ok_or(StatusCode::NoSuchFile)?;
+            Ok(Attrs {
+                id,
+                attrs: FileAttributes {
+                    size: Some(data.len() as u64),
+                    permissions: Some(0o600),
+                    ..Default::default()
+                },
+            })
+        }
     }
 
     impl server::Server for StubServer {
@@ -1478,6 +1868,21 @@ mod tests {
             session: &mut Session,
         ) -> Result<(), Self::Error> {
             if name == "sftp" && self.sftp_version.load(Ordering::SeqCst) != 0 {
+                if self.upload_sftp.load(Ordering::SeqCst)
+                    && let Some(stream) = self.upload_channels.lock().await.remove(&channel)
+                {
+                    session.channel_success(channel)?;
+                    let files = self.upload_files.clone();
+                    let fail_write = self.upload_fail_write.clone();
+                    tokio::spawn(async move {
+                        russh_sftp::server::run(
+                            stream.into_stream(),
+                            MemorySftp { files, fail_write },
+                        )
+                        .await;
+                    });
+                    return Ok(());
+                }
                 self.sftp_channels.push(channel);
                 self.sftp_pending.clear();
                 session.channel_success(channel)?;
@@ -1546,10 +1951,16 @@ mod tests {
 
         async fn channel_open_session(
             &mut self,
-            _: Channel<Msg>,
+            channel: Channel<Msg>,
             reply: server::ChannelOpenHandle,
             _: &mut Session,
         ) -> Result<(), Self::Error> {
+            if self.upload_sftp.load(Ordering::SeqCst) {
+                self.upload_channels
+                    .lock()
+                    .await
+                    .insert(channel.id(), channel);
+            }
             reply.accept().await;
             Ok(())
         }
@@ -1560,6 +1971,21 @@ mod tests {
             data: &[u8],
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            if self.upload_sftp.load(Ordering::SeqCst)
+                && let Some(path) = data.strip_prefix(b"sha256sum -- ")
+                && let Ok(path) = std::str::from_utf8(path)
+            {
+                let files = self.upload_files.lock().unwrap();
+                if let Some(bytes) = files.get(path) {
+                    let digest = format!("{:x}  {path}\n", sha2::Sha256::digest(bytes));
+                    session.channel_success(channel)?;
+                    session.data(channel, digest.into_bytes())?;
+                    session.exit_status_request(channel, 0)?;
+                    session.eof(channel)?;
+                    session.close(channel)?;
+                    return Ok(());
+                }
+            }
             if data == b"docker --host unix:///run/user/1000/docker.sock container start abc123" {
                 self.operations
                     .lock()
@@ -1598,6 +2024,30 @@ mod tests {
                 return Ok(());
             }
             let response = match data {
+                b"df -Pk /tmp" if self.upload_sftp.load(Ordering::SeqCst) =>
+                    b"Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/stub 200000 10000 190000 5% /tmp\n".as_slice(),
+                command if self.upload_sftp.load(Ordering::SeqCst) && command.starts_with(b"mkdir -m 700 -- ") => {
+                    let text = std::str::from_utf8(command).map_err(|_| russh::Error::Disconnect)?;
+                    let directory = text.strip_prefix("mkdir -m 700 -- ")
+                        .and_then(|value| value.split_once(" && chmod 700 -- "))
+                        .map(|(directory, _)| directory).ok_or(russh::Error::Disconnect)?;
+                    super::validated_upload_directory(directory).map_err(|_| russh::Error::Disconnect)?;
+                    if text != format!("mkdir -m 700 -- {directory} && chmod 700 -- {directory} && test \"$(stat -c %a -- {directory})\" = 700") {
+                        return Err(russh::Error::Disconnect);
+                    }
+                    b"".as_slice()
+                }
+                command if self.upload_sftp.load(Ordering::SeqCst) && command.starts_with(b"rm -f -- ") => {
+                    let text = std::str::from_utf8(command).map_err(|_| russh::Error::Disconnect)?;
+                    let directory = text.strip_prefix("rm -f -- ")
+                        .and_then(|value| value.split_once("/image.tar && (rmdir -- "))
+                        .map(|(directory, _)| directory).ok_or(russh::Error::Disconnect)?;
+                    if super::cleanup_archive_command(directory).as_deref() != Ok(text) {
+                        return Err(russh::Error::Disconnect);
+                    }
+                    self.upload_files.lock().unwrap().remove(&format!("{directory}/image.tar"));
+                    b"".as_slice()
+                }
                 b"sh -c 'printf \"%s\\n%s\\n\" \"$DOCKER_CONTEXT\" \"$DOCKER_HOST\"'" => match self.endpoint_mode.load(Ordering::SeqCst) {
                     1 => b"\nunix:///run/user/1000/docker.sock\n".as_slice(),
                     2 => b"local-alt\n\n".as_slice(),
@@ -1674,6 +2124,9 @@ mod tests {
         let remote_context = Arc::new(AtomicBool::new(false));
         let endpoint_mode = Arc::new(AtomicUsize::new(0));
         let sftp_version = Arc::new(AtomicUsize::new(3));
+        let upload_sftp = Arc::new(AtomicBool::new(false));
+        let upload_files = Arc::new(Mutex::new(HashMap::new()));
+        let upload_fail_write = Arc::new(AtomicBool::new(false));
         let config = Arc::new(server::Config {
             keys: vec![key],
             auth_rejection_time: Duration::from_millis(10),
@@ -1696,6 +2149,10 @@ mod tests {
             sftp_channels: Vec::new(),
             sftp_pending: Vec::new(),
             sftp_version: sftp_version.clone(),
+            upload_sftp: upload_sftp.clone(),
+            upload_channels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            upload_files: upload_files.clone(),
+            upload_fail_write: upload_fail_write.clone(),
         };
         let running = server.run_on_socket(config, &listener);
         let handle = running.handle();
@@ -1910,6 +2367,61 @@ mod tests {
             assert_eq!(lines.len(), 2);
             assert!(lines.contains(&"2026-10-26 stdout".to_owned()));
             assert!(lines.contains(&"2026-10-26 stderr".to_owned()));
+            upload_sftp.store(true, Ordering::SeqCst);
+            let archive_path =
+                std::env::temp_dir().join(format!("deving-sftp-{}", uuid::Uuid::new_v4()));
+            let bytes = vec![0x5au8; 150_000];
+            std::fs::write(&archive_path, &bytes).unwrap();
+            let mut progress = Vec::new();
+            let upload = super::transfer_archive(
+                material(Some(fingerprint.clone())),
+                &archive_path,
+                bytes.len() as u64,
+                &AtomicBool::new(false),
+                &mut |copied, total| progress.push((copied, total)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(upload.bytes, bytes.len() as u64);
+            assert_eq!(upload.sha256, format!("{:x}", sha2::Sha256::digest(&bytes)));
+            assert_eq!(upload_files.lock().unwrap().get(&upload.path), Some(&bytes));
+            assert_eq!(
+                progress.last(),
+                Some(&(bytes.len() as u64, bytes.len() as u64))
+            );
+            let transfer_handle = super::trusted_handle(material(Some(fingerprint.clone())))
+                .await
+                .unwrap();
+            super::archive_command(
+                &transfer_handle,
+                &super::cleanup_archive_command(&upload.directory).unwrap(),
+            )
+            .await
+            .unwrap();
+            super::archive_command(
+                &transfer_handle,
+                &super::cleanup_archive_command(&upload.directory).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert!(upload_files.lock().unwrap().is_empty());
+            let _ = transfer_handle
+                .disconnect(russh::Disconnect::ByApplication, "", "en")
+                .await;
+            upload_fail_write.store(true, Ordering::SeqCst);
+            let failure = super::transfer_archive(
+                material(Some(fingerprint.clone())),
+                &archive_path,
+                bytes.len() as u64,
+                &AtomicBool::new(false),
+                &mut |_, _| {},
+            )
+            .await;
+            assert!(failure.is_err());
+            assert!(upload_files.lock().unwrap().is_empty());
+            upload_fail_write.store(false, Ordering::SeqCst);
+            std::fs::remove_file(&archive_path).unwrap();
+            upload_sftp.store(false, Ordering::SeqCst);
             let unknown = execute_container_action(
                 material(Some(fingerprint.clone())),
                 "deadbeef",
