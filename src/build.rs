@@ -6,6 +6,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
@@ -30,6 +31,7 @@ pub struct SavedArchive {
     pub path: PathBuf,
     pub bytes: u64,
     pub sha256: String,
+    pub image_ids: Vec<String>,
 }
 
 impl Drop for SavedArchive {
@@ -213,6 +215,83 @@ fn inspect_built_image(
         !test.is_empty() && test.first().and_then(Value::as_str) != Some("NONE")
     });
     Ok((image_id.to_owned(), has_healthcheck))
+}
+
+fn archive_image_ids(path: &Path, reference: &str, platform: &str) -> Result<Vec<String>, String> {
+    let file = File::open(path).map_err(|_| "无法读取镜像归档元数据。")?;
+    let mut archive = tar::Archive::new(file);
+    let mut index = None;
+    let mut manifest = None;
+    for entry in archive.entries().map_err(|_| "镜像归档格式无效。")? {
+        let entry = entry.map_err(|_| "镜像归档内容无效。")?;
+        let target = match entry.path_bytes().as_ref() {
+            b"index.json" => &mut index,
+            b"manifest.json" => &mut manifest,
+            _ => continue,
+        };
+        if target.is_some() {
+            return Err("镜像归档元数据重复。".into());
+        }
+        let mut bytes = Vec::new();
+        entry
+            .take(64 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "无法读取镜像归档元数据。")?;
+        if bytes.len() > 64 * 1024 {
+            return Err("镜像归档元数据过大。".into());
+        }
+        *target = Some(bytes);
+    }
+    let manifest: Value = serde_json::from_slice(&manifest.ok_or("镜像归档缺少 manifest。")?)
+        .map_err(|_| "镜像归档 manifest 无效。")?;
+    let rows = manifest.as_array().ok_or("镜像归档 manifest 无效。")?;
+    if rows.len() != 1
+        || !rows[0]
+            .get("RepoTags")
+            .and_then(Value::as_array)
+            .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some(reference)))
+    {
+        return Err("镜像归档引用与构建结果不一致。".into());
+    }
+    let config = rows[0]
+        .get("Config")
+        .and_then(Value::as_str)
+        .ok_or("镜像归档配置标识缺失。")?;
+    let config_hash = config
+        .strip_prefix("blobs/sha256/")
+        .or_else(|| config.strip_suffix(".json"))
+        .ok_or("镜像归档配置标识无效。")?;
+    let mut ids = vec![format!("sha256:{config_hash}")];
+    if let Some(index) = index {
+        let index: Value = serde_json::from_slice(&index).map_err(|_| "镜像归档索引无效。")?;
+        let expected = platform.split_once('/').ok_or("镜像归档平台无效。")?;
+        let matches = index
+            .get("manifests")
+            .and_then(Value::as_array)
+            .ok_or("镜像归档索引缺少 manifest。")?
+            .iter()
+            .filter(|item| {
+                item.pointer("/platform/os").and_then(Value::as_str) == Some(expected.0)
+                    && item
+                        .pointer("/platform/architecture")
+                        .and_then(Value::as_str)
+                        == Some(expected.1)
+            })
+            .filter_map(|item| item.get("digest").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err("镜像归档平台索引不唯一。".into());
+        }
+        ids.push(matches[0].to_owned());
+    }
+    if ids.iter().any(|id| {
+        id.len() != 71
+            || !id.starts_with("sha256:")
+            || !id[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err("镜像归档标识无效。".into());
+    }
+    Ok(ids)
 }
 
 async fn execute_build(
@@ -492,6 +571,7 @@ pub fn save_image(image: &BuiltImage, cancel: Arc<AtomicBool>) -> Result<SavedAr
         path,
         bytes: 0,
         sha256: String::new(),
+        image_ids: Vec::new(),
     };
     let mut command = docker::command_for_endpoint(&endpoint);
     command.args([
@@ -530,6 +610,7 @@ pub fn save_image(image: &BuiltImage, cancel: Arc<AtomicBool>) -> Result<SavedAr
     if archive.bytes == 0 {
         return Err("本地镜像归档为空。".into());
     }
+    archive.image_ids = archive_image_ids(&archive.path, &image.reference, &image.platform)?;
     archive.sha256 = format!("{:x}", digest.finalize());
     Ok(archive)
 }
@@ -537,12 +618,13 @@ pub fn save_image(image: &BuiltImage, cancel: Arc<AtomicBool>) -> Result<SavedAr
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildLineBuffer, SavedArchive, build_image, execute_build, sanitized_line, save_image,
-        write_archive,
+        BuildLineBuffer, SavedArchive, archive_image_ids, build_image, execute_build,
+        sanitized_line, save_image, write_archive,
     };
     use crate::project_store::Project;
     use crate::release::PlannedImage;
     use std::collections::VecDeque;
+    use std::fs::File;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -651,8 +733,53 @@ mod tests {
             path: path.clone(),
             bytes: 0,
             sha256: String::new(),
+            image_ids: Vec::new(),
         });
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn export_metadata_tracks_platform_manifest_and_config_ids() {
+        let path = std::env::temp_dir().join(format!(
+            "devingpanel-index-test-{}.tar",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let config = "a".repeat(64);
+        let manifest_id = "b".repeat(64);
+        let reference = "devingpanel/test:one";
+        {
+            let mut archive = tar::Builder::new(File::create(&path).unwrap());
+            for (name, bytes) in [
+                (
+                    "manifest.json",
+                    format!(
+                        r#"[{{"Config":"blobs/sha256/{config}","RepoTags":["{reference}"],"Layers":[]}}]"#
+                    ),
+                ),
+                (
+                    "index.json",
+                    format!(
+                        r#"{{"manifests":[{{"digest":"sha256:{manifest_id}","platform":{{"os":"linux","architecture":"amd64"}}}}]}}"#
+                    ),
+                ),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                archive
+                    .append_data(&mut header, name, bytes.as_bytes())
+                    .unwrap();
+            }
+            archive.finish().unwrap();
+        }
+        assert_eq!(
+            archive_image_ids(&path, reference, "linux/amd64").unwrap(),
+            [format!("sha256:{config}"), format!("sha256:{manifest_id}")]
+        );
+        assert!(archive_image_ids(&path, reference, "linux/arm64").is_err());
+        assert!(archive_image_ids(&path, "different:tag", "linux/amd64").is_err());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -699,6 +826,7 @@ mod tests {
             use sha2::Digest;
             let actual = sha2::Sha256::digest(std::fs::read(&archive.path).unwrap());
             assert_eq!(archive.sha256, format!("{actual:x}"));
+            assert!(!archive.image_ids.is_empty());
             let path = archive.path.clone();
             drop(archive);
             assert!(!path.exists());

@@ -105,7 +105,11 @@ fn apt_candidates_use_source(text: &str, source: DockerInstallSource) -> bool {
                 .trim_start_matches("*** ")
                 .split_whitespace()
                 .collect();
-            parts.len() >= 2 && parts[0] == candidate && parts[1].parse::<i32>().is_ok()
+            parts.len() >= 2
+                && parts[0] == candidate
+                && parts[1]
+                    .parse::<i32>()
+                    .is_ok_and(|priority| priority >= 990)
         }) else {
             return false;
         };
@@ -119,16 +123,14 @@ fn apt_candidates_use_source(text: &str, source: DockerInstallSource) -> bool {
             if parts[1].parse::<i32>().is_ok() {
                 break;
             }
-            if let Ok(priority) = parts[0].parse::<i32>()
-                && priority >= 990
-            {
+            if parts[0].parse::<i32>().is_ok() {
                 if parts[1] == source_url
                     || parts[1]
                         .strip_prefix(&source_url)
                         .is_some_and(|suffix| suffix.starts_with('/'))
                 {
                     selected = true;
-                } else {
+                } else if parts[1] != "/var/lib/dpkg/status" {
                     return false;
                 }
             }
@@ -178,6 +180,7 @@ pub struct UploadedArchive {
     pub path: String,
     pub bytes: u64,
     pub sha256: String,
+    pub image_ids: Vec<String>,
 }
 
 fn validated_upload_directory(raw: &str) -> Result<String, String> {
@@ -1626,6 +1629,7 @@ async fn upload_to_directory(
         path,
         bytes: size,
         sha256: local_digest,
+        image_ids: Vec::new(),
     })
 }
 
@@ -1739,7 +1743,6 @@ pub fn cleanup_uploaded_archive(
 fn validated_load_target(
     archive: &UploadedArchive,
     reference: &str,
-    image_id: &str,
     platform: &str,
 ) -> Result<(), String> {
     let directory = validated_upload_directory(&archive.directory)?;
@@ -1747,6 +1750,12 @@ fn validated_load_target(
         || archive.bytes == 0
         || archive.sha256.len() != 64
         || !archive.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || archive.image_ids.is_empty()
+        || archive.image_ids.iter().any(|id| {
+            id.len() != 71
+                || !id.starts_with("sha256:")
+                || !id[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
     {
         return Err("远端镜像归档信息无效。".into());
     }
@@ -1761,17 +1770,14 @@ fn validated_load_target(
         || !tag
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
-        || image_id.len() != 71
-        || !image_id.starts_with("sha256:")
-        || !image_id[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
         || !matches!(platform, "linux/amd64" | "linux/arm64")
     {
-        return Err("待加载镜像引用、ID 或架构无效。".into());
+        return Err("待加载镜像引用或架构无效。".into());
     }
     Ok(())
 }
 
-fn verified_loaded_image(text: &str, image_id: &str, platform: &str) -> Result<(), String> {
+fn verified_loaded_image(text: &str, image_ids: &[String], platform: &str) -> Result<(), String> {
     let row: Value = serde_json::from_str(text).map_err(|_| "远端镜像元数据无效，结果待核实。")?;
     let actual = format!(
         "{}/{}",
@@ -1780,7 +1786,12 @@ fn verified_loaded_image(text: &str, image_id: &str, platform: &str) -> Result<(
             .and_then(Value::as_str)
             .unwrap_or_default()
     );
-    if row.get("Id").and_then(Value::as_str) != Some(image_id) || actual != platform {
+    if !row
+        .get("Id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| image_ids.iter().any(|expected| expected == id))
+        || actual != platform
+    {
         return Err("远端镜像 ID 或架构与本机构建结果不一致，禁止部署。".into());
     }
     Ok(())
@@ -1790,11 +1801,10 @@ async fn load_archive(
     material: ConnectionMaterial,
     archive: &UploadedArchive,
     reference: &str,
-    image_id: &str,
     platform: &str,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    validated_load_target(archive, reference, image_id, platform)?;
+    validated_load_target(archive, reference, platform)?;
     let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
         .await
         .map_err(|_| "远端镜像加载连接超时。")??;
@@ -1854,7 +1864,7 @@ async fn load_archive(
     let result = archive_command(&handle, &inspect)
         .await
         .map_err(|_| "远端镜像加载后无法核对元数据，结果待核实。")?;
-    verified_loaded_image(&result, image_id, platform)?;
+    verified_loaded_image(&result, &archive.image_ids, platform)?;
     let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
     Ok(())
 }
@@ -1864,18 +1874,17 @@ pub fn load_uploaded_archive(
     expected_host: Host,
     archive: &UploadedArchive,
     reference: &str,
-    image_id: &str,
     platform: &str,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    validated_load_target(archive, reference, image_id, platform)?;
+    validated_load_target(archive, reference, platform)?;
     let material = material_for(&expected_host)?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|_| "无法初始化远端镜像加载环境。".to_owned())?
         .block_on(load_archive(
-            material, archive, reference, image_id, platform, &cancel,
+            material, archive, reference, platform, &cancel,
         ))
 }
 
@@ -1901,6 +1910,93 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
+
+    #[test]
+    #[ignore = "requires an explicitly configured real VPS; creates and removes one private temporary upload"]
+    fn real_vps_probe_and_temporary_upload() {
+        let address = std::env::var("DEVINGPANEL_TEST_VPS_HOST").unwrap();
+        let fingerprint = std::env::var("DEVINGPANEL_TEST_VPS_FINGERPRINT").unwrap();
+        let credential = std::env::var("DEVINGPANEL_TEST_VPS_PASSWORD").unwrap();
+        let material = || ConnectionMaterial {
+            host: Host {
+                id: 0,
+                name: "integration target".into(),
+                address: address.clone(),
+                port: 22,
+                username: "root".into(),
+                group: String::new(),
+                auth: "password".into(),
+                trusted_fingerprint: Some(fingerprint.clone()),
+            },
+            credential: credential.clone(),
+            trusted_fingerprint: Some(fingerprint.clone()),
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                assert!(matches!(
+                    probe(material()).await.unwrap(),
+                    TestResult::Connected {
+                        architecture: Some(platform),
+                        sftp_v3_handshake: true,
+                        ..
+                    } if platform == "linux/amd64"
+                ));
+                let inventory = fetch_inventory(material()).await.unwrap();
+                assert!(inventory.containers.is_empty());
+                let monitor = fetch_monitor(material()).await.unwrap();
+                assert!(monitor.memory_total_kib > 0);
+                let policy_handle = super::trusted_handle(material()).await.unwrap();
+                let policy = super::command_limited(
+                    &policy_handle,
+                    "apt-cache policy docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin",
+                    512 * 1024,
+                )
+                .await
+                .unwrap();
+                assert!(apt_candidates_use_source(&policy, DockerInstallSource::Tencent));
+                let _ = policy_handle
+                    .disconnect(russh::Disconnect::ByApplication, "", "en")
+                    .await;
+                let path = std::env::temp_dir().join(format!(
+                    "devingpanel-vps-upload-{}",
+                    uuid::Uuid::new_v4().simple()
+                ));
+                let bytes = vec![0x5au8; 8192];
+                std::fs::write(&path, &bytes).unwrap();
+                let mut progress = Vec::new();
+                let uploaded = super::transfer_archive(
+                    material(),
+                    &path,
+                    bytes.len() as u64,
+                    &AtomicBool::new(false),
+                    &mut |copied, total| progress.push((copied, total)),
+                )
+                .await
+                .unwrap();
+                let handle = super::trusted_handle(material()).await.unwrap();
+                super::archive_command(
+                    &handle,
+                    &super::cleanup_archive_command(&uploaded.directory).unwrap(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{}: {error}", uploaded.directory));
+                let _ = handle
+                    .disconnect(russh::Disconnect::ByApplication, "", "en")
+                    .await;
+                std::fs::remove_file(path).unwrap();
+                assert_eq!(
+                    uploaded.sha256,
+                    format!("{:x}", sha2::Sha256::digest(&bytes))
+                );
+                assert_eq!(
+                    progress.last(),
+                    Some(&(bytes.len() as u64, bytes.len() as u64))
+                );
+            });
+    }
 
     #[test]
     fn installer_uses_fixed_signed_apt_sources() {
@@ -1934,10 +2030,14 @@ mod tests {
         }
         let output = ["docker-ce", "docker-ce-cli", "containerd.io", "docker-buildx-plugin", "docker-compose-plugin"]
             .iter()
-            .map(|package| format!("{package}:\n  Installed: (none)\n  Candidate: 1.0\n  Version table:\n     1.0 990\n       990 https://mirrors.cloud.tencent.com/docker-ce/linux/debian trixie/stable amd64 Packages\n"))
+            .map(|package| format!("{package}:\n  Installed: (none)\n  Candidate: 1.0\n  Version table:\n     1.0 990\n       500 https://mirrors.cloud.tencent.com/docker-ce/linux/debian trixie/stable amd64 Packages\n"))
             .collect::<String>();
         assert!(apt_candidates_use_source(
             &output,
+            DockerInstallSource::Tencent
+        ));
+        assert!(!apt_candidates_use_source(
+            &output.replace("1.0 990", "1.0 500"),
             DockerInstallSource::Tencent
         ));
         assert!(!apt_candidates_use_source(
@@ -1946,22 +2046,22 @@ mod tests {
         ));
         assert!(!apt_candidates_use_source(
             &output.replace(
-                "990 https://mirrors.cloud.tencent.com",
-                "990 https://untrusted.example"
+                "500 https://mirrors.cloud.tencent.com",
+                "500 https://untrusted.example"
             ),
             DockerInstallSource::Tencent
         ));
         assert!(!apt_candidates_use_source(
             &output.replace(
-                "       990 https://mirrors.cloud.tencent.com",
-                "       1000 https://untrusted.example/docker-ce/linux/debian trixie/stable amd64 Packages\n       990 https://mirrors.cloud.tencent.com"
+                "       500 https://mirrors.cloud.tencent.com",
+                "       1000 https://untrusted.example/docker-ce/linux/debian trixie/stable amd64 Packages\n       500 https://mirrors.cloud.tencent.com"
             ),
             DockerInstallSource::Tencent
         ));
         assert!(!apt_candidates_use_source(
             &output.replace(
-                "       990 https://mirrors.cloud.tencent.com",
-                "       1001 file:/srv/packages trixie/stable amd64 Packages\n       990 https://mirrors.cloud.tencent.com"
+                "       500 https://mirrors.cloud.tencent.com",
+                "       500 file:/srv/packages trixie/stable amd64 Packages\n       500 https://mirrors.cloud.tencent.com"
             ),
             DockerInstallSource::Tencent
         ));
@@ -2924,7 +3024,7 @@ mod tests {
             let bytes = vec![0x5au8; 150_000];
             std::fs::write(&archive_path, &bytes).unwrap();
             let mut progress = Vec::new();
-            let upload = super::transfer_archive(
+            let mut upload = super::transfer_archive(
                 material(Some(fingerprint.clone())),
                 &archive_path,
                 bytes.len() as u64,
@@ -2942,12 +3042,12 @@ mod tests {
             );
             Box::pin(async {
                 let image_id = format!("sha256:{}", "a".repeat(64));
+                upload.image_ids = vec![image_id.clone()];
                 assert!(
                     super::load_archive(
                         material(Some(fingerprint.clone())),
                         &upload,
                         "app;bad:tag",
-                        &image_id,
                         "linux/amd64",
                         &AtomicBool::new(false),
                     )
@@ -2961,7 +3061,6 @@ mod tests {
                         material(Some(fingerprint.clone())),
                         &upload,
                         "app:load-test",
-                        &image_id,
                         "linux/amd64",
                         &AtomicBool::new(false),
                     )
@@ -2974,13 +3073,13 @@ mod tests {
                     path: upload.path.clone(),
                     bytes: upload.bytes,
                     sha256: "b".repeat(64),
+                    image_ids: upload.image_ids.clone(),
                 };
                 assert!(
                     super::load_archive(
                         material(Some(fingerprint.clone())),
                         &altered,
                         "app:load-test",
-                        &image_id,
                         "linux/amd64",
                         &AtomicBool::new(false),
                     )
@@ -2994,7 +3093,6 @@ mod tests {
                         material(Some(fingerprint.clone())),
                         &upload,
                         "app:load-test",
-                        &image_id,
                         "linux/amd64",
                         &AtomicBool::new(false),
                     )
@@ -3009,7 +3107,6 @@ mod tests {
                         material(Some(fingerprint.clone())),
                         &upload,
                         "app:load-test",
-                        &image_id,
                         "linux/amd64",
                         &cancelled,
                     )
@@ -3022,7 +3119,6 @@ mod tests {
                     material(Some(fingerprint.clone())),
                     &upload,
                     "app:load-test",
-                    &image_id,
                     "linux/amd64",
                     &AtomicBool::new(false),
                 )
@@ -3036,7 +3132,6 @@ mod tests {
                     material(Some(fingerprint.clone())),
                     &upload,
                     "app:load-test",
-                    &image_id,
                     "linux/amd64",
                     &AtomicBool::new(false),
                 )
@@ -3044,18 +3139,29 @@ mod tests {
                 .unwrap();
                 assert_eq!(operations.lock().unwrap().len(), 6);
                 let wrong_id = format!("sha256:{}", "b".repeat(64));
+                let mut wrong_archive = super::UploadedArchive {
+                    directory: upload.directory.clone(),
+                    path: upload.path.clone(),
+                    bytes: upload.bytes,
+                    sha256: upload.sha256.clone(),
+                    image_ids: vec![wrong_id],
+                };
                 assert!(
                     super::load_archive(
                         material(Some(fingerprint.clone())),
-                        &upload,
+                        &wrong_archive,
                         "app:load-test",
-                        &wrong_id,
                         "linux/amd64",
                         &AtomicBool::new(false),
                     )
                     .await
                     .unwrap_err()
                     .contains("禁止部署")
+                );
+                wrong_archive.image_ids.clear();
+                assert!(
+                    super::validated_load_target(&wrong_archive, "app:load-test", "linux/amd64")
+                        .is_err()
                 );
             })
             .await;

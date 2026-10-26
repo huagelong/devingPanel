@@ -212,9 +212,11 @@ pub fn transfer_built_image(
         return Err("镜像传输已取消。".into());
     }
     let uploaded = ssh::upload_archive(host.clone(), &archive.path, cancel, &mut progress)?;
-    finish_transfer(&archive, uploaded, |uploaded| {
+    let mut uploaded = finish_transfer(&archive, uploaded, |uploaded| {
         ssh::cleanup_uploaded_archive(host, uploaded)
-    })
+    })?;
+    uploaded.image_ids = archive.image_ids.clone();
+    Ok(uploaded)
 }
 
 #[cfg(test)]
@@ -310,12 +312,14 @@ mod tests {
             )),
             bytes: 100,
             sha256: "a".repeat(64),
+            image_ids: vec![format!("sha256:{}", "a".repeat(64))],
         };
         let mut uploaded = crate::ssh::UploadedArchive {
             directory: "/tmp/devingpanel.0123456789abcdef0123456789abcdef".into(),
             path: "/tmp/devingpanel.0123456789abcdef0123456789abcdef/image.tar".into(),
             bytes: 100,
             sha256: "a".repeat(64),
+            image_ids: Vec::new(),
         };
         assert!(verify_transfer(&archive, &uploaded).is_ok());
         uploaded.bytes += 1;
@@ -339,6 +343,7 @@ mod tests {
             path: "/tmp/devingpanel.0123456789abcdef0123456789abcdef/image.tar".into(),
             bytes: archive.bytes,
             sha256: archive.sha256.clone(),
+            image_ids: Vec::new(),
         };
         assert!(
             finish_transfer(&archive, uploaded, |_| panic!(

@@ -13,6 +13,7 @@ russh = { version = "0.64.1", default-features = false, features = ["ring", "rsa
 russh-sftp = "3.0.1"
 serde_json = "1"
 sha2 = "0.10"
+tar = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "macros", "sync", "process", "io-util", "fs"] }
 uuid = { version = "1", features = ["v4"] }
 yaml-rust2 = "0.13"
