@@ -72,6 +72,9 @@ fn checked_platform(
         TestResult::Connected {
             architecture: None, ..
         } => Err(format!("主机 {host_name} 的架构尚未支持。")),
+        TestResult::DockerMissing { .. } => Err(format!(
+            "主机 {host_name} 的 SSH 已连接，但 Docker 未安装；请先到主机详情安装。"
+        )),
     }
 }
 

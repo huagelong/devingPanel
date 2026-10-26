@@ -30,6 +30,8 @@
 
 在用户通过 VPS 控制台独立核对 ED25519 主机指纹后，使用固定的主机密钥连接 `129.211.23.223:22`。系统 OpenSSH 密码登录、`uname`、根目录 `df -Pk /` 和 SFTP `pwd` 成功；服务器为 Debian Linux `x86_64`，根目录约有 47 GiB 可用空间。远端执行 `docker version` 与 `docker compose version` 均返回 `docker: command not found`。没有上传文件、修改服务器或尝试部署。此测试不等于应用内 SSH/SFTP 适配器验收；该 VPS 安装并启动 Docker Engine 与 Compose 之前，发布预检理应阻断，不能用于镜像传输和部署验证。
 
+主机测试现将可信 SSH 已连通但 Docker 命令缺失与认证/daemon 失败区分，主机详情“基本信息”按 WebUI 的警告卡片提供安装引导。仅 Debian 13 x86_64、root 和已确认指纹可在二次确认后选择腾讯云 Docker CE 镜像或官方 apt 源一键安装；安装前核对 Docker 官方 GPG 主密钥指纹，以 `Signed-By` 限制仓库并按所选域名固定 Docker 包优先级、核对 apt 候选来源，`apt --no-remove` 不自动移除已有包，完成后重新测试 Docker/Compose。其他系统只显示人工安装提示。已在 VPS 只读确认腾讯云镜像与官方仓库的 Debian 13 元数据和密钥可访问，镜像密钥与官方密钥字节一致；**尚未在 VPS 执行安装**。安装中退出客户端或 SSH 中断可能留下部分软件源/包，需要人工核对，不自动重跑；Docker Hub 镜像加速不预设第三方代理；Compose 中其他公共服务镜像仍可能需要可信 Registry/云厂商专属加速地址或预置镜像。当前发布按钮依然禁用。
+
 ## 本地运行
 
 先安装 Rust 1.92+ MSVC 工具链、Visual Studio C++ Build Tools（含 Windows SDK）及 CMake。其他平台的系统依赖见 [GPUI Kit 安装说明](https://gpui-kit.com/docs/installation)。

@@ -31,6 +31,110 @@ pub enum TestResult {
         disk_available_kib: u64,
         sftp_v3_handshake: bool,
     },
+    DockerMissing {
+        os_id: String,
+        os_version: String,
+        system_kernel: String,
+        architecture: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DockerInstallSource {
+    Tencent,
+    Official,
+}
+
+impl DockerInstallSource {
+    fn base_url(self) -> &'static str {
+        match self {
+            Self::Tencent => "https://mirrors.cloud.tencent.com/docker-ce/linux/debian",
+            Self::Official => "https://download.docker.com/linux/debian",
+        }
+    }
+
+    fn host(self) -> &'static str {
+        match self {
+            Self::Tencent => "mirrors.cloud.tencent.com",
+            Self::Official => "download.docker.com",
+        }
+    }
+}
+
+const DOCKER_GPG_FINGERPRINT: &str = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88";
+
+fn valid_docker_signing_key(text: &str) -> bool {
+    text.lines().filter(|line| line.starts_with("pub:")).count() == 1
+        && text
+            .lines()
+            .find_map(|line| line.strip_prefix("fpr:::::::::"))
+            .and_then(|line| line.split(':').next())
+            == Some(DOCKER_GPG_FINGERPRINT)
+}
+
+fn apt_candidates_use_source(text: &str, source: DockerInstallSource) -> bool {
+    let packages = [
+        "docker-ce",
+        "docker-ce-cli",
+        "containerd.io",
+        "docker-buildx-plugin",
+        "docker-compose-plugin",
+    ];
+    let mut sections = std::collections::HashMap::new();
+    let mut current = "";
+    for line in text.lines() {
+        if !line.starts_with(char::is_whitespace) && line.ends_with(':') {
+            current = line.trim_end_matches(':');
+        }
+        sections.entry(current).or_insert_with(Vec::new).push(line);
+    }
+    packages.iter().all(|package| {
+        let Some(lines) = sections.get(package) else {
+            return false;
+        };
+        let Some(candidate) = lines
+            .iter()
+            .find_map(|line| line.trim().strip_prefix("Candidate: "))
+            .filter(|value| *value != "(none)")
+        else {
+            return false;
+        };
+        let Some(index) = lines.iter().position(|line| {
+            let parts: Vec<_> = line
+                .trim()
+                .trim_start_matches("*** ")
+                .split_whitespace()
+                .collect();
+            parts.len() >= 2 && parts[0] == candidate && parts[1].parse::<i32>().is_ok()
+        }) else {
+            return false;
+        };
+        let mut selected = false;
+        let source_url = format!("https://{}/docker-ce/linux/debian", source.host());
+        for line in &lines[index + 1..] {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            if parts[1].parse::<i32>().is_ok() {
+                break;
+            }
+            if let Ok(priority) = parts[0].parse::<i32>()
+                && priority >= 990
+            {
+                if parts[1] == source_url
+                    || parts[1]
+                        .strip_prefix(&source_url)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+                {
+                    selected = true;
+                } else {
+                    return false;
+                }
+            }
+        }
+        selected
+    })
 }
 
 #[derive(Clone)]
@@ -962,6 +1066,54 @@ async fn probe(material: ConnectionMaterial) -> Result<TestResult, String> {
         ConnectionOutcome::NeedsTrust(challenge) => return Ok(challenge),
         ConnectionOutcome::Authenticated(handle) => handle,
     };
+    let docker_presence = command(
+        &handle,
+        "sh -c 'command -v docker >/dev/null 2>&1; printf \"%s\\n\" \"$?\"'",
+    )
+    .await?;
+    if docker_presence.trim() != "0" {
+        let release = command(&handle, "cat /etc/os-release")
+            .await
+            .unwrap_or_default();
+        let field = |name: &str| {
+            release
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map(|value| value.trim_matches('"'))
+                .filter(|value| {
+                    !value.is_empty()
+                        && value.len() <= 32
+                        && value.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                        })
+                })
+                .map(str::to_owned)
+        };
+        let system_kernel = command(&handle, "uname -s -r")
+            .await
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let system_kernel = if system_kernel.is_empty()
+            || system_kernel.len() > 128
+            || system_kernel.chars().any(char::is_control)
+        {
+            "unknown".into()
+        } else {
+            system_kernel
+        };
+        let architecture = command(&handle, "uname -m")
+            .await
+            .ok()
+            .and_then(|value| linux_platform(&value).map(str::to_owned));
+        let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+        return Ok(TestResult::DockerMissing {
+            os_id: field("ID=").unwrap_or_else(|| "unknown".into()),
+            os_version: field("VERSION_ID=").unwrap_or_else(|| "unknown".into()),
+            system_kernel,
+            architecture,
+        });
+    }
     let endpoint = local_docker_endpoint(&handle).await?;
     let docker_version = safe_version(
         &command(
@@ -1055,6 +1207,119 @@ pub fn test_host_snapshot(
                     result.map_err(|_| "主机架构检查超时。")?,
             }
         })
+}
+
+fn docker_install_commands(source: DockerInstallSource) -> Vec<(&'static str, String, Duration)> {
+    let url = source.base_url();
+    let host = source.host();
+    vec![
+        ("更新现有软件源", "DEBIAN_FRONTEND=noninteractive apt-get -o APT::Update::Error-Mode=any update -qq > /dev/null".into(), Duration::from_secs(300)),
+        ("安装仓库签名工具", "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-remove ca-certificates curl gnupg > /dev/null".into(), Duration::from_secs(300)),
+        ("准备 Docker 仓库密钥", format!("install -m 0755 -d /etc/apt/keyrings && curl -fsSL --max-time 60 {url}/gpg -o /etc/apt/keyrings/devingpanel-docker.asc.tmp"), Duration::from_secs(90)),
+        ("验证 Docker 官方密钥", "gpg --batch --show-keys --with-colons /etc/apt/keyrings/devingpanel-docker.asc.tmp".into(), Duration::from_secs(15)),
+        ("配置 Docker 软件源", format!("chmod 0644 /etc/apt/keyrings/devingpanel-docker.asc.tmp && mv /etc/apt/keyrings/devingpanel-docker.asc.tmp /etc/apt/keyrings/devingpanel-docker.asc && printf 'Types: deb\\nURIs: {url}\\nSuites: trixie\\nComponents: stable\\nArchitectures: amd64\\nSigned-By: /etc/apt/keyrings/devingpanel-docker.asc\\n' > /etc/apt/sources.list.d/devingpanel-docker.sources && printf 'Package: docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\\nPin: origin \"{host}\"\\nPin-Priority: 990\\n' > /etc/apt/preferences.d/devingpanel-docker.pref"), Duration::from_secs(15)),
+        ("更新 Docker 软件源", "DEBIAN_FRONTEND=noninteractive apt-get -o APT::Update::Error-Mode=any update -qq > /dev/null".into(), Duration::from_secs(300)),
+        ("核对软件包来源", "apt-cache policy docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin".into(), Duration::from_secs(15)),
+        ("安装 Docker Engine 与 Compose", "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin > /dev/null".into(), Duration::from_secs(900)),
+        ("启动 Docker 服务", "systemctl enable --now docker > /dev/null".into(), Duration::from_secs(90)),
+    ]
+}
+
+async fn install_docker_on(
+    material: ConnectionMaterial,
+    source: DockerInstallSource,
+    on_stage: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    if material.host.username != "root" {
+        return Err("一键安装仅支持 root 登录；请使用有权限的账号手动安装。".into());
+    }
+    let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+        .await
+        .map_err(|_| "Docker 安装 SSH 连接超时。")??;
+    if archive_command(&handle, "id -u").await?.trim() != "0" {
+        return Err("远端登录用户不是 root，禁止安装。".into());
+    }
+    let release = archive_command(&handle, "cat /etc/os-release").await?;
+    let supported = release.lines().any(|line| line == "ID=debian")
+        && release
+            .lines()
+            .any(|line| line == "VERSION_ID=13" || line == "VERSION_ID=\"13\"");
+    let architecture = archive_command(&handle, "uname -m").await?;
+    if !supported || architecture.trim() != "x86_64" {
+        return Err("一键安装目前仅支持 Debian 13 x86_64；其他系统请按官方文档安装。".into());
+    }
+    let tools = archive_command(
+        &handle,
+        "sh -c 'for tool in apt-get dpkg-query systemctl curl; do command -v \"$tool\" >/dev/null 2>&1 || exit 1; done; test -d /run/systemd/system && echo ready'",
+    )
+    .await
+    .map_err(|_| "一键安装需要 apt/dpkg、curl 和运行中的 systemd；请手动安装。")?;
+    if tools.trim() != "ready" {
+        return Err("远端包管理器或 systemd 不可用，请手动安装。".into());
+    }
+    let docker = archive_command(
+        &handle,
+        "sh -c 'command -v docker >/dev/null 2>&1; printf \"%s\\n\" \"$?\"'",
+    )
+    .await?;
+    if docker.trim() == "0" {
+        return Err("Docker 命令已存在，请先检查 daemon 或权限，不应重复安装。".into());
+    }
+    if disk_available(&archive_command(&handle, "df -Pk /").await?)? < 2 * 1024 * 1024 {
+        return Err("VPS 根目录可用空间不足 2 GiB，未开始安装。".into());
+    }
+    let existing = archive_command(
+        &handle,
+        "sh -c 'if test -e /etc/apt/sources.list.d/devingpanel-docker.sources || test -e /etc/apt/preferences.d/devingpanel-docker.pref; then echo occupied; fi'",
+    )
+    .await?;
+    if !existing.trim().is_empty() {
+        return Err("已有本应用创建的 Docker 软件源；请人工核对上次安装结果。".into());
+    }
+    for (stage, command, timeout) in docker_install_commands(source) {
+        on_stage(stage);
+        let output = tokio::time::timeout(
+            timeout,
+            command_limited(
+                &handle,
+                &command,
+                if stage == "核对软件包来源" {
+                    512 * 1024
+                } else {
+                    4096
+                },
+            ),
+        )
+        .await
+        .map_err(|_| format!("{stage}超时，请在 VPS 上核对 apt 与 systemd 状态。"))?
+        .map_err(|_| format!("{stage}失败，请在 VPS 上核对 apt 与 systemd 状态。"))?;
+        if stage == "验证 Docker 官方密钥" && !valid_docker_signing_key(&output) {
+            return Err("Docker 仓库密钥指纹不符，已停止安装；请核对镜像源。".into());
+        }
+        if stage == "核对软件包来源" && !apt_candidates_use_source(&output, source) {
+            return Err("Docker 软件包候选版本不是来自所选签名仓库，已停止安装。".into());
+        }
+    }
+    let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+    Ok(())
+}
+
+#[allow(dead_code)] // The host details confirmation dialog invokes this in a background task.
+pub fn install_docker(
+    expected_host: Host,
+    source: DockerInstallSource,
+    mut on_stage: impl FnMut(&str),
+) -> Result<(), String> {
+    let material = material_for(&expected_host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化 Docker 安装环境。".to_owned())?
+        .block_on(install_docker_on(material, source, &mut on_stage))?;
+    match test_host_snapshot(expected_host, Arc::new(AtomicBool::new(false)))? {
+        TestResult::Connected { .. } => Ok(()),
+        _ => Err("安装命令已结束，但 Docker 尚未通过连接测试；请核对 VPS 状态。".into()),
+    }
 }
 
 async fn fetch_inventory(material: ConnectionMaterial) -> Result<Inventory, String> {
@@ -1617,12 +1882,13 @@ pub fn load_uploaded_archive(
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerAction, LogEvent, LogLineBuffer, TestResult, cleanup_archive_command,
-        container_command, cpu_counters, default_route_interface, disk_available, disk_percent,
+        ContainerAction, DockerInstallSource, LogEvent, LogLineBuffer, TestResult,
+        apt_candidates_use_source, cleanup_archive_command, container_command, cpu_counters,
+        default_route_interface, disk_available, disk_percent, docker_install_commands,
         execute_container_action, execute_disk_prune, fetch_disk_preview, fetch_inventory,
         fetch_monitor, follow_logs, image_size_bytes, memory_kib, network_bytes,
         parse_disk_preview, parse_inventory, probe, safe_version, same_connection_target,
-        validated_upload_directory, verified_sha256,
+        valid_docker_signing_key, validated_upload_directory, verified_sha256,
     };
     use crate::host_store::{ConnectionMaterial, Host};
     use russh::server::{self, Auth, Msg, Server as _, Session};
@@ -1635,6 +1901,71 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
+
+    #[test]
+    fn installer_uses_fixed_signed_apt_sources() {
+        let key = "pub:-:4096:1:0EBFCD88:0::::::\nfpr:::::::::9DC858229FC7DD38854AE2D88D81803C0EBFCD88:\nsub:-:4096:1:xxx:\nfpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\n";
+        assert!(valid_docker_signing_key(key));
+        assert!(!valid_docker_signing_key(&key.replace(
+            "9DC858229FC7DD38854AE2D88D81803C0EBFCD88",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        )));
+        assert!(!valid_docker_signing_key(&format!("{key}{key}")));
+        for (source, host) in [
+            (DockerInstallSource::Tencent, "mirrors.cloud.tencent.com"),
+            (DockerInstallSource::Official, "download.docker.com"),
+        ] {
+            let commands = docker_install_commands(source);
+            assert_eq!(commands.len(), 9);
+            assert!(commands[2].1.contains(host));
+            assert!(
+                commands[4]
+                    .1
+                    .contains("Signed-By: /etc/apt/keyrings/devingpanel-docker.asc")
+            );
+            assert!(commands[4].1.contains(&format!("Pin: origin \"{host}\"")));
+            assert!(commands[5].1.contains("APT::Update::Error-Mode=any"));
+            assert!(commands[7].1.contains("--no-remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"));
+            assert!(
+                !commands
+                    .iter()
+                    .any(|(_, command, _)| command.contains("| sh"))
+            );
+        }
+        let output = ["docker-ce", "docker-ce-cli", "containerd.io", "docker-buildx-plugin", "docker-compose-plugin"]
+            .iter()
+            .map(|package| format!("{package}:\n  Installed: (none)\n  Candidate: 1.0\n  Version table:\n     1.0 990\n       990 https://mirrors.cloud.tencent.com/docker-ce/linux/debian trixie/stable amd64 Packages\n"))
+            .collect::<String>();
+        assert!(apt_candidates_use_source(
+            &output,
+            DockerInstallSource::Tencent
+        ));
+        assert!(!apt_candidates_use_source(
+            &output,
+            DockerInstallSource::Official
+        ));
+        assert!(!apt_candidates_use_source(
+            &output.replace(
+                "990 https://mirrors.cloud.tencent.com",
+                "990 https://untrusted.example"
+            ),
+            DockerInstallSource::Tencent
+        ));
+        assert!(!apt_candidates_use_source(
+            &output.replace(
+                "       990 https://mirrors.cloud.tencent.com",
+                "       1000 https://untrusted.example/docker-ce/linux/debian trixie/stable amd64 Packages\n       990 https://mirrors.cloud.tencent.com"
+            ),
+            DockerInstallSource::Tencent
+        ));
+        assert!(!apt_candidates_use_source(
+            &output.replace(
+                "       990 https://mirrors.cloud.tencent.com",
+                "       1001 file:/srv/packages trixie/stable amd64 Packages\n       990 https://mirrors.cloud.tencent.com"
+            ),
+            DockerInstallSource::Tencent
+        ));
+    }
 
     #[test]
     fn upload_paths_and_checksums_reject_untrusted_remote_output() {
@@ -1912,6 +2243,7 @@ mod tests {
         upload_fail_write: Arc<AtomicBool>,
         load_tag_exists: Arc<AtomicBool>,
         load_no_exit: Arc<AtomicBool>,
+        docker_missing: Arc<AtomicBool>,
     }
 
     struct MemorySftp {
@@ -2068,14 +2400,16 @@ mod tests {
 
         async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
             self.auth_attempts.fetch_add(1, Ordering::SeqCst);
-            Ok(if user == "deploy" && password == "test-password" {
-                Auth::Accept
-            } else {
-                Auth::Reject {
-                    proceed_with_methods: None,
-                    partial_success: false,
-                }
-            })
+            Ok(
+                if (user == "deploy" || user == "root") && password == "test-password" {
+                    Auth::Accept
+                } else {
+                    Auth::Reject {
+                        proceed_with_methods: None,
+                        partial_success: false,
+                    }
+                },
+            )
         }
 
         async fn auth_publickey(
@@ -2223,6 +2557,14 @@ mod tests {
                 } else {
                     b"\"unix:///var/run/docker.sock\"\n".as_slice()
                 },
+                b"sh -c 'command -v docker >/dev/null 2>&1; printf \"%s\\n\" \"$?\"'" => if self.docker_missing.load(Ordering::SeqCst) {
+                    b"127\n".as_slice()
+                } else {
+                    b"0\n".as_slice()
+                },
+                b"cat /etc/os-release" => b"ID=debian\nVERSION_ID=\"13\"\n".as_slice(),
+                b"id -u" => b"0\n".as_slice(),
+                b"sh -c 'for tool in apt-get dpkg-query systemctl curl; do command -v \"$tool\" >/dev/null 2>&1 || exit 1; done; test -d /run/systemd/system && echo ready'" => b"ready\n".as_slice(),
                 b"docker --host unix:///var/run/docker.sock info --format '{{.ServerVersion}}'" => b"29.5.3\n".as_slice(),
                 b"docker --host unix:///var/run/docker.sock compose version --short" => b"5.1.4\n".as_slice(),
                 b"uname -m" => b"x86_64\n".as_slice(),
@@ -2306,6 +2648,7 @@ mod tests {
         let upload_fail_write = Arc::new(AtomicBool::new(false));
         let load_tag_exists = Arc::new(AtomicBool::new(false));
         let load_no_exit = Arc::new(AtomicBool::new(false));
+        let docker_missing = Arc::new(AtomicBool::new(false));
         let config = Arc::new(server::Config {
             keys: vec![key],
             auth_rejection_time: Duration::from_millis(10),
@@ -2334,6 +2677,7 @@ mod tests {
             upload_fail_write: upload_fail_write.clone(),
             load_tag_exists: load_tag_exists.clone(),
             load_no_exit: load_no_exit.clone(),
+            docker_missing: docker_missing.clone(),
         };
         let running = server.run_on_socket(config, &listener);
         let handle = running.handle();
@@ -2399,6 +2743,32 @@ mod tests {
                 _ => panic!("trusted host should connect"),
             }
             assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            docker_missing.store(true, Ordering::SeqCst);
+            assert!(matches!(
+                probe(material(Some(fingerprint.clone()))).await.unwrap(),
+                TestResult::DockerMissing {
+                    os_id,
+                    os_version,
+                    architecture: Some(platform),
+                    ..
+                } if os_id == "debian" && os_version == "13" && platform == "linux/amd64"
+            ));
+            docker_missing.store(false, Ordering::SeqCst);
+            Box::pin(async {
+                let mut root = material(Some(fingerprint.clone()));
+                root.host.username = "root".into();
+                let mut phases = Vec::new();
+                let error =
+                    super::install_docker_on(root, DockerInstallSource::Tencent, &mut |phase| {
+                        phases.push(phase.to_owned())
+                    })
+                    .await
+                    .unwrap_err();
+                assert!(error.contains("命令已存在"));
+                assert!(phases.is_empty());
+                assert!(operations.lock().unwrap().is_empty());
+            })
+            .await;
             for version in [0, 4] {
                 sftp_version.store(version, Ordering::SeqCst);
                 assert!(matches!(

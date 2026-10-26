@@ -17,7 +17,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Instant;
@@ -107,6 +107,12 @@ enum HostTestState {
     },
     Failed(String),
     NeedsTrust,
+    DockerMissing {
+        os_id: String,
+        os_version: String,
+        system_kernel: String,
+        architecture: Option<String>,
+    },
 }
 
 struct BuildForm {
@@ -433,6 +439,9 @@ pub(crate) struct AppView {
     host_monitor_cancel: Option<Arc<AtomicBool>>,
     host_tests: HashMap<i64, HostTestState>,
     host_testing: Option<i64>,
+    host_installing: Option<i64>,
+    host_install_stage: Option<String>,
+    host_install_error: Option<(i64, String)>,
     host_test_generation: u64,
     project_id: Option<i64>,
     project_tab: ProjectTab,
@@ -638,6 +647,9 @@ impl AppView {
             host_monitor_cancel: None,
             host_tests: HashMap::new(),
             host_testing: None,
+            host_installing: None,
+            host_install_stage: None,
+            host_install_error: None,
             host_test_generation: 0,
             project_id: None,
             project_tab: ProjectTab::Build,

@@ -461,6 +461,13 @@ impl AppView {
     }
 
     fn open_edit_host_dialog(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.host_installing == Some(id) {
+            window.push_notification(
+                Notification::warning("Docker 安装期间不可编辑主机连接配置。"),
+                cx,
+            );
+            return;
+        }
         let Some(host) = self.hosts.iter().find(|host| host.id == id).cloned() else {
             return;
         };
@@ -633,6 +640,11 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.host_installing == Some(id) {
+            dialog.submitting.set(false);
+            window.push_notification(Notification::warning("Docker 安装期间不可修改主机。"), cx);
+            return;
+        }
         cx.spawn_in(window, async move |view, cx| {
             let result = cx
                 .background_executor()
@@ -685,7 +697,7 @@ impl AppView {
     }
 
     fn test_host(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.host_testing.is_some() {
+        if self.host_testing.is_some() || self.host_installing.is_some() {
             return;
         }
         self.host_testing = Some(id);
@@ -769,6 +781,29 @@ impl AppView {
                                 .detach();
                                 None
                             }
+                            Ok(TestResult::DockerMissing {
+                                os_id,
+                                os_version,
+                                system_kernel,
+                                architecture,
+                            }) => {
+                                view.host_tests.insert(
+                                    id,
+                                    HostTestState::DockerMissing {
+                                        os_id,
+                                        os_version,
+                                        system_kernel,
+                                        architecture,
+                                    },
+                                );
+                                if view.page == Page::Hosts && view.host_id == Some(id) {
+                                    view.host_tab = HostTab::Info;
+                                    if let Some(cancel) = view.host_monitor_cancel.take() {
+                                        cancel.store(true, Ordering::Relaxed);
+                                    }
+                                }
+                                None
+                            }
                             Err(error) => {
                                 view.host_tests.insert(id, HostTestState::Failed(error));
                                 None
@@ -785,6 +820,151 @@ impl AppView {
                             view.confirm_host_fingerprint(challenge, window, cx);
                         }
                     });
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_docker_install(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(host) = self.hosts.iter().find(|host| host.id == id) else {
+            return;
+        };
+        if host.username != "root"
+            || !matches!(
+                self.host_tests.get(&id),
+                Some(HostTestState::DockerMissing { os_id, os_version, architecture: Some(platform), .. })
+                    if os_id == "debian" && os_version == "13" && platform == "linux/amd64"
+            )
+        {
+            return;
+        }
+        let name = host.name.clone();
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let tencent_view = view.clone();
+            let official_view = view.clone();
+            dialog
+                .title("一键安装 Docker")
+                .w(px(560.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(format!("目标主机：{name} · Debian 13 / amd64 · root"))
+                        .child("将添加 Docker CE apt 源与签名密钥，安装 Engine、CLI、containerd、Buildx、Compose，并启动 Docker 服务。可能改变系统软件包与网络配置。")
+                        .child("仓库密钥须匹配 Docker 官方指纹 9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88；不执行 curl | sh，也不设置未知的镜像加速器。")
+                        .child("安装源：mirrors.cloud.tencent.com（腾讯云，国内推荐）或 download.docker.com（官方）。若源不可用会停止，不自动切换。请确认 VPS 有足够磁盘空间并允许 apt 安装。"),
+                )
+                .footer(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(Button::new("docker-install-cancel").label("取消").on_click(
+                            |_, window, cx| window.close_dialog(cx),
+                        ))
+                        .child(Button::new("docker-install-official").label("使用官方源安装").on_click(
+                            move |_, window, cx| {
+                                window.close_dialog(cx);
+                                let _ = official_view.update(cx, |view, cx| {
+                                    view.start_docker_install(id, ssh::DockerInstallSource::Official, window, cx)
+                                });
+                            },
+                        ))
+                        .child(Button::new("docker-install-tencent").primary().label("使用腾讯云镜像安装").on_click(
+                            move |_, window, cx| {
+                                window.close_dialog(cx);
+                                let _ = tencent_view.update(cx, |view, cx| {
+                                    view.start_docker_install(id, ssh::DockerInstallSource::Tencent, window, cx)
+                                });
+                            },
+                        )),
+                )
+        });
+    }
+
+    fn start_docker_install(
+        &mut self,
+        id: i64,
+        source: ssh::DockerInstallSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.host_installing.is_some()
+            || !matches!(
+                self.host_tests.get(&id),
+                Some(HostTestState::DockerMissing { .. })
+            )
+        {
+            return;
+        }
+        let Some(host) = self.hosts.iter().find(|host| host.id == id).cloned() else {
+            return;
+        };
+        self.host_installing = Some(id);
+        self.host_install_stage = Some("准备连接并核对系统…".into());
+        self.host_install_error = None;
+        cx.notify();
+        let stage = Arc::new(Mutex::new(String::new()));
+        let worker_stage = stage.clone();
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let next = stage
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                let active = view
+                    .update(cx, |view, cx| {
+                        if view.host_installing != Some(id) {
+                            return false;
+                        }
+                        if !next.is_empty() && view.host_install_stage.as_deref() != Some(&next) {
+                            view.host_install_stage = Some(next);
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !active {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    ssh::install_docker(host, source, |phase| {
+                        *worker_stage
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = phase.into();
+                    })
+                })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.host_installing = None;
+                    view.host_install_stage = None;
+                    if let Err(error) = &result {
+                        view.host_install_error = Some((id, error.clone()));
+                    }
+                    cx.notify();
+                });
+                match result {
+                    Ok(()) => {
+                        window.push_notification(
+                            Notification::success("Docker 已安装；正在重新测试连接"),
+                            app,
+                        );
+                        let _ = view.update(app, |view, cx| view.test_host(id, window, cx));
+                    }
+                    Err(error) => window.push_notification(Notification::error(error), app),
                 }
             });
         })
@@ -948,6 +1128,10 @@ impl AppView {
     }
 
     fn confirm_host_delete(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.host_installing == Some(id) {
+            window.push_notification(Notification::warning("Docker 安装期间不可删除主机。"), cx);
+            return;
+        }
         let Some(host) = self.hosts.iter().find(|host| host.id == id) else {
             return;
         };
@@ -1035,6 +1219,11 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.host_installing == Some(id) {
+            submitting.set(false);
+            window.push_notification(Notification::warning("Docker 安装期间不可删除主机。"), cx);
+            return;
+        }
         cx.spawn_in(window, async move |view, cx| {
             let (result, fresh, projects) = cx
                 .background_executor()
@@ -1496,6 +1685,9 @@ impl AppView {
                 ("待复核".into(), self.palette().muted)
             }
             Some(HostTestState::NeedsTrust) => ("待确认指纹".into(), self.palette().warning),
+            Some(HostTestState::DockerMissing { .. }) => {
+                ("Docker 未安装".into(), self.palette().warning)
+            }
             Some(HostTestState::Failed(_)) => ("连接失败".into(), self.palette().destructive),
             None => ("未连接".into(), self.palette().muted),
         }
@@ -1548,6 +1740,9 @@ impl AppView {
                 Some(HostTestState::Checking) => "正在测试 SSH 与 Docker…".into(),
                 Some(HostTestState::Failed(latest)) => latest.clone(),
                 Some(HostTestState::NeedsTrust) => "请先独立核对并确认 SSH 主机指纹。".into(),
+                Some(HostTestState::DockerMissing { .. }) => {
+                    "SSH 已连接，但 Docker 未安装；请到基本信息查看安装引导。".into()
+                }
                 _ => error.clone(),
             };
             return self
@@ -1748,6 +1943,18 @@ impl AppView {
                     .clone()
                     .unwrap_or_else(|| "不支持的架构".into()),
             ),
+            Some(HostTestState::DockerMissing {
+                os_id,
+                os_version,
+                system_kernel,
+                architecture,
+            }) => (
+                format!("{os_id} {os_version} / {system_kernel}"),
+                "未安装".into(),
+                architecture
+                    .clone()
+                    .unwrap_or_else(|| "不支持的架构".into()),
+            ),
             _ => (
                 "待连接测试".into(),
                 "待连接测试".into(),
@@ -1774,8 +1981,21 @@ impl AppView {
             }
             Some(HostTestState::Failed(error)) => error.clone(),
             Some(HostTestState::NeedsTrust) => "等待独立核对 SSH 主机指纹。".into(),
+            Some(HostTestState::DockerMissing { .. }) => {
+                "SSH 已连接，Docker 未安装；发布和容器管理暂不可用。".into()
+            }
             _ => "尚未完成 SSH 与 Docker 检查。".into(),
         };
+        let docker_missing = matches!(
+            self.host_tests.get(&id),
+            Some(HostTestState::DockerMissing { .. })
+        );
+        let install_supported = host.username == "root"
+            && matches!(
+                self.host_tests.get(&id),
+                Some(HostTestState::DockerMissing { os_id, os_version, architecture: Some(platform), .. })
+                    if os_id == "debian" && os_version == "13" && platform == "linux/amd64"
+            );
         div()
             .flex()
             .flex_col()
@@ -1881,6 +2101,37 @@ impl AppView {
                                     .child(self.host_info_field("架构", architecture))
                                     .child(self.host_info_field("Agent", "无".into())),
                             )
+                            .when(docker_missing, |el| {
+                                el.child(
+                                    div()
+                                        .border_1()
+                                        .border_color(self.palette().warning)
+                                        .rounded_lg()
+                                        .p_4()
+                                        .flex()
+                                        .flex_col()
+                                        .items_start()
+                                        .gap_3()
+                                        .child(div().text_color(self.palette().warning).child("SSH 已连接 · Docker 未安装"))
+                                        .child(if install_supported {
+                                            "国内推荐腾讯云 Docker CE apt 镜像；安装前需确认仓库签名，完成后自动重新测试。"
+                                        } else {
+                                            "一键安装目前仅支持 Debian 13 / amd64 且以 root 登录；请按 Docker 官方文档手动安装 Engine 与 Compose。"
+                                        })
+                                        .when_some(self.host_install_error.as_ref().filter(|(failed_id, _)| *failed_id == id), |el, (_, error)| {
+                                            el.child(div().text_color(self.palette().destructive).child(error.clone()))
+                                        })
+                                        .when(install_supported, |el| {
+                                            el.child(Button::new("docker-install-open")
+                                                .label(if self.host_installing == Some(id) { "正在安装 Docker…" } else { "一键安装 Docker" })
+                                                .disabled(self.host_installing.is_some())
+                                                .on_click(cx.listener(move |view, _, window, cx| view.confirm_docker_install(id, window, cx))))
+                                        })
+                                        .when(self.host_installing == Some(id), |el| {
+                                            el.child(self.host_install_stage.clone().unwrap_or_else(|| "安装中…".into()))
+                                        }),
+                                )
+                            })
                             .child(div().text_color(color).child(format!(
                                 "连接状态：{status} · 主机指纹{} · {status_detail}",
                                 if host.trusted_fingerprint.is_some() {
