@@ -38,6 +38,8 @@
 
 已另用应用内 russh 的隔离实机测试验证可信指纹、密码认证、Docker/Compose 与架构探测、空容器列表和资源采样；应用内 SFTP 向随机私有 `/tmp/devingpanel.*` 目录传输 8192 字节、核对远端权限/大小/SHA-256 和进度，完成后删除临时目录与本地测试文件。该测试没有调用远端 `docker load` 适配器，也没有部署业务容器。
 
+用户提供 Docker Hub 镜像源名单后，从 VPS 逐个检查 `/v2/`：`docker.1panel.live` 返回 200，`docker.m.daocloud.io` 与阿里云地址返回可继续鉴权的 401，南京大学地址返回 403，网易/中科大地址 DNS 失败，`dockerproxy.com` 与 `registry.docker-cn.com` 超时。1Panel 与 DaoCloud 均实际拉取了相同 digest 的小型 BusyBox 镜像，随后仅将这两个已验证地址写入此前不存在的 VPS `/etc/docker/daemon.json`。配置经 `dockerd --validate` 通过，重启后 Docker/containerd 正常、镜像源出现在 `docker info`，默认 `docker pull busybox:latest` 成功；测试镜像均已清理，容器数仍为 0。此为这台 VPS 在测试时的连通性，不保证公共镜像源持续可用或内容可信；生产 Compose 依赖建议使用受控 Registry 并固定镜像 digest。客户端的一键安装流程仍不自动设置公共镜像加速器。
+
 ## 本地运行
 
 先安装 Rust 1.92+ MSVC 工具链、Visual Studio C++ Build Tools（含 Windows SDK）及 CMake。其他平台的系统依赖见 [GPUI Kit 安装说明](https://gpui-kit.com/docs/installation)。
