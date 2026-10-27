@@ -7,6 +7,8 @@ use crate::host_store::{self, Host};
 use crate::preferences;
 use crate::project_store::{self, Project};
 use crate::release;
+use crate::release_materials;
+use crate::release_store;
 use crate::ssh::{self, TestResult};
 use gpui_kit::InteractiveElement;
 use gpui_kit::component::Icon;
@@ -376,6 +378,13 @@ impl ThemeChoice {
     }
 }
 
+struct MaterialCheck {
+    compose_files: usize,
+    has_env: bool,
+    archives: usize,
+    planned_archives: usize,
+}
+
 pub(crate) struct AppView {
     page: Page,
     menu_open: bool,
@@ -405,6 +414,22 @@ pub(crate) struct AppView {
     deploy_target_loading: bool,
     deploy_target_generation: u64,
     deploy_target_cancel: Option<Arc<AtomicBool>>,
+    release_tasks: Vec<release_store::TaskSnapshot>,
+    release_tasks_loading: bool,
+    release_tasks_error: Option<String>,
+    release_project_tasks: HashMap<i64, Vec<release_store::TaskSnapshot>>,
+    release_project_loading: HashSet<i64>,
+    release_project_errors: HashMap<i64, String>,
+    release_observations: HashMap<String, Result<Vec<ssh::ObservedContainer>, String>>,
+    release_image_checks: HashMap<String, Result<Vec<(String, bool)>, String>>,
+    release_image_checking: HashSet<String>,
+    previous_version_checks: HashMap<String, Result<release::PreviousVersionCheck, String>>,
+    previous_version_checking: HashSet<String>,
+    release_checking: HashSet<String>,
+    release_resolving: HashSet<String>,
+    release_material_checks: HashMap<String, Result<MaterialCheck, String>>,
+    release_material_checking: HashSet<String>,
+    release_recovery_busy: bool,
     container_tab: ContainerTab,
     container_host_id: Option<i64>,
     container_inventory: Option<ssh::Inventory>,
@@ -586,6 +611,21 @@ impl AppView {
             });
         })
         .detach();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { release_materials::recover_prepared() })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                match result {
+                    Ok(count) if count > 0 => view.refresh_release_tasks(None, cx),
+                    Err(error) => view.release_tasks_error = Some(error),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         Self {
             page: Page::Dashboard,
             menu_open: false,
@@ -615,6 +655,22 @@ impl AppView {
             deploy_target_loading: false,
             deploy_target_generation: 0,
             deploy_target_cancel: None,
+            release_tasks: Vec::new(),
+            release_tasks_loading: false,
+            release_tasks_error: None,
+            release_project_tasks: HashMap::new(),
+            release_project_loading: HashSet::new(),
+            release_project_errors: HashMap::new(),
+            release_observations: HashMap::new(),
+            release_image_checks: HashMap::new(),
+            release_image_checking: HashSet::new(),
+            previous_version_checks: HashMap::new(),
+            previous_version_checking: HashSet::new(),
+            release_checking: HashSet::new(),
+            release_resolving: HashSet::new(),
+            release_material_checks: HashMap::new(),
+            release_material_checking: HashSet::new(),
+            release_recovery_busy: false,
             container_tab: ContainerTab::Containers,
             container_host_id: None,
             container_inventory: None,

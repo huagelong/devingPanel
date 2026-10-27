@@ -1361,7 +1361,7 @@ mod tests {
             [("A".into(), "1".into()), ("B".into(), "2".into())]
         );
         assert_eq!(list_in(&reopened).unwrap()[0].service, "web");
-        reopened.pragma_update(None, "user_version", 13).unwrap();
+        reopened.pragma_update(None, "user_version", 21).unwrap();
         assert!(initialize(&reopened).is_err());
         drop(reopened);
         set_compose_files_in(
@@ -1424,7 +1424,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 20);
         let project = &list_in(&conn).unwrap()[0];
         assert_eq!(project.image, "repo/app");
         assert_eq!(project.platform, "linux/arm64");

@@ -5,7 +5,8 @@ use crate::host_store;
 use crate::project_config::{self, BuildSpec};
 use crate::project_store::{self, Project};
 use crate::release;
-use crate::release_store::{self, Intent, Outcome, Phase};
+use crate::release_materials;
+use crate::release_store::{self, HealthResult, Intent, Outcome, Phase};
 use crate::ssh::{self, DeploymentState, StackService};
 use std::path::Path;
 use std::sync::{
@@ -88,11 +89,17 @@ pub fn run(
         let variable = project_config::image_variable(&spec.service)?;
         env_file.extend_from_slice(format!("{variable}=\"{}\"\n", image.reference).as_bytes());
     }
+    let materials = release_materials::prepare(&files, &env_file)?;
     if cancel.load(Ordering::Relaxed)
         || release::source_digest(&project_store::effective(project_id)?)? != digest
     {
         return Err("项目配置在预检期间变化或预检已取消。".into());
     }
+    let (docker_endpoint, docker_daemon_id) = ssh::docker_identity_for_host(host.clone())?;
+    let docker_identity = ssh::ReleaseDockerIdentity {
+        endpoint: &docker_endpoint,
+        daemon_id: &docker_daemon_id,
+    };
     let id = uuid::Uuid::new_v4().to_string();
     let first = &planned[0];
     release_store::create(&Intent {
@@ -100,6 +107,8 @@ pub fn run(
         project_id,
         project_name: project.name.clone(),
         host: host.clone(),
+        docker_endpoint: docker_endpoint.clone(),
+        docker_daemon_id: docker_daemon_id.clone(),
         image_reference: first.reference.clone(),
         platform: first.platform.clone(),
         images: manifest
@@ -116,6 +125,15 @@ pub fn run(
             .collect(),
         config_sha256: digest.clone(),
     })?;
+    if let Err(error) = release_materials::save(&id, materials) {
+        let outcome = if error.contains("部分凭据可能残留") {
+            Outcome::Unknown
+        } else {
+            Outcome::Failed
+        };
+        let _ = release_store::settle(&id, Phase::Prepared, outcome, "本机版本材料保存失败");
+        return Err(error);
+    }
     release_store::advance(&id, Phase::Prepared, Phase::Building)?;
     let mut built = Vec::new();
     for (spec, image) in manifest.builds.iter().zip(&planned) {
@@ -152,9 +170,16 @@ pub fn run(
     let mut uploaded = Vec::new();
     for (spec, image) in manifest.builds.iter().zip(&built) {
         on_event(&format!("传输镜像：{}", spec.service));
-        match release::transfer_built_image(host.clone(), image, cancel.clone(), |sent, total| {
-            on_event(&format!("镜像传输 {sent}/{total} 字节"));
-        }) {
+        match release::transfer_built_image(
+            &id,
+            &spec.service,
+            host.clone(),
+            image,
+            cancel.clone(),
+            |sent, total| {
+                on_event(&format!("镜像传输 {sent}/{total} 字节"));
+            },
+        ) {
             Ok(value) => uploaded.push(value),
             Err(error) => {
                 let cleanup = cleanup_known_archives(&uploaded, None, |archive| {
@@ -183,8 +208,26 @@ pub fn run(
         .enumerate()
     {
         on_event(&format!("远端加载镜像：{}", spec.service));
+        if let Err(error) = release_store::record_image_ids(&id, &spec.service, &archive.image_ids)
+        {
+            let cleanup = cleanup_known_archives(&uploaded, None, |archive| {
+                ssh::cleanup_uploaded_archive(host.clone(), archive)
+            });
+            let _ = release_store::settle(
+                &id,
+                Phase::Loading,
+                Outcome::Unknown,
+                "镜像归档 ID 保存结果待核实",
+            );
+            return Err(if cleanup.is_ok() {
+                error
+            } else {
+                format!("{error}；远端临时归档清理待核实")
+            });
+        }
         if let Err(error) = ssh::load_uploaded_archive(
             host.clone(),
+            docker_identity,
             archive,
             &image.reference,
             &image.platform,
@@ -246,6 +289,7 @@ pub fn run(
     on_event("校验所有 Compose 服务");
     let services = match ssh::validate_staged_stack(
         host.clone(),
+        docker_identity,
         &staged,
         project_id,
         &expected,
@@ -262,14 +306,29 @@ pub fn run(
             return Err(error);
         }
     };
+    if let Err(error) = release_store::record_services(&id, &services) {
+        let _ = release_store::settle(
+            &id,
+            Phase::Validating,
+            Outcome::Failed,
+            "整栈服务计划未保存",
+        );
+        return Err(error);
+    }
     release_store::advance(&id, Phase::Validating, Phase::Validated)?;
     release_store::advance(&id, Phase::Validated, Phase::Deploying)?;
     on_event("启动全部 Compose 服务");
-    if let Err(error) =
-        ssh::start_staged_stack(host.clone(), &staged, project_id, &expected, cancel.clone())
-    {
+    if let Err(error) = ssh::start_staged_stack(
+        host.clone(),
+        docker_identity,
+        &staged,
+        project_id,
+        &expected,
+        cancel.clone(),
+    ) {
         let _ = ssh::check_staged_stack(
             host,
+            docker_identity,
             &staged,
             project_id,
             &expected,
@@ -286,21 +345,30 @@ pub fn run(
     }
     release_store::advance(&id, Phase::Deploying, Phase::Checking)?;
     on_event("核对全部服务健康状态");
-    let health =
-        match ssh::check_staged_stack(host, &staged, project_id, &expected, &services, cancel) {
-            Ok(value) => value,
-            Err(error) => {
-                let _ =
-                    release_store::settle(&id, Phase::Checking, Outcome::Unknown, "整栈状态待核实");
-                return Err(error);
-            }
-        };
-    release_store::advance(&id, Phase::Checking, Phase::Checked)?;
-    let detail = match health {
-        DeploymentState::Healthy => "全部服务健康；历史恢复入口尚未实现",
-        _ => "至少一个服务未健康，需人工核实",
+    let health = match ssh::check_staged_stack(
+        host,
+        docker_identity,
+        &staged,
+        project_id,
+        &expected,
+        &services,
+        cancel,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = release_store::settle(&id, Phase::Checking, Outcome::Unknown, "整栈状态待核实");
+            return Err(error);
+        }
     };
-    release_store::settle(&id, Phase::Checked, Outcome::Blocked, detail)?;
+    let (result, detail) = match health {
+        DeploymentState::Healthy => (HealthResult::Healthy, "全部服务健康；回滚执行尚未实现"),
+        DeploymentState::RunningUnverified => (
+            HealthResult::RunningUnverified,
+            "至少一个服务缺少健康检查，需人工核实",
+        ),
+        DeploymentState::Failed => (HealthResult::Failed, "至少一个服务未健康，需人工核实"),
+    };
+    release_store::settle_checked(&id, result, detail)?;
     Ok(id)
 }
 

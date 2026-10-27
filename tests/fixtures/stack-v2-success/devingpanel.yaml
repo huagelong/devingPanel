@@ -1,0 +1,20 @@
+version: 2
+name: stack-v2-success
+tag: "{timestamp}"
+builds:
+  - service: web
+    dockerfile: Dockerfile.web
+    image: stack-v2-success-web
+    platform: linux/amd64
+    args: {}
+  - service: worker
+    dockerfile: Dockerfile.worker
+    image: stack-v2-success-worker
+    platform: linux/amd64
+    args: {}
+deploy:
+  compose:
+    files: [compose.yaml]
+  targets:
+    - group: test
+      host: vps-smoke

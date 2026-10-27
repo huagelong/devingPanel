@@ -1,0 +1,4 @@
+FROM redis:7-alpine
+COPY probe-worker.txt /probe-worker.txt
+HEALTHCHECK --interval=2s --timeout=2s --retries=3 CMD test -s /probe-worker.txt
+CMD ["sh", "-c", "sleep 3600"]

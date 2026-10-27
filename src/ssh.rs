@@ -1,4 +1,5 @@
 use crate::host_store::{self, ConnectionMaterial, Host};
+use crate::release_store::TaskSnapshot;
 use base64::Engine as _;
 use russh::client;
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
@@ -239,6 +240,19 @@ pub struct StackService {
     pub service: String,
     pub reference: String,
     pub image_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedContainer {
+    pub service: String,
+    pub status: String,
+    pub health: Option<String>,
+    pub image_id: String,
+    pub config_image: String,
+}
+
+pub struct ReleaseObservation {
+    pub containers: Vec<ObservedContainer>,
 }
 
 pub(crate) fn validated_release_file(path: &str) -> Result<(), String> {
@@ -769,6 +783,65 @@ async fn local_docker_endpoint(handle: &client::Handle<HostKeyChecker>) -> Resul
     let endpoint: String =
         serde_json::from_str(endpoint.trim()).map_err(|_| "远端 Docker context 端点格式无效。")?;
     validate_local_endpoint(&endpoint)
+}
+
+#[derive(Clone, Copy)]
+pub struct ReleaseDockerIdentity<'a> {
+    pub endpoint: &'a str,
+    pub daemon_id: &'a str,
+}
+
+async fn checked_release_endpoint(
+    handle: &client::Handle<HostKeyChecker>,
+    expected: ReleaseDockerIdentity<'_>,
+) -> Result<String, String> {
+    let actual = local_docker_endpoint(handle).await?;
+    if actual != expected.endpoint {
+        return Err("远端 Docker 端点与发布任务快照不同，操作已阻断。".into());
+    }
+    if docker_daemon_id(handle, &actual).await? != expected.daemon_id {
+        return Err("远端 Docker daemon 身份与发布任务快照不同，操作已阻断。".into());
+    }
+    Ok(actual)
+}
+
+fn validated_daemon_id(raw: &str) -> Result<String, String> {
+    let id = raw.trim();
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_'))
+    {
+        return Err("远端 Docker daemon ID 无效。".into());
+    }
+    Ok(id.to_owned())
+}
+
+async fn docker_daemon_id(
+    handle: &client::Handle<HostKeyChecker>,
+    endpoint: &str,
+) -> Result<String, String> {
+    validated_daemon_id(
+        &archive_command(handle, &docker_command(endpoint, "info --format '{{.ID}}'")).await?,
+    )
+}
+
+pub fn docker_identity_for_host(expected_host: Host) -> Result<(String, String), String> {
+    let material = material_for(&expected_host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化 Docker 端点预检环境。".to_owned())?
+        .block_on(async {
+            let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+                .await
+                .map_err(|_| "Docker 端点预检连接超时。")??;
+            let endpoint = local_docker_endpoint(&handle).await?;
+            let daemon_id = docker_daemon_id(&handle, &endpoint).await?;
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+            Ok((endpoint, daemon_id))
+        })
 }
 
 fn safe_field(row: &Value, key: &str) -> Result<String, String> {
@@ -2356,6 +2429,7 @@ fn valid_compose_service(service: &str) -> bool {
 
 async fn validate_staged_compose_on(
     material: ConnectionMaterial,
+    identity: ReleaseDockerIdentity<'_>,
     staged: &StagedDeployment,
     project_id: i64,
     service: &str,
@@ -2368,7 +2442,7 @@ async fn validate_staged_compose_on(
     let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
         .await
         .map_err(|_| "Compose 校验连接超时。")??;
-    let endpoint = local_docker_endpoint(&handle).await?;
+    let endpoint = checked_release_endpoint(&handle, identity).await?;
     let command = format!(
         "{} config --format json",
         compose_config_command(&endpoint, staged, project_id, reference)?
@@ -2387,6 +2461,7 @@ async fn validate_staged_compose_on(
 #[allow(dead_code)] // The release coordinator stops after validation until deployment is wired up.
 pub fn validate_staged_compose(
     expected_host: Host,
+    identity: ReleaseDockerIdentity<'_>,
     staged: &StagedDeployment,
     project_id: i64,
     service: &str,
@@ -2399,7 +2474,7 @@ pub fn validate_staged_compose(
         .build()
         .map_err(|_| "无法初始化 Compose 校验环境。".to_owned())?
         .block_on(validate_staged_compose_on(
-            material, staged, project_id, service, reference, &cancel,
+            material, identity, staged, project_id, service, reference, &cancel,
         ))
 }
 
@@ -2487,6 +2562,7 @@ fn verified_stack_config(text: &str, built: &[StackService]) -> Result<Vec<Stack
 
 async fn validate_stack_on(
     material: ConnectionMaterial,
+    identity: ReleaseDockerIdentity<'_>,
     staged: &StagedDeployment,
     project_id: i64,
     built: &[StackService],
@@ -2495,7 +2571,7 @@ async fn validate_stack_on(
     let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
         .await
         .map_err(|_| "Compose 校验连接超时。")??;
-    let endpoint = local_docker_endpoint(&handle).await?;
+    let endpoint = checked_release_endpoint(&handle, identity).await?;
     let command = format!(
         "{} config --format json",
         stack_command(&endpoint, staged, project_id, built)?
@@ -2510,6 +2586,7 @@ async fn validate_stack_on(
 
 pub fn validate_staged_stack(
     host: Host,
+    identity: ReleaseDockerIdentity<'_>,
     staged: &StagedDeployment,
     project_id: i64,
     built: &[StackService],
@@ -2521,7 +2598,7 @@ pub fn validate_staged_stack(
         .build()
         .map_err(|_| "无法初始化整栈校验环境。".to_owned())?
         .block_on(validate_stack_on(
-            material, staged, project_id, built, &cancel,
+            material, identity, staged, project_id, built, &cancel,
         ))
 }
 
@@ -2551,7 +2628,7 @@ fn deployment_inspect_command(endpoint: &str, ids: &[String]) -> Result<String, 
     {
         return Err("目标服务容器标识无效。".into());
     }
-    let template = r#"{"Id":{{json .Id}},"Image":{{json .Image}},"ConfigImage":{{json .Config.Image}},"Status":{{json .State.Status}},"Health":{{with index .State "Health"}}{{json .Status}}{{else}}null{{end}}}"#;
+    let template = r#"{"Id":{{json .Id}},"Service":{{json (index .Config.Labels "com.docker.compose.service")}},"Image":{{json .Image}},"ConfigImage":{{json .Config.Image}},"Status":{{json .State.Status}},"Health":{{with index .State "Health"}}{{json .Status}}{{else}}null{{end}}}"#;
     Ok(docker_command(
         endpoint,
         &format!(
@@ -2560,6 +2637,322 @@ fn deployment_inspect_command(endpoint: &str, ids: &[String]) -> Result<String, 
             ids.join(" ")
         ),
     ))
+}
+
+fn parse_release_observation(ids: &[String], output: &str) -> Result<ReleaseObservation, String> {
+    let mut seen = HashSet::new();
+    let mut containers = Vec::new();
+    for line in output.lines() {
+        let row: Value = serde_json::from_str(line).map_err(|_| "远端容器状态无法解析。")?;
+        let id = row
+            .get("Id")
+            .and_then(Value::as_str)
+            .ok_or("容器 ID 缺失。")?;
+        if !ids.iter().any(|expected| expected == id) || !seen.insert(id.to_owned()) {
+            return Err("远端容器检查结果不完整或重复。".into());
+        }
+        let service = row
+            .get("Service")
+            .and_then(Value::as_str)
+            .ok_or("Compose 服务标签缺失。")?;
+        let status = row
+            .get("Status")
+            .and_then(Value::as_str)
+            .ok_or("容器运行状态缺失。")?;
+        let health = row.get("Health").and_then(Value::as_str);
+        let image_id = row
+            .get("Image")
+            .and_then(Value::as_str)
+            .ok_or("容器镜像 ID 缺失。")?;
+        let config_image = row
+            .get("ConfigImage")
+            .and_then(Value::as_str)
+            .ok_or("容器镜像引用缺失。")?;
+        if !valid_compose_service(service)
+            || !matches!(
+                status,
+                "running" | "exited" | "created" | "restarting" | "paused" | "dead"
+            )
+            || health.is_some_and(|value| !matches!(value, "healthy" | "unhealthy" | "starting"))
+            || image_id.len() != 71
+            || !image_id.starts_with("sha256:")
+            || !image_id[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            || config_image.is_empty()
+            || config_image.len() > 512
+            || config_image.chars().any(char::is_control)
+        {
+            return Err("Compose 服务状态无法核实。".into());
+        }
+        containers.push(ObservedContainer {
+            service: service.into(),
+            status: status.into(),
+            health: health.map(str::to_owned),
+            image_id: image_id.to_owned(),
+            config_image: config_image.to_owned(),
+        });
+    }
+    if seen.len() != ids.len() {
+        return Err("远端容器检查结果不完整或重复。".into());
+    }
+    containers.sort_by(|left, right| left.service.cmp(&right.service));
+    Ok(ReleaseObservation { containers })
+}
+
+async fn observe_project_on(
+    material: ConnectionMaterial,
+    project_id: i64,
+    expected_endpoint: Option<&str>,
+    expected_daemon_id: Option<&str>,
+) -> Result<ReleaseObservation, String> {
+    if project_id <= 0 {
+        return Err("项目 ID 无效。".into());
+    }
+    let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+        .await
+        .map_err(|_| "只读核实连接超时。")??;
+    let endpoint = match (expected_endpoint, expected_daemon_id) {
+        (Some(endpoint), Some(daemon_id)) => {
+            checked_release_endpoint(
+                &handle,
+                ReleaseDockerIdentity {
+                    endpoint,
+                    daemon_id,
+                },
+            )
+            .await?
+        }
+        (None, None) => local_docker_endpoint(&handle).await?,
+        _ => return Err("发布任务 Docker 身份快照不完整，核实已阻断。".into()),
+    };
+    let list = docker_command(
+        &endpoint,
+        &format!(
+            "ps -a --no-trunc --filter label=com.docker.compose.project=dp{project_id} --format '{{{{.ID}}}}'"
+        ),
+    );
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        command_limited(&handle, &list, 8192),
+    )
+    .await
+    .map_err(|_| "远端容器列表核实超时。")??;
+    let ids: Vec<String> = output.lines().map(str::to_owned).collect();
+    if ids.len() > 100
+        || ids
+            .iter()
+            .any(|id| id.len() != 64 || validate_container_id(id).is_err())
+    {
+        return Err("远端项目容器列表无效。".into());
+    }
+    if ids.is_empty() {
+        return Ok(ReleaseObservation {
+            containers: Vec::new(),
+        });
+    }
+    let inspect = deployment_inspect_command(&endpoint, &ids)?;
+    let rows = tokio::time::timeout(
+        Duration::from_secs(15),
+        command_limited(&handle, &inspect, 64 * 1024),
+    )
+    .await
+    .map_err(|_| "远端容器元数据核实超时。")??;
+    parse_release_observation(&ids, &rows)
+}
+
+pub fn observe_release_project(task: &TaskSnapshot) -> Result<ReleaseObservation, String> {
+    let material = material_for(&task.host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化只读核实环境。".to_owned())?
+        .block_on(observe_project_on(
+            material,
+            task.project_id,
+            task.docker_endpoint.as_deref(),
+            task.docker_daemon_id.as_deref(),
+        ))
+}
+
+pub fn verify_staged_materials(
+    task: &TaskSnapshot,
+    snapshot: &crate::release_materials::RestoredMaterials,
+) -> Result<(), String> {
+    let endpoint = task
+        .docker_endpoint
+        .as_deref()
+        .ok_or("任务缺少 Docker endpoint 身份。")?;
+    let daemon_id = task
+        .docker_daemon_id
+        .as_deref()
+        .ok_or("任务缺少 Docker daemon 身份。")?;
+    if snapshot.compose_files.is_empty() || snapshot.compose_files.len() > 16 {
+        return Err("部署文件快照无效。".into());
+    }
+    let material = material_for(&task.host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化部署文件核实环境。")?
+        .block_on(async {
+            let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+                .await
+                .map_err(|_| "部署文件核实连接超时。")??;
+            checked_release_endpoint(
+                &handle,
+                ReleaseDockerIdentity {
+                    endpoint,
+                    daemon_id,
+                },
+            )
+            .await?;
+            let home = archive_command(&handle, "sh -c 'printf %s \"$HOME\"'").await?;
+            let directory = validated_release_directory(&home, task.project_id, &task.id)?;
+            for file in &snapshot.compose_files {
+                validated_release_file(&file.path)?;
+                let path = shell_quote(&format!("{directory}/{}", file.path))?;
+                let output = archive_command_with_timeout(
+                    &handle,
+                    &format!("sha256sum -- {path}"),
+                    Duration::from_secs(30),
+                )
+                .await?;
+                if verified_sha256(&output)? != format!("{:x}", Sha256::digest(&file.bytes)) {
+                    return Err("远端 Compose 文件已变化或丢失。".into());
+                }
+            }
+            let env_path = shell_quote(&format!("{directory}/.env"))?;
+            let output = archive_command_with_timeout(
+                &handle,
+                &format!("sha256sum -- {env_path}"),
+                Duration::from_secs(30),
+            )
+            .await?;
+            if verified_sha256(&output)? != format!("{:x}", Sha256::digest(&snapshot.env_file)) {
+                return Err("远端环境快照已变化或丢失。".into());
+            }
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+            Ok(())
+        })
+}
+
+fn historical_image_matches(
+    text: &str,
+    image: &crate::release_store::HistoricalImage,
+) -> Result<bool, String> {
+    let row: Value = serde_json::from_str(text).map_err(|_| "远端历史镜像元数据无效。")?;
+    let id = row
+        .get("Id")
+        .and_then(Value::as_str)
+        .ok_or("远端镜像 ID 缺失。")?;
+    let os = row
+        .get("Os")
+        .and_then(Value::as_str)
+        .ok_or("远端镜像系统信息缺失。")?;
+    let arch = row
+        .get("Architecture")
+        .and_then(Value::as_str)
+        .ok_or("远端镜像架构信息缺失。")?;
+    Ok(image.image_ids.iter().any(|expected| expected == id)
+        && format!("{os}/{arch}") == image.platform)
+}
+
+async fn observe_historical_images_on(
+    material: ConnectionMaterial,
+    identity: ReleaseDockerIdentity<'_>,
+    images: &[crate::release_store::HistoricalImage],
+) -> Result<Vec<(String, bool)>, String> {
+    if images.is_empty() || images.len() > 16 {
+        return Err("历史镜像计划无效。".into());
+    }
+    for image in images {
+        let (name, tag) = image
+            .reference
+            .rsplit_once(':')
+            .ok_or("历史镜像引用无效。")?;
+        if !crate::project_store::valid_image_name(name)
+            || tag.is_empty()
+            || tag.len() > 128
+            || !tag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+            || !matches!(image.platform.as_str(), "linux/amd64" | "linux/arm64")
+            || image.service.is_empty()
+            || image.service.len() > 128
+            || image.service.chars().any(char::is_control)
+        {
+            return Err("历史镜像计划无效。".into());
+        }
+        validate_deployment_image_ids(&image.image_ids)?;
+    }
+    let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+        .await
+        .map_err(|_| "历史镜像核实连接超时。")??;
+    let endpoint = checked_release_endpoint(&handle, identity).await?;
+    let mut results = Vec::with_capacity(images.len());
+    for image in images {
+        let reference = shell_quote(&image.reference)?;
+        let list = docker_command(
+            &endpoint,
+            &format!(
+                "image ls --filter reference={reference} --format '{{{{.Repository}}}}:{{{{.Tag}}}}'"
+            ),
+        );
+        let output = tokio::time::timeout(
+            Duration::from_secs(15),
+            command_limited(&handle, &list, 8192),
+        )
+        .await
+        .map_err(|_| "历史镜像列表核实超时。")??;
+        if !output.lines().any(|line| line == image.reference) {
+            results.push((image.service.clone(), false));
+            continue;
+        }
+        let format = concat!(
+            "image inspect --format '",
+            r#"{"Id":{{json .Id}},"Os":{{json .Os}},"Architecture":{{json .Architecture}}}"#,
+            "' "
+        );
+        let inspect = docker_command(&endpoint, &format!("{format}{reference}"));
+        let output = tokio::time::timeout(
+            Duration::from_secs(15),
+            command_limited(&handle, &inspect, 8192),
+        )
+        .await
+        .map_err(|_| "历史镜像元数据核实超时。")??;
+        results.push((
+            image.service.clone(),
+            historical_image_matches(&output, image)?,
+        ));
+    }
+    let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+    Ok(results)
+}
+
+pub fn observe_historical_images(
+    task: &TaskSnapshot,
+    images: &[crate::release_store::HistoricalImage],
+) -> Result<Vec<(String, bool)>, String> {
+    let endpoint = task
+        .docker_endpoint
+        .as_deref()
+        .ok_or("旧任务缺少 Docker endpoint 快照。")?;
+    let daemon_id = task
+        .docker_daemon_id
+        .as_deref()
+        .ok_or("旧任务缺少 Docker daemon 身份快照。")?;
+    let material = material_for(&task.host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化历史镜像核实环境。")?
+        .block_on(observe_historical_images_on(
+            material,
+            ReleaseDockerIdentity {
+                endpoint,
+                daemon_id,
+            },
+            images,
+        ))
 }
 
 fn inspect_deployment_state(
@@ -2657,34 +3050,33 @@ async fn inspect_target_containers(
 
 async fn start_staged_compose_on(
     material: ConnectionMaterial,
+    identity: ReleaseDockerIdentity<'_>,
     staged: &StagedDeployment,
     project_id: i64,
-    service: &str,
-    reference: &str,
-    image_ids: &[String],
+    target: &StackService,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    if !valid_compose_service(service) {
+    if !valid_compose_service(&target.service) {
         return Err("部署服务无效。".into());
     }
-    validate_deployment_image_ids(image_ids)?;
+    validate_deployment_image_ids(&target.image_ids)?;
     if cancel.load(Ordering::Relaxed) {
         return Err("部署已取消，尚未启动容器。".into());
     }
     let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
         .await
         .map_err(|_| "部署连接超时。")??;
-    let endpoint = local_docker_endpoint(&handle).await?;
-    let prefix = compose_config_command(&endpoint, staged, project_id, reference)?;
+    let endpoint = checked_release_endpoint(&handle, identity).await?;
+    let prefix = compose_config_command(&endpoint, staged, project_id, &target.reference)?;
     let inspect = docker_command(
         &endpoint,
         &format!(
             "image inspect --format '{{{{.Id}}}}' {}",
-            shell_quote(reference)?
+            shell_quote(&target.reference)?
         ),
     );
     let remote_id = archive_command(&handle, &inspect).await?;
-    if !image_ids.iter().any(|id| id == remote_id.trim()) {
+    if !target.image_ids.iter().any(|id| id == remote_id.trim()) {
         return Err("远端镜像 tag 已变化，禁止启动。".into());
     }
     if cancel.load(Ordering::Relaxed) {
@@ -2692,7 +3084,7 @@ async fn start_staged_compose_on(
     }
     let up = format!(
         "{prefix} up -d --no-build --pull never --no-deps {}",
-        shell_quote(service)?
+        shell_quote(&target.service)?
     );
     tokio::select! {
         _ = wait_cancel(cancel) => Err("远端启动已取消，执行结果待核实。".into()),
@@ -2705,24 +3097,29 @@ async fn start_staged_compose_on(
 
 async fn check_staged_compose_on(
     material: ConnectionMaterial,
+    identity: ReleaseDockerIdentity<'_>,
     staged: &StagedDeployment,
     project_id: i64,
-    service: &str,
-    reference: &str,
-    image_ids: &[String],
+    target: &StackService,
     cancel: &AtomicBool,
 ) -> Result<DeploymentState, String> {
-    if !valid_compose_service(service) {
+    if !valid_compose_service(&target.service) {
         return Err("部署服务无效。".into());
     }
     let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
         .await
         .map_err(|_| "状态核实连接超时。")??;
-    let endpoint = local_docker_endpoint(&handle).await?;
+    let endpoint = checked_release_endpoint(&handle, identity).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
         let state = inspect_target_containers(
-            &handle, &endpoint, staged, project_id, service, reference, image_ids,
+            &handle,
+            &endpoint,
+            staged,
+            project_id,
+            &target.service,
+            &target.reference,
+            &target.image_ids,
         )
         .await?;
         if let Some(state) = state {
@@ -2741,11 +3138,10 @@ async fn check_staged_compose_on(
 #[allow(dead_code)] // The GUI release flow remains disabled until history and recovery are wired up.
 pub fn start_staged_compose(
     expected_host: Host,
+    identity: ReleaseDockerIdentity<'_>,
     staged: &StagedDeployment,
     project_id: i64,
-    service: &str,
-    reference: &str,
-    image_ids: &[String],
+    target: &StackService,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let material = material_for(&expected_host)?;
@@ -2754,18 +3150,17 @@ pub fn start_staged_compose(
         .build()
         .map_err(|_| "无法初始化远端部署环境。".to_owned())?
         .block_on(start_staged_compose_on(
-            material, staged, project_id, service, reference, image_ids, &cancel,
+            material, identity, staged, project_id, target, &cancel,
         ))
 }
 
 #[allow(dead_code)] // Explicit read-only check, including after an uncertain start result.
 pub fn check_staged_compose(
     expected_host: Host,
+    identity: ReleaseDockerIdentity<'_>,
     staged: &StagedDeployment,
     project_id: i64,
-    service: &str,
-    reference: &str,
-    image_ids: &[String],
+    target: &StackService,
     cancel: Arc<AtomicBool>,
 ) -> Result<DeploymentState, String> {
     let material = material_for(&expected_host)?;
@@ -2774,12 +3169,13 @@ pub fn check_staged_compose(
         .build()
         .map_err(|_| "无法初始化状态核实环境。".to_owned())?
         .block_on(check_staged_compose_on(
-            material, staged, project_id, service, reference, image_ids, &cancel,
+            material, identity, staged, project_id, target, &cancel,
         ))
 }
 
 async fn start_stack_on(
     material: ConnectionMaterial,
+    identity: ReleaseDockerIdentity<'_>,
     staged: &StagedDeployment,
     project_id: i64,
     built: &[StackService],
@@ -2791,7 +3187,7 @@ async fn start_stack_on(
     let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
         .await
         .map_err(|_| "整栈启动连接超时。")??;
-    let endpoint = local_docker_endpoint(&handle).await?;
+    let endpoint = checked_release_endpoint(&handle, identity).await?;
     for image in built {
         validate_deployment_image_ids(&image.image_ids)?;
         let inspect = docker_command(
@@ -2824,6 +3220,7 @@ async fn start_stack_on(
 
 pub fn start_staged_stack(
     host: Host,
+    identity: ReleaseDockerIdentity<'_>,
     staged: &StagedDeployment,
     project_id: i64,
     built: &[StackService],
@@ -2834,11 +3231,14 @@ pub fn start_staged_stack(
         .enable_all()
         .build()
         .map_err(|_| "无法初始化整栈部署环境。".to_owned())?
-        .block_on(start_stack_on(material, staged, project_id, built, &cancel))
+        .block_on(start_stack_on(
+            material, identity, staged, project_id, built, &cancel,
+        ))
 }
 
 async fn check_stack_on(
     material: ConnectionMaterial,
+    identity: ReleaseDockerIdentity<'_>,
     staged: &StagedDeployment,
     project_id: i64,
     built: &[StackService],
@@ -2851,10 +3251,10 @@ async fn check_stack_on(
     let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
         .await
         .map_err(|_| "整栈核实连接超时。")??;
-    let endpoint = local_docker_endpoint(&handle).await?;
+    let endpoint = checked_release_endpoint(&handle, identity).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
-        let mut pending = false;
+        let mut states = Vec::with_capacity(services.len());
         for service in services {
             let prefix = stack_command(&endpoint, staged, project_id, built)?;
             let list = format!(
@@ -2869,7 +3269,7 @@ async fn check_stack_on(
             .map_err(|_| "整栈容器列表检查超时。")??;
             let ids: Vec<String> = output.lines().map(str::to_owned).collect();
             if ids.is_empty() {
-                pending = true;
+                states.push(None);
                 continue;
             }
             if ids.len() != 1 {
@@ -2882,14 +3282,15 @@ async fn check_stack_on(
             )
             .await
             .map_err(|_| "整栈容器检查超时。")??;
-            match inspect_deployment_state(&rows, &ids, &service.reference, &service.image_ids)? {
-                Some(DeploymentState::Healthy) => {}
-                Some(_) => return Ok(DeploymentState::Failed),
-                None => pending = true,
-            }
+            states.push(inspect_deployment_state(
+                &rows,
+                &ids,
+                &service.reference,
+                &service.image_ids,
+            )?);
         }
-        if !pending {
-            return Ok(DeploymentState::Healthy);
+        if let Some(state) = aggregate_stack_states(&states) {
+            return Ok(state);
         }
         if tokio::time::Instant::now() >= deadline {
             return Ok(DeploymentState::Failed);
@@ -2901,8 +3302,23 @@ async fn check_stack_on(
     }
 }
 
+fn aggregate_stack_states(states: &[Option<DeploymentState>]) -> Option<DeploymentState> {
+    if states.contains(&Some(DeploymentState::Failed)) {
+        return Some(DeploymentState::Failed);
+    }
+    if states.contains(&None) {
+        return None;
+    }
+    if states.contains(&Some(DeploymentState::RunningUnverified)) {
+        Some(DeploymentState::RunningUnverified)
+    } else {
+        Some(DeploymentState::Healthy)
+    }
+}
+
 pub fn check_staged_stack(
     host: Host,
+    identity: ReleaseDockerIdentity<'_>,
     staged: &StagedDeployment,
     project_id: i64,
     built: &[StackService],
@@ -2915,7 +3331,7 @@ pub fn check_staged_stack(
         .build()
         .map_err(|_| "无法初始化整栈核实环境。".to_owned())?
         .block_on(check_stack_on(
-            material, staged, project_id, built, services, &cancel,
+            material, identity, staged, project_id, built, services, &cancel,
         ))
 }
 
@@ -2978,6 +3394,7 @@ fn verified_loaded_image(text: &str, image_ids: &[String], platform: &str) -> Re
 
 async fn load_archive(
     material: ConnectionMaterial,
+    identity: ReleaseDockerIdentity<'_>,
     archive: &UploadedArchive,
     reference: &str,
     platform: &str,
@@ -2987,9 +3404,12 @@ async fn load_archive(
     let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
         .await
         .map_err(|_| "远端镜像加载连接超时。")??;
-    let endpoint = tokio::time::timeout(Duration::from_secs(10), local_docker_endpoint(&handle))
-        .await
-        .map_err(|_| "远端 Docker 端点检查超时。")??;
+    let endpoint = tokio::time::timeout(
+        Duration::from_secs(10),
+        checked_release_endpoint(&handle, identity),
+    )
+    .await
+    .map_err(|_| "远端 Docker 端点检查超时。")??;
     let host_platform = linux_platform(&archive_command(&handle, "uname -m").await?);
     let daemon_platform = archive_command(
         &handle,
@@ -3051,6 +3471,7 @@ async fn load_archive(
 #[allow(dead_code)] // The release coordinator will call this before deploying Compose.
 pub fn load_uploaded_archive(
     expected_host: Host,
+    identity: ReleaseDockerIdentity<'_>,
     archive: &UploadedArchive,
     reference: &str,
     platform: &str,
@@ -3063,7 +3484,7 @@ pub fn load_uploaded_archive(
         .build()
         .map_err(|_| "无法初始化远端镜像加载环境。".to_owned())?
         .block_on(load_archive(
-            material, archive, reference, platform, &cancel,
+            material, identity, archive, reference, platform, &cancel,
         ))
 }
 
@@ -3081,6 +3502,7 @@ mod tests {
         verified_compose_config, verified_sha256,
     };
     use crate::host_store::{ConnectionMaterial, Host};
+    use crate::release_store::HistoricalImage;
     use russh::server::{self, Auth, Msg, Server as _, Session};
     use russh::{Channel, ChannelId};
     use russh_sftp::protocol::{Attrs, FileAttributes, Handle, OpenFlags, Status, StatusCode};
@@ -3235,6 +3657,75 @@ mod tests {
     }
 
     #[test]
+    fn historical_image_check_distinguishes_matching_changed_and_invalid_metadata() {
+        let expected = HistoricalImage {
+            service: "web".into(),
+            reference: "app:v1".into(),
+            platform: "linux/amd64".into(),
+            image_ids: vec![format!("sha256:{}", "a".repeat(64))],
+        };
+        let matching = format!(
+            r#"{{"Id":"sha256:{}","Os":"linux","Architecture":"amd64"}}"#,
+            "a".repeat(64)
+        );
+        assert!(super::historical_image_matches(&matching, &expected).unwrap());
+        assert!(
+            !super::historical_image_matches(&matching.replace("amd64", "arm64"), &expected)
+                .unwrap()
+        );
+        assert!(
+            !super::historical_image_matches(
+                &matching.replace(&"a".repeat(64), &"b".repeat(64)),
+                &expected
+            )
+            .unwrap()
+        );
+        assert!(super::historical_image_matches("not-json", &expected).is_err());
+    }
+
+    #[test]
+    fn stack_health_preserves_running_without_healthcheck() {
+        use super::{DeploymentState as State, aggregate_stack_states};
+        assert_eq!(
+            aggregate_stack_states(&[Some(State::Healthy), Some(State::Healthy)]),
+            Some(State::Healthy)
+        );
+        assert_eq!(
+            aggregate_stack_states(&[Some(State::Healthy), Some(State::RunningUnverified)]),
+            Some(State::RunningUnverified)
+        );
+        assert_eq!(
+            aggregate_stack_states(&[Some(State::RunningUnverified), None]),
+            None
+        );
+        assert_eq!(
+            aggregate_stack_states(&[None, Some(State::Failed)]),
+            Some(State::Failed)
+        );
+    }
+
+    #[test]
+    fn release_observation_requires_exact_compose_container_set() {
+        let id = "a".repeat(64);
+        let image = format!("sha256:{}", "b".repeat(64));
+        let row = format!(
+            r#"{{"Id":"{id}","Service":"web","Image":"{image}","ConfigImage":"app:v1","Status":"running","Health":"healthy"}}"#
+        );
+        let observed = super::parse_release_observation(std::slice::from_ref(&id), &row).unwrap();
+        assert_eq!(observed.containers[0].service, "web");
+        assert_eq!(observed.containers[0].health.as_deref(), Some("healthy"));
+        assert!(super::parse_release_observation(std::slice::from_ref(&id), "").is_err());
+        assert!(
+            super::parse_release_observation(std::slice::from_ref(&id), &format!("{row}\n{row}"))
+                .is_err()
+        );
+        assert!(
+            super::parse_release_observation(&[id], &row.replace("\"web\"", "\"invalid/name\""))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn container_check_rejects_wrong_image_and_distinguishes_health() {
         let id = "a".repeat(64);
         let image = format!("sha256:{}", "b".repeat(64));
@@ -3344,6 +3835,181 @@ mod tests {
             r#"["https://docker.1panel.live/","https://docker.m.daocloud.io/"]"#
         ));
         assert!(!mirrors_active(r#"["https://untrusted.example/"]"#));
+    }
+
+    #[test]
+    #[ignore = "requires an isolated copy of the real host database and its existing vault credential; read-only SSH"]
+    fn real_historical_images_read_only() {
+        let task_id = std::env::var("DEVINGPANEL_TEST_HISTORY_TASK").unwrap();
+        let mut task = crate::release_store::get_task(&task_id).unwrap();
+        let conn = crate::database::connect().unwrap();
+        let mut query = conn.prepare(
+            "SELECT service, reference, platform FROM release_task_images WHERE task_id = ?1 ORDER BY ordinal"
+        ).unwrap();
+        let plans = query
+            .query_map([&task_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            plans.len(),
+            2,
+            "the isolated stack smoke test needs both built services"
+        );
+        let (endpoint, daemon_id) = super::docker_identity_for_host(task.host.clone()).unwrap();
+        task.docker_endpoint = Some(endpoint.clone());
+        task.docker_daemon_id = Some(daemon_id.clone());
+        let material = super::material_for(&task.host).unwrap();
+        let images = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let handle = super::trusted_handle(material).await?;
+                super::checked_release_endpoint(
+                    &handle,
+                    super::ReleaseDockerIdentity {
+                        endpoint: &endpoint,
+                        daemon_id: &daemon_id,
+                    },
+                )
+                .await?;
+                let mut images = Vec::new();
+                for (service, reference, platform) in plans {
+                    let reference_arg = super::shell_quote(&reference)?;
+                    let command = super::docker_command(
+                        &endpoint,
+                        &format!("image inspect --format '{{{{json .Id}}}}' {reference_arg}"),
+                    );
+                    let result = super::archive_command(&handle, &command).await?;
+                    let image_id: String = serde_json::from_str(result.trim())
+                        .map_err(|_| "测试镜像 ID 格式无效。")?;
+                    images.push(HistoricalImage {
+                        service,
+                        reference,
+                        platform,
+                        image_ids: vec![image_id],
+                    });
+                }
+                let _ = handle
+                    .disconnect(russh::Disconnect::ByApplication, "", "en")
+                    .await;
+                Ok::<_, String>(images)
+            })
+            .unwrap();
+        assert_eq!(
+            super::observe_historical_images(&task, &images).unwrap(),
+            images
+                .iter()
+                .map(|item| (item.service.clone(), true))
+                .collect::<Vec<_>>()
+        );
+        let mut changed = images.clone();
+        changed[1].image_ids = vec![format!("sha256:{}", "0".repeat(64))];
+        assert_eq!(
+            super::observe_historical_images(&task, &changed).unwrap(),
+            vec![
+                (images[0].service.clone(), true),
+                (images[1].service.clone(), false)
+            ]
+        );
+        let mut missing = images.clone();
+        missing[0].reference =
+            format!("devingpanel-absent-{}:smoke", uuid::Uuid::new_v4().simple());
+        assert_eq!(
+            super::observe_historical_images(&task, &missing).unwrap(),
+            vec![
+                (images[0].service.clone(), false),
+                (images[1].service.clone(), true)
+            ]
+        );
+        task.docker_daemon_id = Some("changed-daemon".into());
+        assert!(super::observe_historical_images(&task, &images).is_err());
+    }
+
+    #[test]
+    #[ignore = "removes only an explicitly selected isolated stack-series Compose project on the test VPS"]
+    fn real_cleanup_isolated_series_stack() {
+        let project_id: i64 = std::env::var("DEVINGPANEL_TEST_CLEANUP_PROJECT_ID")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(project_id > 3);
+        let project = crate::project_store::effective(project_id).unwrap();
+        assert!(project.name.starts_with("stack-series-"));
+        let data = crate::preferences::data_dir()
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+        assert!(std::path::Path::new(&project.path).starts_with(&data));
+        let task = crate::release_store::recent(Some(project_id))
+            .unwrap()
+            .into_iter()
+            .find(|task| task.phase == "checked" && task.outcome == "blocked")
+            .expect("isolated failing release not found");
+        let images = crate::release_store::historical_images(&task.id).unwrap();
+        let built: Vec<_> = images
+            .into_iter()
+            .map(|image| super::StackService {
+                service: image.service,
+                reference: image.reference,
+                image_ids: image.image_ids,
+            })
+            .collect();
+        let files = crate::release_materials::load(&task.id).unwrap();
+        let before = super::observe_release_project(&task).unwrap();
+        assert_eq!(before.containers.len(), 4);
+        let material = super::material_for(&task.host).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let handle = super::trusted_handle(material).await?;
+                let identity = super::ReleaseDockerIdentity {
+                    endpoint: task.docker_endpoint.as_deref().unwrap(),
+                    daemon_id: task.docker_daemon_id.as_deref().unwrap(),
+                };
+                let endpoint = super::checked_release_endpoint(&handle, identity).await?;
+                let home = super::archive_command(&handle, "sh -c 'printf %s \"$HOME\"'").await?;
+                let directory = super::validated_release_directory(&home, project_id, &task.id)?;
+                let staged = super::StagedDeployment {
+                    env_path: format!("{directory}/.env"),
+                    compose_files: files
+                        .compose_files
+                        .iter()
+                        .map(|file| file.path.clone())
+                        .collect(),
+                    directory,
+                };
+                let command = format!(
+                    "{} down --remove-orphans",
+                    super::stack_command(&endpoint, &staged, project_id, &built)?
+                );
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    super::command_limited(&handle, &command, 64 * 1024),
+                )
+                .await
+                .map_err(|_| "隔离 Compose 清理超时，状态待核实。")??;
+                let _ = handle
+                    .disconnect(russh::Disconnect::ByApplication, "", "en")
+                    .await;
+                Ok::<_, String>(())
+            })
+            .unwrap();
+        assert!(
+            super::observe_release_project(&task)
+                .unwrap()
+                .containers
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3457,8 +4123,12 @@ mod tests {
                 )
                 .await
                 .unwrap();
+                let handle = super::trusted_handle(material()).await.unwrap();
+                let endpoint = super::local_docker_endpoint(&handle).await.unwrap();
+                let daemon_id = super::docker_daemon_id(&handle, &endpoint).await.unwrap();
                 super::validate_staged_compose_on(
                     material(),
+                    super::ReleaseDockerIdentity { endpoint: &endpoint, daemon_id: &daemon_id },
                     &staged,
                     987654321,
                     "web",
@@ -3467,7 +4137,6 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                let handle = super::trusted_handle(material()).await.unwrap();
                 let paths = files
                     .iter()
                     .map(|file| format!("{}/{}", staged.directory, file.path))
@@ -4162,6 +4831,7 @@ mod tests {
                 b"id -u" => b"0\n".as_slice(),
                 b"sh -c 'for tool in apt-get dpkg-query systemctl curl; do command -v \"$tool\" >/dev/null 2>&1 || exit 1; done; test -d /run/systemd/system && echo ready'" => b"ready\n".as_slice(),
                 b"docker --host unix:///var/run/docker.sock info --format '{{.ServerVersion}}'" => b"29.5.3\n".as_slice(),
+                b"docker --host unix:///var/run/docker.sock info --format '{{.ID}}'" => b"TEST:ID\n".as_slice(),
                 b"docker --host unix:///var/run/docker.sock compose version --short" => b"5.1.4\n".as_slice(),
                 b"uname -m" => b"x86_64\n".as_slice(),
                 b"docker --host unix:///var/run/docker.sock info --format '{{.OSType}}/{{.Architecture}}'" => if self.wrong_daemon_arch.load(Ordering::SeqCst) {
@@ -4538,10 +5208,15 @@ mod tests {
             );
             Box::pin(async {
                 let image_id = format!("sha256:{}", "a".repeat(64));
+                let identity = super::ReleaseDockerIdentity {
+                    endpoint: "unix:///var/run/docker.sock",
+                    daemon_id: "TEST:ID",
+                };
                 upload.image_ids = vec![image_id.clone()];
                 assert!(
                     super::load_archive(
                         material(Some(fingerprint.clone())),
+                        identity,
                         &upload,
                         "app;bad:tag",
                         "linux/amd64",
@@ -4551,10 +5226,29 @@ mod tests {
                     .is_err()
                 );
                 assert_eq!(operations.lock().unwrap().len(), 5);
+                let wrong_identity = super::ReleaseDockerIdentity {
+                    endpoint: "unix:///var/run/docker.sock",
+                    daemon_id: "OTHER:ID",
+                };
+                assert!(
+                    super::load_archive(
+                        material(Some(fingerprint.clone())),
+                        wrong_identity,
+                        &upload,
+                        "app:load-test",
+                        "linux/amd64",
+                        &AtomicBool::new(false),
+                    )
+                    .await
+                    .unwrap_err()
+                    .contains("daemon 身份")
+                );
+                assert_eq!(operations.lock().unwrap().len(), 5);
                 wrong_daemon_arch.store(true, Ordering::SeqCst);
                 assert!(
                     super::load_archive(
                         material(Some(fingerprint.clone())),
+                        identity,
                         &upload,
                         "app:load-test",
                         "linux/amd64",
@@ -4574,6 +5268,7 @@ mod tests {
                 assert!(
                     super::load_archive(
                         material(Some(fingerprint.clone())),
+                        identity,
                         &altered,
                         "app:load-test",
                         "linux/amd64",
@@ -4587,6 +5282,7 @@ mod tests {
                 assert!(
                     super::load_archive(
                         material(Some(fingerprint.clone())),
+                        identity,
                         &upload,
                         "app:load-test",
                         "linux/amd64",
@@ -4601,6 +5297,7 @@ mod tests {
                 assert!(
                     super::load_archive(
                         material(Some(fingerprint.clone())),
+                        identity,
                         &upload,
                         "app:load-test",
                         "linux/amd64",
@@ -4613,6 +5310,7 @@ mod tests {
                 load_no_exit.store(true, Ordering::SeqCst);
                 let uncertain = super::load_archive(
                     material(Some(fingerprint.clone())),
+                    identity,
                     &upload,
                     "app:load-test",
                     "linux/amd64",
@@ -4626,6 +5324,7 @@ mod tests {
                 assert_eq!(operations.lock().unwrap().len(), 5);
                 super::load_archive(
                     material(Some(fingerprint.clone())),
+                    identity,
                     &upload,
                     "app:load-test",
                     "linux/amd64",
@@ -4645,6 +5344,7 @@ mod tests {
                 assert!(
                     super::load_archive(
                         material(Some(fingerprint.clone())),
+                        identity,
                         &wrong_archive,
                         "app:load-test",
                         "linux/amd64",

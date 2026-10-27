@@ -98,11 +98,14 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
              host_username TEXT NOT NULL,
              host_auth TEXT NOT NULL,
              host_fingerprint TEXT NOT NULL,
+             docker_endpoint TEXT,
+             docker_daemon_id TEXT,
              image_reference TEXT NOT NULL,
              platform TEXT NOT NULL,
              config_sha256 TEXT NOT NULL,
              phase TEXT NOT NULL,
              outcome TEXT NOT NULL CHECK (outcome IN ('running', 'failed', 'unknown', 'blocked', 'complete')),
+             health_result TEXT CHECK (health_result IN ('healthy', 'running_unverified', 'failed')),
              detail TEXT NOT NULL DEFAULT '',
              started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -114,10 +117,33 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
              service TEXT NOT NULL,
              reference TEXT NOT NULL,
              platform TEXT NOT NULL,
+             image_ids TEXT,
+             archive_sha256 TEXT,
+             archive_bytes INTEGER,
              PRIMARY KEY (task_id, ordinal),
              UNIQUE (task_id, service)
          );
-         PRAGMA user_version = 12;
+         CREATE TABLE release_task_resolutions (
+             task_id TEXT PRIMARY KEY REFERENCES release_tasks(id),
+             decision TEXT NOT NULL,
+             observed_containers INTEGER NOT NULL,
+             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );
+         CREATE TABLE release_task_services (
+             task_id TEXT NOT NULL REFERENCES release_tasks(id),
+             service TEXT NOT NULL,
+             reference TEXT NOT NULL,
+             image_ids TEXT,
+             confirmed_image_id TEXT,
+             PRIMARY KEY (task_id, service)
+         );
+         CREATE TABLE release_materials (
+             task_id TEXT PRIMARY KEY REFERENCES release_tasks(id),
+             state TEXT NOT NULL CHECK (state IN ('writing', 'ready')),
+             chunks INTEGER NOT NULL CHECK (chunks BETWEEN 0 AND 128),
+             material_sha256 TEXT
+         );
+         PRAGMA user_version = 20;
          COMMIT;",
         ),
         1 => {
@@ -269,8 +295,8 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             )?;
             initialize(conn)
         }
-        11 => conn.execute_batch(
-            "BEGIN;
+        11 => {
+            conn.execute_batch("BEGIN;
              CREATE TABLE release_task_images (
                  task_id TEXT NOT NULL REFERENCES release_tasks(id),
                  ordinal INTEGER NOT NULL,
@@ -283,9 +309,93 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
              INSERT INTO release_task_images (task_id, ordinal, service, reference, platform)
              SELECT id, 0, '', image_reference, platform FROM release_tasks;
              PRAGMA user_version = 12;
+             COMMIT;")?;
+            initialize(conn)
+        }
+        12 => conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE release_tasks ADD COLUMN docker_endpoint TEXT;
+             CREATE TABLE release_task_resolutions (
+                 task_id TEXT PRIMARY KEY REFERENCES release_tasks(id),
+                 decision TEXT NOT NULL,
+                 observed_containers INTEGER NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );
+             PRAGMA user_version = 13;
              COMMIT;",
-        ),
-        12 => Ok(()),
+        ).and_then(|_| initialize(conn)),
+        13 => {
+            let exists: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('release_tasks') WHERE name = 'docker_daemon_id'",
+                [], |row| row.get(0),
+            )?;
+            if exists == 0 {
+                conn.execute_batch("BEGIN;
+                    ALTER TABLE release_tasks ADD COLUMN docker_daemon_id TEXT;
+                    PRAGMA user_version = 14;
+                    COMMIT;")?;
+            } else {
+                conn.execute_batch("BEGIN; PRAGMA user_version = 14; COMMIT;")?;
+            }
+            initialize(conn)
+        }
+        14 => {
+            conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE release_materials (
+                 task_id TEXT PRIMARY KEY REFERENCES release_tasks(id),
+                 state TEXT NOT NULL CHECK (state IN ('writing', 'ready')),
+                 chunks INTEGER NOT NULL CHECK (chunks BETWEEN 0 AND 128)
+             );
+             PRAGMA user_version = 15;
+             COMMIT;",
+            )?;
+            initialize(conn)
+        }
+        15 => {
+            conn.execute_batch("BEGIN;
+                ALTER TABLE release_task_images ADD COLUMN image_ids TEXT;
+                PRAGMA user_version = 16;
+                COMMIT;")?;
+            initialize(conn)
+        }
+        16 => {
+            conn.execute_batch("BEGIN;
+                ALTER TABLE release_task_images ADD COLUMN archive_sha256 TEXT;
+                ALTER TABLE release_task_images ADD COLUMN archive_bytes INTEGER;
+                PRAGMA user_version = 17;
+                COMMIT;")?;
+            initialize(conn)
+        }
+        17 => {
+            conn.execute_batch("BEGIN;
+                ALTER TABLE release_tasks ADD COLUMN health_result TEXT CHECK (health_result IN ('healthy', 'running_unverified', 'failed'));
+                PRAGMA user_version = 18;
+                COMMIT;")?;
+            initialize(conn)
+        }
+        18 => {
+            conn.execute_batch("BEGIN;
+                ALTER TABLE release_materials ADD COLUMN material_sha256 TEXT;
+                PRAGMA user_version = 19;
+                COMMIT;")?;
+            initialize(conn)
+        }
+        19 => {
+            conn.execute_batch("BEGIN;
+                CREATE TABLE release_task_services (
+                    task_id TEXT NOT NULL REFERENCES release_tasks(id),
+                    service TEXT NOT NULL,
+                    reference TEXT NOT NULL,
+                    image_ids TEXT,
+                    confirmed_image_id TEXT,
+                    PRIMARY KEY (task_id, service)
+                );
+                PRAGMA user_version = 20;
+                COMMIT;")?;
+            initialize(conn)
+        }
+        20 => Ok(()),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }
@@ -315,7 +425,195 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 20);
+    }
+
+    #[test]
+    fn upgrades_version_twelve_with_resolution_audit_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE release_tasks (id TEXT PRIMARY KEY);
+             CREATE TABLE release_task_images (task_id TEXT, service TEXT);
+             PRAGMA user_version = 12;",
+        )
+        .unwrap();
+        initialize(&conn).unwrap();
+        initialize(&conn).unwrap();
+        let found: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'release_task_resolutions'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(found, 1);
+        let column: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('release_tasks') WHERE name = 'docker_endpoint'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(column, 1);
+        let daemon_column: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('release_tasks') WHERE name = 'docker_daemon_id'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(daemon_column, 1);
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 20);
+    }
+
+    #[test]
+    fn upgrades_both_version_thirteen_daemon_column_shapes() {
+        for has_daemon_column in [false, true] {
+            let conn = Connection::open_in_memory().unwrap();
+            let schema = if has_daemon_column {
+                "CREATE TABLE release_tasks (id TEXT PRIMARY KEY, docker_endpoint TEXT, docker_daemon_id TEXT);
+                 CREATE TABLE release_task_images (task_id TEXT, service TEXT);
+                 PRAGMA user_version = 13;"
+            } else {
+                "CREATE TABLE release_tasks (id TEXT PRIMARY KEY, docker_endpoint TEXT);
+                 CREATE TABLE release_task_images (task_id TEXT, service TEXT);
+                 PRAGMA user_version = 13;"
+            };
+            conn.execute_batch(schema).unwrap();
+            initialize(&conn).unwrap();
+            initialize(&conn).unwrap();
+            let columns: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('release_tasks') WHERE name = 'docker_daemon_id'",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(columns, 1);
+            let version: i64 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 20);
+        }
+    }
+
+    #[test]
+    fn upgrades_version_fourteen_with_private_material_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE release_tasks (id TEXT PRIMARY KEY);
+             CREATE TABLE release_task_images (task_id TEXT, service TEXT);
+             PRAGMA user_version = 14;",
+        )
+        .unwrap();
+        initialize(&conn).unwrap();
+        let found: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'release_materials'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(found, 1);
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 20);
+    }
+
+    #[test]
+    fn upgrades_version_fifteen_with_image_id_snapshots() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE release_tasks (id TEXT PRIMARY KEY); CREATE TABLE release_task_images (task_id TEXT, service TEXT); CREATE TABLE release_materials (task_id TEXT, state TEXT, chunks INTEGER); PRAGMA user_version = 15;").unwrap();
+        initialize(&conn).unwrap();
+        let found: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('release_task_images') WHERE name = 'image_ids'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(found, 1);
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 20);
+    }
+
+    #[test]
+    fn upgrades_version_sixteen_with_local_archive_metadata() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE release_tasks (id TEXT PRIMARY KEY); CREATE TABLE release_task_images (task_id TEXT, service TEXT); CREATE TABLE release_materials (task_id TEXT, state TEXT, chunks INTEGER); PRAGMA user_version = 16;").unwrap();
+        initialize(&conn).unwrap();
+        initialize(&conn).unwrap();
+        for name in ["archive_sha256", "archive_bytes"] {
+            let found: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('release_task_images') WHERE name = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1);
+        }
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 20);
+    }
+
+    #[test]
+    fn upgrades_version_seventeen_without_inventing_old_health_results() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE release_tasks (id TEXT PRIMARY KEY, phase TEXT, outcome TEXT);
+            CREATE TABLE release_materials (task_id TEXT, state TEXT, chunks INTEGER);
+            INSERT INTO release_tasks VALUES ('old', 'checked', 'blocked'); PRAGMA user_version = 17;").unwrap();
+        initialize(&conn).unwrap();
+        initialize(&conn).unwrap();
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT health_result FROM release_tasks WHERE id = 'old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(result, None);
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 20);
+    }
+
+    #[test]
+    fn upgrades_version_eighteen_without_inventing_old_material_digest() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE release_materials (task_id TEXT PRIMARY KEY, state TEXT, chunks INTEGER);
+            INSERT INTO release_materials VALUES ('old', 'ready', 1); PRAGMA user_version = 18;",
+        )
+        .unwrap();
+        initialize(&conn).unwrap();
+        initialize(&conn).unwrap();
+        let digest: Option<String> = conn
+            .query_row(
+                "SELECT material_sha256 FROM release_materials WHERE task_id = 'old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(digest, None);
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 20);
+    }
+
+    #[test]
+    fn upgrades_version_nineteen_with_empty_service_plan() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA user_version = 19;").unwrap();
+        initialize(&conn).unwrap();
+        initialize(&conn).unwrap();
+        let found: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('release_task_services') WHERE name = 'confirmed_image_id'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(found, 1);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM release_task_services", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 20);
     }
 
     #[test]
@@ -331,7 +629,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 20);
         let name: String = conn
             .query_row("SELECT name FROM projects", [], |row| row.get(0))
             .unwrap();
@@ -381,7 +679,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 20);
         let pending: String = conn
             .query_row("SELECT credential_id FROM pending_credentials", [], |row| {
                 row.get(0)
@@ -411,7 +709,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 20);
         conn.execute(
             "INSERT INTO project_hosts (project_id, host_id, ordinal) VALUES (3, 5, 0)",
             [],
@@ -437,7 +735,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 20);
         let host_id: i64 = conn
             .query_row("SELECT host_id FROM project_hosts", [], |row| row.get(0))
             .unwrap();
@@ -473,7 +771,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 20);
         let tables: i64 = conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'release_tasks'",
             [], |row| row.get(0),

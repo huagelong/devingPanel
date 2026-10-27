@@ -4655,6 +4655,614 @@ impl AppView {
         .into_any_element()
     }
 
+    pub(super) fn refresh_release_tasks(
+        &mut self,
+        project_id: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        match project_id {
+            Some(id) if !self.release_project_loading.insert(id) => return,
+            None if self.release_tasks_loading => return,
+            None => self.release_tasks_loading = true,
+            _ => {}
+        }
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { release_store::recent(project_id) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                match (project_id, result) {
+                    (Some(id), Ok(tasks)) => {
+                        view.release_project_loading.remove(&id);
+                        view.release_project_tasks.insert(id, tasks);
+                        view.release_project_errors.remove(&id);
+                    }
+                    (Some(id), Err(error)) => {
+                        view.release_project_loading.remove(&id);
+                        view.release_project_errors.insert(id, error);
+                    }
+                    (None, Ok(tasks)) => {
+                        view.release_tasks_loading = false;
+                        view.release_tasks = tasks;
+                        view.release_tasks_error = None;
+                    }
+                    (None, Err(error)) => {
+                        view.release_tasks_loading = false;
+                        view.release_tasks_error = Some(error);
+                    }
+                }
+                view.previous_version_checks.clear();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn inspect_release_task(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.release_checking.insert(id.clone()) {
+            return;
+        }
+        self.release_observations.remove(&id);
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let key = id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    release::observe_task(&id).map(|(_, observation)| observation.containers)
+                })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.release_checking.remove(&key);
+                view.release_observations.insert(key, result);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn inspect_release_materials(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.release_material_checking.insert(id.clone()) {
+            return;
+        }
+        self.release_material_checks.remove(&id);
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let key = id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let snapshot = release_materials::load(&id)?;
+                    let services = release_store::planned_archive_services(&id)?;
+                    let mut archived = 0;
+                    for (service, has_archive) in &services {
+                        if *has_archive {
+                            crate::release_archive::verify(&id, service)?;
+                            archived += 1;
+                        }
+                    }
+                    Ok::<_, String>(MaterialCheck {
+                        compose_files: snapshot.compose_files.len(),
+                        has_env: !snapshot.env_file.is_empty(),
+                        archives: archived,
+                        planned_archives: services.len(),
+                    })
+                })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.release_material_checking.remove(&key);
+                view.release_material_checks.insert(key, result);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn inspect_release_images(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.release_image_checking.insert(id.clone()) {
+            return;
+        }
+        self.release_image_checks.remove(&id);
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let key = id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { release::observe_task_images(&id) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.release_image_checking.remove(&key);
+                view.release_image_checks.insert(key, result);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn inspect_previous_version(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.previous_version_checking.insert(id.clone()) {
+            return;
+        }
+        self.previous_version_checks.remove(&id);
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let key = id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { release::inspect_previous_version(&id) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.previous_version_checking.remove(&key);
+                view.previous_version_checks.insert(key, result);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn retry_prepared_recovery(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.release_recovery_busy {
+            return;
+        }
+        self.release_recovery_busy = true;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { release_materials::recover_prepared() })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.release_recovery_busy = false;
+                    view.refresh_release_tasks(None, cx);
+                    if let Some(project_id) = view.project_id {
+                        view.refresh_release_tasks(Some(project_id), cx);
+                    }
+                    cx.notify();
+                });
+                window.push_notification(
+                    match result {
+                        Ok(count) => {
+                            Notification::success(format!("已清理 {count} 条构建前中断任务"))
+                        }
+                        Err(error) => Notification::warning(error),
+                    },
+                    app,
+                );
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_close_absent_task(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let eligible = self
+            .release_tasks
+            .iter()
+            .chain(
+                self.release_project_tasks
+                    .values()
+                    .flat_map(|tasks| tasks.iter()),
+            )
+            .any(|task| {
+                task.id == id
+                    && task.docker_endpoint.is_some()
+                    && task.docker_daemon_id.is_some()
+                    && matches!(
+                        (task.phase.as_str(), task.outcome.as_str()),
+                        ("checked", "blocked") | ("checking", "unknown")
+                    )
+            });
+        let observed_absent = self
+            .release_observations
+            .get(&id)
+            .is_some_and(|result| result.as_ref().is_ok_and(Vec::is_empty));
+        if !eligible || !observed_absent || self.release_resolving.contains(&id) {
+            return;
+        }
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm_view = view.clone();
+            let task_id = id.clone();
+            dialog.title("确认关闭待核实任务").w(px(520.))
+                .child(div().flex().flex_col().gap_3()
+                    .child("只读核实未发现该 Compose 项目的容器。确认后会再次连接并核实；仅在仍无容器、任务阶段未变化时记录人工决定并解除项目锁定。")
+                    .child("这不会删除远端镜像或部署文件，不会执行 Compose，也不代表先前部署成功。"))
+                .footer(div().flex().justify_end().gap_2()
+                    .child(Button::new("release-absence-cancel").label("取消")
+                        .on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("release-absence-confirm").danger().label("确认无容器并关闭")
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let id = task_id.clone();
+                            let _ = confirm_view.update(cx, |view, cx| view.close_absent_task(id, window, cx));
+                        })))
+        });
+    }
+
+    fn close_absent_task(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(task_project_id) = self
+            .release_tasks
+            .iter()
+            .chain(
+                self.release_project_tasks
+                    .values()
+                    .flat_map(|tasks| tasks.iter()),
+            )
+            .find(|task| task.id == id)
+            .map(|task| task.project_id)
+        else {
+            return;
+        };
+        if !self.release_resolving.insert(id.clone()) {
+            return;
+        }
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let key = id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { release::confirm_absent_and_close(&id) })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.release_resolving.remove(&key);
+                    view.release_observations.remove(&key);
+                    if result.is_ok() {
+                        view.refresh_release_tasks(None, cx);
+                        view.refresh_release_tasks(Some(task_project_id), cx);
+                    }
+                    cx.notify();
+                });
+                window.push_notification(
+                    match result {
+                        Ok(()) => Notification::success("已记录人工核实并解除项目锁定"),
+                        Err(error) => Notification::error(error),
+                    },
+                    app,
+                );
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_complete_task(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let eligible = self
+            .release_tasks
+            .iter()
+            .chain(
+                self.release_project_tasks
+                    .values()
+                    .flat_map(|tasks| tasks.iter()),
+            )
+            .any(|task| {
+                task.id == id
+                    && task.phase == "checked"
+                    && task.outcome == "blocked"
+                    && task.health_result.as_deref() == Some("healthy")
+            });
+        if !eligible || self.release_resolving.contains(&id) {
+            return;
+        }
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm_view = view.clone();
+            let task_id = id.clone();
+            dialog.title("确认健康发布完成").w(px(520.))
+                .child(div().flex().flex_col().gap_3()
+                    .child("将重新检查本机版本材料、远端自有镜像及整个 Compose 项目的容器和健康状态。只有身份和所有服务均匹配时才记录完成并解除项目阻断。")
+                    .child("首次发布不要求已有上一版本；确认不会部署、重启或清理任何容器，也不会启用回滚按钮。旧任务或缺少服务计划的任务不能确认完成。"))
+                .footer(div().flex().justify_end().gap_2()
+                    .child(Button::new("release-complete-cancel").label("取消")
+                        .on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("release-complete-confirm").label("重新核实并确认完成")
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let id = task_id.clone();
+                            let _ = confirm_view.update(cx, |view, cx| view.complete_healthy_task(id, window, cx));
+                        })))
+        });
+    }
+
+    fn complete_healthy_task(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project_id) = self
+            .release_tasks
+            .iter()
+            .chain(
+                self.release_project_tasks
+                    .values()
+                    .flat_map(|tasks| tasks.iter()),
+            )
+            .find(|task| task.id == id)
+            .map(|task| task.project_id)
+        else {
+            return;
+        };
+        if !self.release_resolving.insert(id.clone()) {
+            return;
+        }
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let key = id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { release::confirm_healthy_and_complete(&id) })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.release_resolving.remove(&key);
+                    view.release_observations.remove(&key);
+                    view.release_image_checks.remove(&key);
+                    view.previous_version_checks.clear();
+                    view.refresh_release_tasks(None, cx);
+                    view.refresh_release_tasks(Some(project_id), cx);
+                    cx.notify();
+                });
+                window.push_notification(
+                    match result {
+                        Ok(count) => Notification::success(format!(
+                            "已确认 {count} 个服务健康，发布记录已完成"
+                        )),
+                        Err(error) => Notification::error(error),
+                    },
+                    app,
+                );
+            });
+        })
+        .detach();
+    }
+
+    fn release_history_panel(&self, project_id: Option<i64>, cx: &mut Context<Self>) -> AnyElement {
+        let mut rows = div().px_6().pb_6().flex().flex_col().gap_3();
+        rows = rows.child(
+            div().flex().justify_end().child(
+                Button::new("release-recover-prepared")
+                    .label(if self.release_recovery_busy {
+                        "清理中…"
+                    } else {
+                        "重试构建前中断清理"
+                    })
+                    .disabled(self.release_recovery_busy)
+                    .on_click(
+                        cx.listener(|view, _, window, cx| view.retry_prepared_recovery(window, cx)),
+                    ),
+            ),
+        );
+        let error = match project_id {
+            Some(id) => self.release_project_errors.get(&id),
+            None => self.release_tasks_error.as_ref(),
+        };
+        if let Some(error) = error {
+            rows = rows.child(
+                div()
+                    .text_color(self.palette().destructive)
+                    .child(error.clone()),
+            );
+        }
+        let tasks = match project_id {
+            Some(id) => self
+                .release_project_tasks
+                .get(&id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            None => self.release_tasks.as_slice(),
+        };
+        if tasks.is_empty() {
+            rows = rows.child(div().text_color(self.palette().muted).child(
+                if project_id.is_some_and(|id| self.release_project_loading.contains(&id))
+                    || (project_id.is_none() && self.release_tasks_loading)
+                {
+                    "正在读取任务…"
+                } else {
+                    "暂无发布任务；版本回滚历史尚未接入"
+                },
+            ));
+        }
+        for (index, task) in tasks.iter().enumerate() {
+            let id = task.id.clone();
+            let checking = self.release_checking.contains(&id);
+            let resolving = self.release_resolving.contains(&id);
+            let material_checking = self.release_material_checking.contains(&id);
+            let image_checking = self.release_image_checking.contains(&id);
+            let previous_checking = self.previous_version_checking.contains(&id);
+            let observation = self.release_observations.get(&id);
+            let absent = observation.is_some_and(|result| result.as_ref().is_ok_and(Vec::is_empty));
+            let eligible = task.docker_endpoint.is_some()
+                && task.docker_daemon_id.is_some()
+                && matches!(
+                    (task.phase.as_str(), task.outcome.as_str()),
+                    ("checked", "blocked") | ("checking", "unknown")
+                );
+            let active = matches!(task.outcome.as_str(), "running" | "unknown" | "blocked");
+            let can_complete = task.phase == "checked"
+                && task.outcome == "blocked"
+                && task.health_result.as_deref() == Some("healthy");
+            let detail = match observation {
+                Some(Ok(containers)) if containers.is_empty() && eligible => {
+                    "远端无该项目容器；可再次核实后关闭任务".into()
+                }
+                Some(Ok(containers)) if containers.is_empty() => {
+                    "远端无该项目容器，但旧任务缺少 Docker daemon 身份快照或阶段不安全，不能自动解除阻断".into()
+                }
+                Some(Ok(containers)) => containers
+                    .iter()
+                    .map(|item| {
+                        format!(
+                            "{}：{} / {}",
+                            item.service,
+                            item.status,
+                            item.health.as_deref().unwrap_or("无健康检查")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  ·  "),
+                Some(Err(error)) => format!("核实失败：{error}"),
+                None => task.detail.clone(),
+            };
+            rows =
+                rows.child(
+                    div()
+                        .border_1()
+                        .border_color(self.palette().border)
+                        .rounded_md()
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(div().font_family(mono_font()).child(format!(
+                            "{}  ·  {}  ·  {}",
+                            id.chars().take(8).collect::<String>(),
+                            task.project_name,
+                            task.host.name
+                        )))
+                        .child(div().text_color(self.palette().muted).child(format!(
+                            "{}  ·  {}  ·  {}",
+                            task.started_at, task.phase, task.outcome
+                        )))
+                        .when_some(task.health_result.as_deref(), |row, health| {
+                            let (label, color) = match health {
+                                "healthy" => ("发布时核实：全部健康（仍未解除阻断）", self.palette().success),
+                                "running_unverified" => ("发布时核实：运行中，未验证就绪", self.palette().warning),
+                                _ => ("发布时核实：未健康", self.palette().destructive),
+                            };
+                            row.child(div().text_color(color).child(label))
+                        })
+                        .child(div().whitespace_normal().child(detail))
+                        .when_some(self.release_material_checks.get(&id), |row, material| {
+                            row.child(div().text_color(self.palette().muted).child(
+                                match material {
+                                    Ok(check) => format!(
+                                        "Compose/环境快照可读：{} 份 Compose，环境快照{}；镜像归档 {}/{} 份可读（不代表可回滚）",
+                                        check.compose_files,
+                                        if check.has_env { "已保存" } else { "为空" },
+                                        check.archives,
+                                        check.planned_archives,
+                                    ),
+                                    Err(error) => format!("本机材料不可用：{error}"),
+                                },
+                            ))
+                        })
+                        .when_some(self.release_image_checks.get(&id), |row, result| {
+                            row.child(div().text_color(self.palette().muted).child(match result {
+                                Ok(images) => format!(
+                                    "远端历史镜像：{}（只读，不代表可回滚）",
+                                    images.iter().map(|(service, available)| format!(
+                                        "{service} {}", if *available { "ID/架构匹配" } else { "缺失或已变化" }
+                                    )).collect::<Vec<_>>().join("  ·  ")
+                                ),
+                                Err(error) => format!("远端镜像核实失败：{error}"),
+                            }))
+                        })
+                        .when_some(self.previous_version_checks.get(&id), |row, result| {
+                            row.child(div().text_color(self.palette().muted).child(match result {
+                                Ok(check) => format!(
+                                    "上一健康版本 {}：{} 份镜像及本机快照在核查时齐全；尚不可回滚",
+                                    check.task_id.chars().take(8).collect::<String>(), check.images
+                                ),
+                                Err(error) => format!("上一版本预检不可用：{error}"),
+                            }))
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(
+                                    Button::new(("release-inspect", index))
+                                        .label(if checking {
+                                            "核实中…"
+                                        } else {
+                                            "重新核实状态"
+                                        })
+                                        .disabled(checking || resolving || !active)
+                                        .on_click(cx.listener({
+                                            let id = id.clone();
+                                            move |view, _, _, cx| {
+                                                view.inspect_release_task(id.clone(), cx)
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    Button::new(("release-materials", index))
+                                        .label(if material_checking {
+                                            "检查中…"
+                                        } else {
+                                            "检查本机材料"
+                                        })
+                                        .disabled(material_checking)
+                                        .on_click(cx.listener({
+                                            let id = id.clone();
+                                            move |view, _, _, cx| {
+                                                view.inspect_release_materials(id.clone(), cx)
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    Button::new(("release-images", index))
+                                        .label(if image_checking { "核实中…" } else { "核实远端镜像" })
+                                        .disabled(image_checking)
+                                        .on_click(cx.listener({
+                                            let id = id.clone();
+                                            move |view, _, _, cx| view.inspect_release_images(id.clone(), cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new(("previous-version", index))
+                                        .label(if previous_checking { "预检中…" } else { "检查上一版本" })
+                                        .disabled(previous_checking)
+                                        .on_click(cx.listener({
+                                            let id = id.clone();
+                                            move |view, _, _, cx| view.inspect_previous_version(id.clone(), cx)
+                                        })),
+                                )
+                                .when(absent && eligible, |row| {
+                                    row.child(
+                                        Button::new(("release-confirm-absence", index))
+                                            .danger()
+                                            .label(if resolving {
+                                                "处理中…"
+                                            } else {
+                                                "确认无容器，解除阻断"
+                                            })
+                                            .disabled(resolving || checking)
+                                            .on_click(cx.listener({
+                                                let id = id.clone();
+                                                move |view, _, window, cx| {
+                                                    view.confirm_close_absent_task(
+                                                        id.clone(),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                }
+                                            })),
+                                    )
+                                })
+                                .when(can_complete, |row| {
+                                    row.child(Button::new(("release-confirm-healthy", index))
+                                        .label(if resolving { "处理中…" } else { "确认健康发布完成" })
+                                        .disabled(resolving || checking)
+                                        .on_click(cx.listener({
+                                            let id = id.clone();
+                                            move |view, _, window, cx| view.confirm_complete_task(id.clone(), window, cx)
+                                        })))
+                                }),
+                        ),
+                );
+        }
+        self.panel(
+            "发布任务",
+            "只读核实远端状态；有容器或执行阶段不明时不能解除锁定。",
+            rows,
+        )
+        .into_any_element()
+    }
+
     fn project_detail(
         &self,
         project: &Project,
@@ -4698,6 +5306,8 @@ impl AppView {
                                     view.open_target_form(project_id);
                                 } else if tab == ProjectTab::Environment {
                                     view.load_environment(project_id, None, window, cx);
+                                } else if tab == ProjectTab::History {
+                                    view.refresh_release_tasks(Some(project_id), cx);
                                 }
                                 cx.notify();
                             },
@@ -4715,17 +5325,7 @@ impl AppView {
             ProjectTab::Compose => self.compose_panel(project, cx),
             ProjectTab::Environment => self.environment_panel(project, cx).into_any_element(),
             ProjectTab::Targets => self.targets_panel(project, cx).into_any_element(),
-            ProjectTab::History => self
-                .panel(
-                    "发布历史",
-                    "",
-                    div()
-                        .px_6()
-                        .pb_6()
-                        .text_color(self.palette().muted)
-                        .child("暂无发布记录"),
-                )
-                .into_any_element(),
+            ProjectTab::History => self.release_history_panel(Some(project.id), cx),
         };
         let release_project_id = project.id;
         div()
@@ -5128,6 +5728,7 @@ impl AppView {
                             cx,
                             |this, _, cx| {
                                 this.deploy_tab = DeployTab::History;
+                                this.refresh_release_tasks(None, cx);
                                 cx.notify();
                             },
                         )),
@@ -5154,17 +5755,7 @@ impl AppView {
                     self.project_empty("先创建项目", cx).into_any_element()
                 }
             } else {
-                self.panel(
-                    "发布历史",
-                    "",
-                    div()
-                        .border_t_1()
-                        .border_color(self.palette().border)
-                        .p_4()
-                        .text_color(self.palette().muted)
-                        .child("暂无发布记录"),
-                )
-                .into_any_element()
+                self.release_history_panel(None, cx)
             })
     }
 

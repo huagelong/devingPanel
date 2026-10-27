@@ -6,7 +6,9 @@ use crate::host_store;
 use crate::host_store::Host;
 use crate::project_config;
 use crate::project_store::{self, NewProject, Project};
-use crate::release_store::{self, Intent, Outcome, Phase};
+use crate::release_archive;
+use crate::release_materials;
+use crate::release_store::{self, HealthResult, Intent, Outcome, Phase};
 use crate::ssh::{self, TestResult};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -234,6 +236,8 @@ fn finish_transfer(
 
 #[allow(dead_code)] // The release coordinator will load this archive before deployment.
 pub fn transfer_built_image(
+    task_id: &str,
+    service: &str,
     host: Host,
     image: &BuiltImage,
     cancel: Arc<AtomicBool>,
@@ -245,6 +249,7 @@ pub fn transfer_built_image(
         return Err("目标主机架构与已构建镜像不匹配。".into());
     }
     let archive = build::save_image(image, cancel.clone())?;
+    release_archive::retain(task_id, service, &archive)?;
     if cancel.load(Ordering::Relaxed) {
         return Err("镜像传输已取消。".into());
     }
@@ -404,6 +409,7 @@ pub fn run_single_host_until_checked(
     cancel: Arc<AtomicBool>,
     mut on_event: impl FnMut(&str),
 ) -> Result<String, String> {
+    let _release_guard = release_materials::acquire_guard(project_id)?;
     if project_store::effective(project_id)?.manifest_mode {
         return crate::stack_release::run(project_id, host_id, base_tag, cancel, on_event);
     }
@@ -411,15 +417,23 @@ pub fn run_single_host_until_checked(
         prepare_single_host(project_id, host_id, base_tag, cancel.clone())?;
     let files = deployment_files(&project)?;
     let env_file = env_store::deployment_env_file(project_id, host_id)?;
+    let materials = release_materials::prepare(&files, &env_file)?;
     if source_digest(&project_store::effective(project_id)?)? != digest {
         return Err("项目文件在冻结部署材料期间变化，请重新开始。".into());
     }
+    let (docker_endpoint, docker_daemon_id) = ssh::docker_identity_for_host(host.clone())?;
+    let docker_identity = ssh::ReleaseDockerIdentity {
+        endpoint: &docker_endpoint,
+        daemon_id: &docker_daemon_id,
+    };
     let id = uuid::Uuid::new_v4().to_string();
     release_store::create(&Intent {
         id: id.clone(),
         project_id,
         project_name: project.name.clone(),
         host: host.clone(),
+        docker_endpoint: docker_endpoint.clone(),
+        docker_daemon_id: docker_daemon_id.clone(),
         image_reference: image.reference.clone(),
         platform: image.platform.clone(),
         images: vec![(
@@ -429,6 +443,15 @@ pub fn run_single_host_until_checked(
         )],
         config_sha256: digest.clone(),
     })?;
+    if let Err(error) = release_materials::save(&id, materials) {
+        let outcome = if error.contains("部分凭据可能残留") {
+            Outcome::Unknown
+        } else {
+            Outcome::Failed
+        };
+        let _ = release_store::settle(&id, Phase::Prepared, outcome, "本机版本材料保存失败");
+        return Err(error);
+    }
     release_store::advance(&id, Phase::Prepared, Phase::Building)?;
     on_event("本机构建");
     let built = match build::build_image(&project, &image, cancel.clone(), |line| on_event(line)) {
@@ -449,26 +472,42 @@ pub fn run_single_host_until_checked(
     }
     release_store::advance(&id, Phase::Built, Phase::Uploading)?;
     on_event("传输镜像");
-    let uploaded =
-        match transfer_built_image(host.clone(), &built, cancel.clone(), |sent, total| {
-            on_event(&format!("镜像传输 {sent}/{total} 字节"))
-        }) {
-            Ok(uploaded) => uploaded,
-            Err(error) => {
-                let _ = release_store::settle(
-                    &id,
-                    Phase::Uploading,
-                    Outcome::Unknown,
-                    "传输结果待核实",
-                );
-                return Err(error);
-            }
-        };
+    let uploaded = match transfer_built_image(
+        &id,
+        &project.service,
+        host.clone(),
+        &built,
+        cancel.clone(),
+        |sent, total| on_event(&format!("镜像传输 {sent}/{total} 字节")),
+    ) {
+        Ok(uploaded) => uploaded,
+        Err(error) => {
+            let _ =
+                release_store::settle(&id, Phase::Uploading, Outcome::Unknown, "传输结果待核实");
+            return Err(error);
+        }
+    };
     release_store::advance(&id, Phase::Uploading, Phase::Uploaded)?;
     release_store::advance(&id, Phase::Uploaded, Phase::Loading)?;
+    if let Err(error) = release_store::record_image_ids(&id, &project.service, &uploaded.image_ids)
+    {
+        let cleanup = ssh::cleanup_uploaded_archive(host.clone(), &uploaded);
+        let _ = release_store::settle(
+            &id,
+            Phase::Loading,
+            Outcome::Unknown,
+            "镜像归档 ID 保存结果待核实",
+        );
+        return Err(if cleanup.is_ok() {
+            error
+        } else {
+            format!("{error}；远端临时归档清理待核实")
+        });
+    }
     on_event("远端加载镜像");
     if let Err(error) = ssh::load_uploaded_archive(
         host.clone(),
+        docker_identity,
         &uploaded,
         &built.reference,
         &built.platform,
@@ -526,6 +565,7 @@ pub fn run_single_host_until_checked(
     on_event("远端校验 Compose 配置");
     if let Err(error) = ssh::validate_staged_compose(
         host.clone(),
+        docker_identity,
         &staged,
         project_id,
         &project.service,
@@ -542,24 +582,27 @@ pub fn run_single_host_until_checked(
     }
     release_store::advance(&id, Phase::Validating, Phase::Validated)?;
     release_store::advance(&id, Phase::Validated, Phase::Deploying)?;
+    let target = ssh::StackService {
+        service: project.service.clone(),
+        reference: built.reference.clone(),
+        image_ids: uploaded.image_ids.clone(),
+    };
     on_event("远端启动 Compose 服务");
     if let Err(error) = ssh::start_staged_compose(
         host.clone(),
+        docker_identity,
         &staged,
         project_id,
-        &project.service,
-        &built.reference,
-        &uploaded.image_ids,
+        &target,
         cancel.clone(),
     ) {
         // A read-only reconnect can reveal partial effects but cannot justify a retry.
         let observed = ssh::check_staged_compose(
             host,
+            docker_identity,
             &staged,
             project_id,
-            &project.service,
-            &built.reference,
-            &uploaded.image_ids,
+            &target,
             Arc::new(AtomicBool::new(false)),
         );
         let detail = match observed {
@@ -577,11 +620,10 @@ pub fn run_single_host_until_checked(
     on_event("核对容器与健康状态");
     let state = match ssh::check_staged_compose(
         host,
+        docker_identity,
         &staged,
         project_id,
-        &project.service,
-        &built.reference,
-        &uploaded.image_ids,
+        &target,
         cancel,
     ) {
         Ok(state) => state,
@@ -590,30 +632,142 @@ pub fn run_single_host_until_checked(
             return Err(error);
         }
     };
-    release_store::advance(&id, Phase::Checking, Phase::Checked)?;
-    let (outcome, detail) = match state {
-        ssh::DeploymentState::Healthy => (Outcome::Blocked, "容器健康，历史材料与恢复入口尚未实现"),
+    let (health, detail) = match state {
+        ssh::DeploymentState::Healthy => (HealthResult::Healthy, "容器健康；回滚执行尚未实现"),
         ssh::DeploymentState::RunningUnverified => (
-            Outcome::Blocked,
-            "容器运行中但无健康检查，历史材料与恢复入口尚未实现",
+            HealthResult::RunningUnverified,
+            "容器运行中但无健康检查；回滚执行尚未实现",
         ),
         ssh::DeploymentState::Failed => (
-            Outcome::Blocked,
+            HealthResult::Failed,
             "目标容器未运行、镜像不符或健康检查失败，需人工处理",
         ),
     };
-    release_store::settle(&id, Phase::Checked, outcome, detail)?;
+    release_store::settle_checked(&id, health, detail)?;
     Ok(id)
+}
+
+pub fn observe_task(
+    id: &str,
+) -> Result<(release_store::TaskSnapshot, ssh::ReleaseObservation), String> {
+    let task = release_store::get_unresolved(id)?;
+    let observation = ssh::observe_release_project(&task)?;
+    Ok((task, observation))
+}
+
+pub fn observe_task_images(id: &str) -> Result<Vec<(String, bool)>, String> {
+    let task = release_store::get_task(id)?;
+    let images = release_store::historical_images(id)?;
+    ssh::observe_historical_images(&task, &images)
+}
+
+pub struct PreviousVersionCheck {
+    pub task_id: String,
+    pub images: usize,
+}
+
+pub fn inspect_previous_version(id: &str) -> Result<PreviousVersionCheck, String> {
+    let previous = release_store::previous_healthy(id)?;
+    let _snapshot = release_materials::load(&previous.id)?;
+    let images = release_store::historical_images(&previous.id)?;
+    for image in &images {
+        crate::release_archive::verify(&previous.id, &image.service)?;
+    }
+    let remote = ssh::observe_historical_images(&previous, &images)?;
+    if remote.len() != images.len() || remote.iter().any(|(_, matched)| !matched) {
+        return Err("上一健康版本的远端镜像缺失或已变化。".into());
+    }
+    if release_store::previous_healthy(id)?.id != previous.id {
+        return Err("预检期间发布历史已变化，请重新检查。".into());
+    }
+    Ok(PreviousVersionCheck {
+        task_id: previous.id,
+        images: images.len(),
+    })
+}
+
+pub fn confirm_absent_and_close(id: &str) -> Result<(), String> {
+    let task = release_store::get_unresolved(id)?;
+    if !matches!(
+        (task.phase.as_str(), task.outcome.as_str()),
+        ("checked", "blocked") | ("checking", "unknown")
+    ) {
+        return Err("该阶段可能仍有远端操作，禁止解除阻断。".into());
+    }
+    if task.docker_endpoint.is_none() || task.docker_daemon_id.is_none() {
+        return Err("旧任务缺少 Docker daemon 身份快照，不能自动解除阻断。".into());
+    }
+    let observation = ssh::observe_release_project(&task)?;
+    if !observation.containers.is_empty() {
+        return Err("远端仍存在该项目的容器，未解除阻断。".into());
+    }
+    release_store::resolve_absent(&task)
+}
+
+pub fn confirm_healthy_and_complete(id: &str) -> Result<usize, String> {
+    let task = release_store::get_unresolved(id)?;
+    let _guard = release_materials::acquire_guard(task.project_id)?;
+    if task.phase != "checked"
+        || task.outcome != "blocked"
+        || task.health_result.as_deref() != Some("healthy")
+    {
+        return Err("仅新任务的整栈健康结果可人工确认完成。".into());
+    }
+    let snapshot = release_materials::load(id)?;
+    if snapshot.compose_files.is_empty() {
+        return Err("当次 Compose 快照不完整。".into());
+    }
+    let built = release_store::historical_images(id)?;
+    let services = release_store::planned_services(id)?;
+    for image in &built {
+        crate::release_archive::verify(id, &image.service)?;
+    }
+    ssh::verify_staged_materials(&task, &snapshot)?;
+    let remote_images = ssh::observe_historical_images(&task, &built)?;
+    if remote_images.len() != built.len() || remote_images.iter().any(|(_, available)| !available) {
+        return Err("远端自有镜像缺失或已变化，未确认完成。".into());
+    }
+    let observation = ssh::observe_release_project(&task)?;
+    if !matching_healthy_services(&services, &observation.containers) {
+        return Err("远端整栈服务数量、镜像或健康状态与当次计划不符。".into());
+    }
+    release_store::complete_checked(&task, &observation.containers)?;
+    Ok(observation.containers.len())
+}
+
+fn matching_healthy_services(
+    services: &[release_store::PlannedService],
+    observed: &[ssh::ObservedContainer],
+) -> bool {
+    !services.is_empty()
+        && services.len() == observed.len()
+        && services.iter().all(|expected| {
+            observed
+                .iter()
+                .filter(|item| item.service == expected.service)
+                .count()
+                == 1
+                && observed.iter().any(|item| {
+                    item.service == expected.service
+                        && item.status == "running"
+                        && item.health.as_deref() == Some("healthy")
+                        && item.config_image == expected.reference
+                        && (expected.image_ids.is_empty()
+                            || expected.image_ids.contains(&item.image_id))
+                })
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        check_project_config, checked_platform, deployment_files, finish_transfer, plan_images,
-        source_digest, verify_transfer,
+        check_project_config, checked_platform, deployment_files, finish_transfer,
+        matching_healthy_services, plan_images, source_digest, verify_transfer,
     };
     use crate::build::SavedArchive;
     use crate::project_store::Project;
+    use crate::release_store::PlannedService;
+    use crate::ssh::ObservedContainer;
     use crate::ssh::TestResult;
 
     fn project() -> Project {
@@ -633,6 +787,204 @@ mod tests {
             manifest_mode: false,
             config_error: None,
         }
+    }
+
+    #[test]
+    fn completion_requires_exact_service_set_and_healthy_images() {
+        let expected = vec![
+            PlannedService {
+                service: "web".into(),
+                reference: "app:v1".into(),
+                image_ids: vec![format!("sha256:{}", "a".repeat(64))],
+            },
+            PlannedService {
+                service: "db".into(),
+                reference: "postgres:16".into(),
+                image_ids: vec![],
+            },
+        ];
+        let observed = vec![
+            ObservedContainer {
+                service: "web".into(),
+                status: "running".into(),
+                health: Some("healthy".into()),
+                image_id: expected[0].image_ids[0].clone(),
+                config_image: "app:v1".into(),
+            },
+            ObservedContainer {
+                service: "db".into(),
+                status: "running".into(),
+                health: Some("healthy".into()),
+                image_id: format!("sha256:{}", "b".repeat(64)),
+                config_image: "postgres:16".into(),
+            },
+        ];
+        assert!(matching_healthy_services(&expected, &observed));
+        assert!(!matching_healthy_services(&expected, &observed[..1]));
+        let mut changed = observed.clone();
+        changed[1].service = "web".into();
+        assert!(!matching_healthy_services(&expected, &changed));
+        changed = observed.clone();
+        changed[1].health = None;
+        assert!(!matching_healthy_services(&expected, &changed));
+        changed = observed.clone();
+        changed[0].image_id = format!("sha256:{}", "c".repeat(64));
+        assert!(!matching_healthy_services(&expected, &changed));
+    }
+
+    #[test]
+    #[ignore = "requires isolated APPDATA database copy, trusted VPS credential and local Docker; creates an isolated remote stack"]
+    fn real_two_version_stack_release_and_completion() {
+        let source =
+            std::path::PathBuf::from(std::env::var("DEVINGPANEL_TEST_STACK_FIXTURE").unwrap());
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let name = format!("stack-series-{}", &suffix[..12]);
+        let path = crate::preferences::data_dir().unwrap().join(&name);
+        std::fs::create_dir(&path).unwrap();
+        for file in [
+            "compose.yaml",
+            "Dockerfile.web",
+            "Dockerfile.worker",
+            "probe-web.txt",
+            "probe-worker.txt",
+        ] {
+            std::fs::copy(source.join(file), path.join(file)).unwrap();
+        }
+        let manifest = std::fs::read_to_string(source.join("devingpanel.yaml"))
+            .unwrap()
+            .replace("stack-v2-success", &name);
+        std::fs::write(path.join("devingpanel.yaml"), manifest).unwrap();
+        let project = crate::project_store::create_from_manifest(&path).unwrap();
+        let host_id = *project
+            .host_ids
+            .first()
+            .expect("fixture must bind the trusted test host");
+        let host = crate::host_store::list()
+            .unwrap()
+            .0
+            .into_iter()
+            .find(|host| host.id == host_id)
+            .unwrap();
+        let (endpoint, daemon_id) = crate::ssh::docker_identity_for_host(host.clone()).unwrap();
+        let probe = crate::release_store::TaskSnapshot {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project.id,
+            project_name: project.name.clone(),
+            host,
+            docker_endpoint: Some(endpoint),
+            docker_daemon_id: Some(daemon_id),
+            phase: "prepared".into(),
+            outcome: "running".into(),
+            health_result: None,
+            detail: String::new(),
+            started_at: String::new(),
+        };
+        assert!(
+            crate::ssh::observe_release_project(&probe)
+                .unwrap()
+                .containers
+                .is_empty(),
+            "refusing to use an existing remote Compose project"
+        );
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first = super::run_single_host_until_checked(
+            project.id,
+            host_id,
+            &format!("smoke{}", uuid::Uuid::new_v4().simple()),
+            cancel.clone(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            crate::release_store::get_task(&first)
+                .unwrap()
+                .health_result
+                .as_deref(),
+            Some("healthy")
+        );
+        assert_eq!(super::confirm_healthy_and_complete(&first).unwrap(), 4);
+        assert_eq!(
+            crate::release_store::get_task(&first).unwrap().outcome,
+            "complete"
+        );
+        let second = super::run_single_host_until_checked(
+            project.id,
+            host_id,
+            &format!("smoke{}", uuid::Uuid::new_v4().simple()),
+            cancel,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            super::inspect_previous_version(&second).unwrap().task_id,
+            first
+        );
+        assert_eq!(super::confirm_healthy_and_complete(&second).unwrap(), 4);
+        assert_eq!(
+            crate::release_store::get_task(&second).unwrap().outcome,
+            "complete"
+        );
+    }
+
+    #[test]
+    #[ignore = "continues an isolated two-version VPS test project; leaves its third release blocked/unhealthy"]
+    fn real_failed_third_release_preserves_completed_versions() {
+        let project_id: i64 = std::env::var("DEVINGPANEL_TEST_SERIES_PROJECT_ID")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let source =
+            std::path::PathBuf::from(std::env::var("DEVINGPANEL_TEST_FAILURE_FIXTURE").unwrap());
+        let project = crate::project_store::effective(project_id).unwrap();
+        assert!(project.name.starts_with("stack-series-"));
+        let data = crate::preferences::data_dir()
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+        assert!(std::path::Path::new(&project.path).starts_with(&data));
+        let host_id = project.host_ids[0];
+        let before: Vec<_> = crate::release_store::recent(Some(project_id))
+            .unwrap()
+            .into_iter()
+            .filter(|task| task.outcome == "complete")
+            .collect();
+        assert_eq!(before.len(), 2);
+        std::fs::copy(
+            source.join("compose.yaml"),
+            std::path::Path::new(&project.path).join("compose.yaml"),
+        )
+        .unwrap();
+        let id = super::run_single_host_until_checked(
+            project_id,
+            host_id,
+            &format!("fault{}", uuid::Uuid::new_v4().simple()),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let task = crate::release_store::get_task(&id).unwrap();
+        assert_eq!(
+            (
+                task.phase.as_str(),
+                task.outcome.as_str(),
+                task.health_result.as_deref()
+            ),
+            ("checked", "blocked", Some("failed"))
+        );
+        assert!(super::confirm_healthy_and_complete(&id).is_err());
+        let after: Vec<_> = crate::release_store::recent(Some(project_id))
+            .unwrap()
+            .into_iter()
+            .filter(|task| task.outcome == "complete")
+            .collect();
+        assert_eq!(after.len(), 2);
+        assert_eq!(
+            after
+                .iter()
+                .map(|task| &task.id)
+                .collect::<std::collections::HashSet<_>>(),
+            before.iter().map(|task| &task.id).collect()
+        );
     }
 
     #[test]

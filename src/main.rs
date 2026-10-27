@@ -8,6 +8,8 @@ mod preferences;
 mod project_config;
 mod project_store;
 mod release;
+mod release_archive;
+mod release_materials;
 mod release_store;
 mod ssh;
 mod stack_release;
