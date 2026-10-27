@@ -853,7 +853,7 @@ mod tests {
         let manifest_path = directory.join("devingpanel.yaml");
         fs::write(
             &manifest_path,
-            "version: 1\nname: myapp\nbuild:\n  dockerfile: Dockerfile\n  image: myapp\n  tag: '{timestamp}'\n  platform: auto\n  args: {}\ndeploy:\n  compose:\n    files: [compose.yaml]\n  service: web\n  targets:\n    - group: prod\n      host: web-1\n",
+            "version: 2\nname: myapp\ntag: '{timestamp}'\nbuilds:\n  - service: web\n    dockerfile: Dockerfile\n    image: myapp\n    platform: auto\n    args: {}\ndeploy:\n  compose:\n    files: [compose.yaml]\n  targets:\n    - group: prod\n      host: web-1\n",
         ).unwrap();
         let conn = Connection::open_in_memory().unwrap();
         initialize(&conn).unwrap();
@@ -1361,7 +1361,7 @@ mod tests {
             [("A".into(), "1".into()), ("B".into(), "2".into())]
         );
         assert_eq!(list_in(&reopened).unwrap()[0].service, "web");
-        reopened.pragma_update(None, "user_version", 12).unwrap();
+        reopened.pragma_update(None, "user_version", 13).unwrap();
         assert!(initialize(&reopened).is_err());
         drop(reopened);
         set_compose_files_in(
@@ -1424,7 +1424,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         let project = &list_in(&conn).unwrap()[0];
         assert_eq!(project.image, "repo/app");
         assert_eq!(project.platform, "linux/arm64");

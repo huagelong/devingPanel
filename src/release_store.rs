@@ -67,6 +67,7 @@ pub struct Intent {
     pub host: Host,
     pub image_reference: String,
     pub platform: String,
+    pub images: Vec<(String, String, String)>,
     pub config_sha256: String,
 }
 
@@ -84,6 +85,17 @@ fn create_in(conn: &Connection, intent: &Intent) -> Result<(), String> {
             .all(|byte| byte.is_ascii_hexdigit())
         || intent.project_id <= 0
         || intent.host.id <= 0
+        || intent.images.is_empty()
+        || intent.images.len() > 16
+        || intent.images[0].1 != intent.image_reference
+        || intent.images[0].2 != intent.platform
+        || intent.images.iter().any(|(service, reference, platform)| {
+            service.is_empty()
+                || reference.is_empty()
+                || !matches!(platform.as_str(), "linux/amd64" | "linux/arm64")
+                || service.chars().any(char::is_control)
+                || reference.chars().any(char::is_control)
+        })
     {
         return Err("发布任务标识或配置摘要无效。".into());
     }
@@ -137,6 +149,12 @@ fn create_in(conn: &Connection, intent: &Intent) -> Result<(), String> {
             ],
         )
         .map_err(|_| "该项目已有未核实的发布任务，不能重复开始。".to_owned())?;
+    for (ordinal, (service, reference, platform)) in intent.images.iter().enumerate() {
+        transaction.execute(
+            "INSERT INTO release_task_images (task_id, ordinal, service, reference, platform) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![intent.id, ordinal as i64, service, reference, platform],
+        ).map_err(|_| "发布镜像服务重复或不合法。".to_owned())?;
+    }
     transaction.commit().map_err(|err| err.to_string())?;
     Ok(())
 }
@@ -233,6 +251,7 @@ mod tests {
             },
             image_reference: "test:v1-amd64".into(),
             platform: "linux/amd64".into(),
+            images: vec![("web".into(), "test:v1-amd64".into(), "linux/amd64".into())],
             config_sha256: "a".repeat(64),
         }
     }
@@ -323,6 +342,42 @@ mod tests {
         conn.execute("DELETE FROM projects WHERE id = 1", [])
             .unwrap();
         assert!(create_in(&conn, &draft).is_err());
+    }
+
+    #[test]
+    fn persists_all_planned_images_before_any_release_phase() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        seed(&conn);
+        let mut draft = intent();
+        draft.images.push((
+            "worker".into(),
+            "test-worker:v1-amd64".into(),
+            "linux/amd64".into(),
+        ));
+        create_in(&conn, &draft).unwrap();
+        let saved = conn.prepare("SELECT service, reference FROM release_task_images WHERE task_id = ?1 ORDER BY ordinal").unwrap()
+            .query_map([&draft.id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            saved,
+            [
+                ("web".into(), "test:v1-amd64".into()),
+                ("worker".into(), "test-worker:v1-amd64".into())
+            ]
+        );
+        let mut invalid = intent();
+        invalid.project_id = 3;
+        invalid.images.push(invalid.images[0].clone());
+        assert!(create_in(&conn, &invalid).is_err());
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM release_tasks WHERE id = ?1",
+                [&invalid.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

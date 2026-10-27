@@ -147,29 +147,46 @@ pub fn plan_images(
         .iter()
         .map(|(_, platform)| platform.as_str())
         .collect::<BTreeSet<_>>();
+    let builds = if project.manifest_mode {
+        project_config::load(Path::new(&project.path))?
+            .builds
+            .into_iter()
+            .map(|build| (build.image, build.platform))
+            .collect::<Vec<_>>()
+    } else {
+        vec![(project.image.clone(), project.platform.clone())]
+    };
     let mut planned = Vec::new();
-    for platform in platforms {
-        let suffix = match platform {
-            "linux/amd64" => "-amd64",
-            "linux/arm64" => "-arm64",
-            _ => return Err("目标平台不受支持。".into()),
-        };
-        let tag = format!("{base_tag}{suffix}");
-        if tag.len() > 128
-            || !tag
-                .bytes()
-                .next()
-                .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-            || !tag
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
-        {
-            return Err("发布标识无法生成合法的 Docker tag。".into());
+    for (image, requested_platform) in builds {
+        if !project_store::valid_image_name(&image) {
+            return Err("项目镜像名无效。".into());
         }
-        planned.push(PlannedImage {
-            platform: platform.to_owned(),
-            reference: format!("{}:{tag}", project.image),
-        });
+        for platform in &platforms {
+            if requested_platform != "auto" && requested_platform != *platform {
+                return Err("构建目标平台与发布主机不匹配。".into());
+            }
+            let suffix = match *platform {
+                "linux/amd64" => "-amd64",
+                "linux/arm64" => "-arm64",
+                _ => return Err("目标平台不受支持。".into()),
+            };
+            let tag = format!("{base_tag}{suffix}");
+            if tag.len() > 128
+                || !tag
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                || !tag
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+            {
+                return Err("发布标识无法生成合法的 Docker tag。".into());
+            }
+            planned.push(PlannedImage {
+                platform: (*platform).to_owned(),
+                reference: format!("{image}:{tag}"),
+            });
+        }
     }
     Ok(planned)
 }
@@ -239,10 +256,15 @@ pub fn transfer_built_image(
     Ok(uploaded)
 }
 
-fn source_digest(project: &Project) -> Result<String, String> {
+pub(crate) fn source_digest(project: &Project) -> Result<String, String> {
     let root = Path::new(&project.path)
         .canonicalize()
         .map_err(|_| "项目目录不存在。")?;
+    let builds = if project.manifest_mode {
+        project_config::load(&root)?.builds
+    } else {
+        Vec::new()
+    };
     let metadata = serde_json::json!({
         "name": project.name,
         "dockerfile": project.dockerfile,
@@ -253,6 +275,10 @@ fn source_digest(project: &Project) -> Result<String, String> {
         "compose_files": project.compose_files,
         "build_args": project.build_args,
         "host_ids": project.host_ids,
+        "builds": builds.iter().map(|build| serde_json::json!({
+            "service": build.service, "dockerfile": build.dockerfile,
+            "image": build.image, "platform": build.platform, "args": build.args,
+        })).collect::<Vec<_>>(),
     });
     let mut digest = Sha256::new();
     digest.update(serde_json::to_vec(&metadata).map_err(|_| "无法核对项目配置。")?);
@@ -261,6 +287,7 @@ fn source_digest(project: &Project) -> Result<String, String> {
         paths.push(project_config::FILE_NAME.to_owned());
     }
     paths.push(project.dockerfile.clone());
+    paths.extend(builds.iter().map(|build| build.dockerfile.clone()));
     paths.extend(project.compose_files.iter().cloned());
     for relative in paths {
         let file = root
@@ -288,7 +315,7 @@ fn source_digest(project: &Project) -> Result<String, String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn deployment_files(project: &Project) -> Result<Vec<ssh::DeploymentFile>, String> {
+pub(crate) fn deployment_files(project: &Project) -> Result<Vec<ssh::DeploymentFile>, String> {
     let root = Path::new(&project.path)
         .canonicalize()
         .map_err(|_| "项目目录不存在。")?;
@@ -339,6 +366,9 @@ pub fn prepare_single_host(
 ) -> Result<(Project, Host, PlannedImage, String), String> {
     let project = project_store::effective(project_id)?;
     check_project_config(&project, &[host_id])?;
+    if project.manifest_mode {
+        return Err("YAML v2 请使用整栈发布协调器。".into());
+    }
     env_store::check_deployment_environment(project_id, &[host_id])?;
     let (hosts, _) = host_store::list()?;
     let host = hosts
@@ -374,6 +404,9 @@ pub fn run_single_host_until_checked(
     cancel: Arc<AtomicBool>,
     mut on_event: impl FnMut(&str),
 ) -> Result<String, String> {
+    if project_store::effective(project_id)?.manifest_mode {
+        return crate::stack_release::run(project_id, host_id, base_tag, cancel, on_event);
+    }
     let (project, host, image, digest) =
         prepare_single_host(project_id, host_id, base_tag, cancel.clone())?;
     let files = deployment_files(&project)?;
@@ -389,6 +422,11 @@ pub fn run_single_host_until_checked(
         host: host.clone(),
         image_reference: image.reference.clone(),
         platform: image.platform.clone(),
+        images: vec![(
+            project.service.clone(),
+            image.reference.clone(),
+            image.platform.clone(),
+        )],
         config_sha256: digest.clone(),
     })?;
     release_store::advance(&id, Phase::Prepared, Phase::Building)?;
@@ -639,7 +677,7 @@ mod tests {
         assert_ne!(before, source_digest(&project).unwrap());
         project.manifest_mode = true;
         assert!(source_digest(&project).is_err());
-        std::fs::write(dir.join("devingpanel.yaml"), "version: 1\n").unwrap();
+        std::fs::write(dir.join("devingpanel.yaml"), "version: 2\nname: app\ntag: '{timestamp}'\nbuilds:\n  - service: web\n    dockerfile: Dockerfile\n    image: app\n    platform: auto\n    args: {}\ndeploy:\n  compose:\n    files: [compose.yaml]\n  targets:\n    - group: test\n      host: web\n").unwrap();
         assert_ne!(before, source_digest(&project).unwrap());
         std::fs::remove_file(dir.join("devingpanel.yaml")).unwrap();
         std::fs::remove_file(dir.join("compose.yaml")).unwrap();
@@ -769,6 +807,48 @@ mod tests {
         assert_eq!(plan[1].reference, "app:v1.2-arm64");
         assert!(plan_images(&project, "bad tag", &targets).is_err());
         assert!(plan_images(&project, &"a".repeat(128), &targets).is_err());
+    }
+
+    #[test]
+    fn plans_each_manifest_build_with_shared_release_tag() {
+        let dir = std::env::temp_dir().join(format!(
+            "devingpanel-multibuild-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(dir.join("Dockerfile.worker"), "FROM scratch\n").unwrap();
+        std::fs::write(dir.join("compose.yaml"), "services: {}\n").unwrap();
+        std::fs::write(dir.join("devingpanel.yaml"), "version: 2\nname: app\ntag: '{timestamp}'\nbuilds:\n  - service: web\n    dockerfile: Dockerfile\n    image: app-web\n    platform: auto\n    args: {}\n  - service: worker\n    dockerfile: Dockerfile.worker\n    image: app-worker\n    platform: auto\n    args: {}\ndeploy:\n  compose:\n    files: [compose.yaml]\n  targets:\n    - group: test\n      host: web\n").unwrap();
+        let mut project = project();
+        project.path = dir.to_string_lossy().into_owned();
+        project.manifest_mode = true;
+        let targets = vec![(1, "linux/amd64".into()), (2, "linux/arm64".into())];
+        let plan = plan_images(&project, "v3", &targets).unwrap();
+        assert_eq!(plan.len(), 4);
+        assert_eq!(
+            plan.iter()
+                .map(|image| image.reference.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "app-web:v3-amd64",
+                "app-web:v3-arm64",
+                "app-worker:v3-amd64",
+                "app-worker:v3-arm64"
+            ]
+        );
+        let before = source_digest(&project).unwrap();
+        std::fs::write(dir.join("Dockerfile.worker"), "FROM busybox\n").unwrap();
+        assert_ne!(before, source_digest(&project).unwrap());
+        for file in [
+            "Dockerfile",
+            "Dockerfile.worker",
+            "compose.yaml",
+            "devingpanel.yaml",
+        ] {
+            std::fs::remove_file(dir.join(file)).unwrap();
+        }
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

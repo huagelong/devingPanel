@@ -218,7 +218,7 @@ fn valid_name(name: &str) -> bool {
         .next()
         .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        && name != "DEVINGPANEL_IMAGE"
+        && !name.starts_with("DEVINGPANEL_IMAGE")
 }
 
 fn scope_bound(conn: &Connection, project_id: i64, host_id: i64) -> Result<bool, String> {
@@ -595,7 +595,12 @@ mod tests {
             Some("prod")
         );
         assert!(save_in(&mut conn, 1, Some(3), vec![], |_, _| Ok(())).is_err());
-        for invalid in ["DEVINGPANEL_IMAGE", "BAD-NAME", "1START"] {
+        for invalid in [
+            "DEVINGPANEL_IMAGE",
+            "DEVINGPANEL_IMAGE_WEB",
+            "BAD-NAME",
+            "1START",
+        ] {
             assert!(
                 save_in(
                     &mut conn,

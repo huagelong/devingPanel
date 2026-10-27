@@ -18,8 +18,37 @@ pub struct Target {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildSpec {
+    pub service: String,
+    pub dockerfile: String,
+    pub image: String,
+    pub platform: String,
+    pub args: Vec<(String, String)>,
+}
+
+pub fn image_variable(service: &str) -> Result<String, String> {
+    if service.is_empty()
+        || service.len() > 100
+        || !service
+            .bytes()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric())
+        || !service
+            .bytes()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'-' | b'_'))
+    {
+        return Err("构建服务名不能映射为安全的镜像变量。".into());
+    }
+    Ok(format!(
+        "DEVINGPANEL_IMAGE_{}",
+        service.to_ascii_uppercase().replace('-', "_")
+    ))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
     pub name: String,
+    pub builds: Vec<BuildSpec>,
     pub dockerfile: String,
     pub image: String,
     pub tag_rule: String,
@@ -90,46 +119,74 @@ pub fn parse(source: &str) -> Result<Manifest, String> {
     if docs.len() != 1 {
         return Err("devingpanel.yaml 必须且只能包含一份文档。".into());
     }
-    let root = mapping(&docs[0], "配置", &["version", "name", "build", "deploy"])?;
-    if field(root, "version", "配置")?.as_i64() != Some(1) {
-        return Err("devingpanel.yaml 仅支持 version: 1。".into());
+    let root = mapping(
+        &docs[0],
+        "配置",
+        &["version", "name", "tag", "builds", "deploy"],
+    )?;
+    if field(root, "version", "配置")?.as_i64() != Some(2) {
+        return Err("devingpanel.yaml 仅支持 version: 2。".into());
     }
     let name = text(root, "name", "配置", false)?;
-    let build = mapping(
-        field(root, "build", "配置")?,
-        "build",
-        &["dockerfile", "image", "tag", "platform", "args"],
-    )?;
-    let dockerfile = text(build, "dockerfile", "build", false)?;
-    relative_file(&dockerfile, "Dockerfile")?;
-    let image = text(build, "image", "build", false)?;
-    if !project_store::valid_image_name(&image) {
-        return Err("build.image 不是合法的 Docker 镜像名。".into());
-    }
-    let tag_rule = text(build, "tag", "build", false)?;
+    let tag_rule = text(root, "tag", "配置", false)?;
     if !project_store::valid_tag_rule(&tag_rule) {
-        return Err("build.tag 不是合法的 Tag 规则。".into());
+        return Err("tag 不是合法的 Tag 规则。".into());
     }
-    let platform = text(build, "platform", "build", false)?;
-    if !matches!(platform.as_str(), "auto" | "linux/amd64" | "linux/arm64") {
-        return Err("build.platform 不受支持。".into());
+    let rows = field(root, "builds", "配置")?
+        .as_vec()
+        .ok_or("builds 必须是数组。")?;
+    if rows.is_empty() || rows.len() > 16 {
+        return Err("builds 必须包含 1 至 16 个构建。".into());
     }
-    let args = field(build, "args", "build")?
-        .as_hash()
-        .ok_or("build.args 必须是键值映射。")?;
-    let mut build_args = Vec::new();
-    for (key, value) in args {
-        let name = key.as_str().ok_or("Build args 名称必须是字符串。")?;
-        let value = value.as_str().ok_or("Build args 值必须是字符串。")?;
-        if !valid_arg_name(name) || value.contains('\0') {
-            return Err("Build args 名称或值无效。".into());
+    let mut builds = Vec::new();
+    let mut services = HashSet::new();
+    let mut images = HashSet::new();
+    let mut variables = HashSet::new();
+    for row in rows {
+        let build = mapping(
+            row,
+            "builds 条目",
+            &["service", "dockerfile", "image", "platform", "args"],
+        )?;
+        let service = text(build, "service", "builds 条目", false)?;
+        let variable = image_variable(&service)?;
+        let dockerfile = text(build, "dockerfile", "builds 条目", false)?;
+        relative_file(&dockerfile, "Dockerfile")?;
+        let image = text(build, "image", "builds 条目", false)?;
+        let platform = text(build, "platform", "builds 条目", false)?;
+        if !project_store::valid_image_name(&image)
+            || !matches!(platform.as_str(), "auto" | "linux/amd64" | "linux/arm64")
+            || !services.insert(service.clone())
+            || !images.insert(image.clone())
+            || !variables.insert(variable)
+        {
+            return Err("构建服务、镜像名、平台重复或无效。".into());
         }
-        build_args.push((name.into(), value.into()));
+        let args = field(build, "args", "builds 条目")?
+            .as_hash()
+            .ok_or("builds.args 必须是键值映射。")?;
+        let mut parsed_args = Vec::new();
+        for (key, value) in args {
+            let name = key.as_str().ok_or("Build args 名称必须是字符串。")?;
+            let value = value.as_str().ok_or("Build args 值必须是字符串。")?;
+            if !valid_arg_name(name) || value.contains('\0') {
+                return Err("Build args 名称或值无效。".into());
+            }
+            parsed_args.push((name.into(), value.into()));
+        }
+        builds.push(BuildSpec {
+            service,
+            dockerfile,
+            image,
+            platform,
+            args: parsed_args,
+        });
     }
+    let first = &builds[0];
     let deploy = mapping(
         field(root, "deploy", "配置")?,
         "deploy",
-        &["compose", "service", "targets"],
+        &["compose", "targets"],
     )?;
     let compose = mapping(field(deploy, "compose", "deploy")?, "compose", &["files"])?;
     let files = field(compose, "files", "compose")?
@@ -148,7 +205,6 @@ pub fn parse(source: &str) -> Result<Manifest, String> {
         }
         compose_files.push(file.into());
     }
-    let service = text(deploy, "service", "deploy", false)?;
     let target_rows = field(deploy, "targets", "deploy")?
         .as_vec()
         .ok_or("deploy.targets 必须是主机列表。")?;
@@ -174,13 +230,14 @@ pub fn parse(source: &str) -> Result<Manifest, String> {
     }
     Ok(Manifest {
         name,
-        dockerfile,
-        image,
+        builds: builds.clone(),
+        dockerfile: first.dockerfile.clone(),
+        image: first.image.clone(),
         tag_rule,
-        platform,
-        build_args,
+        platform: first.platform.clone(),
+        build_args: first.args.clone(),
         compose_files,
-        service,
+        service: first.service.clone(),
         targets,
     })
 }
@@ -205,12 +262,14 @@ pub fn load(root: &Path) -> Result<Manifest, String> {
     }
     let source = String::from_utf8(bytes).map_err(|_| "devingpanel.yaml 必须是 UTF-8。")?;
     let manifest = parse(&source)?;
-    NewProject {
-        name: manifest.name.clone(),
-        path: root.to_string_lossy().into_owned(),
-        dockerfile: manifest.dockerfile.clone(),
+    for build in &manifest.builds {
+        NewProject {
+            name: manifest.name.clone(),
+            path: root.to_string_lossy().into_owned(),
+            dockerfile: build.dockerfile.clone(),
+        }
+        .normalize()?;
     }
-    .normalize()?;
     for file in &manifest.compose_files {
         let resolved = root
             .join(file)
@@ -276,6 +335,15 @@ pub fn export_legacy(project: &Project, hosts: &[Host]) -> Result<(), String> {
     {
         return Err("请先补齐构建配置、Compose 服务和目标主机，再导出 YAML。".into());
     }
+    let variable = format!("${{{}}}", image_variable(&project.service)?);
+    if !project.compose_files.iter().any(|file| {
+        std::fs::read_to_string(Path::new(&project.path).join(file))
+            .is_ok_and(|source| source.contains(&variable))
+    }) {
+        return Err(format!(
+            "请先将 Compose 部署服务的 image 改为 {variable}，再导出 YAML。"
+        ));
+    }
     let mut targets = Vec::new();
     let mut seen = HashSet::new();
     for id in &project.host_ids {
@@ -295,28 +363,26 @@ pub fn export_legacy(project: &Project, hosts: &[Host]) -> Result<(), String> {
         targets.push(host);
     }
     let mut source = format!(
-        "version: 1\nname: {}\nbuild:\n  dockerfile: {}\n  image: {}\n  tag: {}\n  platform: {}\n  args:\n",
+        "version: 2\nname: {}\ntag: {}\nbuilds:\n  - service: {}\n    dockerfile: {}\n    image: {}\n    platform: {}\n    args:\n",
         quoted(&project.name),
+        quoted(&project.tag_rule),
+        quoted(&project.service),
         quoted(&project.dockerfile),
         quoted(&project.image),
-        quoted(&project.tag_rule),
         quoted(&project.platform)
     );
     if project.build_args.is_empty() {
-        source.push_str("    {}\n");
+        source.push_str("      {}\n");
     } else {
         for (name, value) in &project.build_args {
-            source.push_str(&format!("    {}: {}\n", quoted(name), quoted(value)));
+            source.push_str(&format!("      {}: {}\n", quoted(name), quoted(value)));
         }
     }
     source.push_str("deploy:\n  compose:\n    files:\n");
     for file in &project.compose_files {
         source.push_str(&format!("      - {}\n", quoted(file)));
     }
-    source.push_str(&format!(
-        "  service: {}\n  targets:\n",
-        quoted(&project.service)
-    ));
+    source.push_str("  targets:\n");
     for host in targets {
         source.push_str(&format!(
             "    - group: {}\n      host: {}\n",
@@ -349,19 +415,19 @@ mod tests {
     use crate::project_store::Project;
 
     const VALID: &str = r#"
-version: 1
+version: 2
 name: myapp
-build:
-  dockerfile: Dockerfile
-  image: myapp
-  tag: "{timestamp}"
-  platform: auto
-  args:
-    NODE_ENV: production
+tag: "{timestamp}"
+builds:
+  - service: web
+    dockerfile: Dockerfile
+    image: myapp
+    platform: auto
+    args:
+      NODE_ENV: production
 deploy:
   compose:
     files: [compose.yaml, compose.prod.yaml]
-  service: web
   targets:
     - group: prod
       host: web-1
@@ -386,8 +452,21 @@ deploy:
     }
 
     #[test]
+    fn parses_multiple_builds_and_rejects_colliding_image_variables() {
+        let second = "  - service: worker\n    dockerfile: Dockerfile.worker\n    image: myapp-worker\n    platform: auto\n    args: {}\n";
+        let source = VALID.replace("deploy:\n", &format!("{second}deploy:\n"));
+        let parsed = parse(&source).unwrap();
+        assert_eq!(parsed.builds.len(), 2);
+        assert_eq!(parsed.builds[1].service, "worker");
+        let collision = source.replace("service: worker", "service: WEB");
+        assert!(parse(&collision).is_err());
+        let collision = source.replace("service: worker", "service: web");
+        assert!(parse(&collision).is_err());
+    }
+
+    #[test]
     fn rejects_ambiguous_and_unsafe_configuration() {
-        assert!(parse(&VALID.replace("version: 1", "version: 2")).is_err());
+        assert!(parse(&VALID.replace("version: 2", "version: 1")).is_err());
         assert!(parse(&VALID.replace("name: myapp", "name: myapp\nname: other")).is_err());
         assert!(parse(&VALID.replace("name: myapp", "name: myapp\nextra: yes")).is_err());
         assert!(parse(&VALID.replace("Dockerfile", "../Dockerfile")).is_err());
@@ -400,6 +479,7 @@ deploy:
             .is_err()
         );
         assert!(parse(&VALID.replace("NODE_ENV: production", "NODE_ENV: 42")).is_err());
+        assert!(parse(&VALID.replace("service: web", "service: a-b\n  - service: a_b")).is_err());
         assert!(
             parse(&VALID.replace(
                 "host: web-1",
@@ -407,7 +487,7 @@ deploy:
             ))
             .is_err()
         );
-        assert!(parse(&format!("{VALID}\n---\nversion: 1")).is_err());
+        assert!(parse(&format!("{VALID}\n---\nversion: 2")).is_err());
     }
 
     #[test]
@@ -418,7 +498,11 @@ deploy:
         ));
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("Dockerfile"), "FROM scratch\n").unwrap();
-        std::fs::write(root.join("compose.yaml"), "services: {}\n").unwrap();
+        std::fs::write(
+            root.join("compose.yaml"),
+            "services:\n  web:\n    image: ${DEVINGPANEL_IMAGE_WEB}\n",
+        )
+        .unwrap();
         let project = Project {
             id: 1,
             name: "myapp".into(),
@@ -445,6 +529,18 @@ deploy:
             auth: "password".into(),
             trusted_fingerprint: None,
         };
+        std::fs::write(
+            root.join("compose.yaml"),
+            "services:\n  web:\n    image: ${DEVINGPANEL_IMAGE}\n",
+        )
+        .unwrap();
+        assert!(export_legacy(&project, std::slice::from_ref(&host)).is_err());
+        assert!(!root.join("devingpanel.yaml").exists());
+        std::fs::write(
+            root.join("compose.yaml"),
+            "services:\n  web:\n    image: ${DEVINGPANEL_IMAGE_WEB}\n",
+        )
+        .unwrap();
         export_legacy(&project, std::slice::from_ref(&host)).unwrap();
         let exported = load(&root).unwrap();
         assert_eq!(exported.targets[0].host, "web-1");

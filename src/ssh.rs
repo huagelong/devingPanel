@@ -234,6 +234,13 @@ pub struct StagedDeployment {
     pub env_path: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct StackService {
+    pub service: String,
+    pub reference: String,
+    pub image_ids: Vec<String>,
+}
+
 pub(crate) fn validated_release_file(path: &str) -> Result<(), String> {
     if path.is_empty()
         || path.len() > 512
@@ -2396,6 +2403,128 @@ pub fn validate_staged_compose(
         ))
 }
 
+fn stack_command(
+    endpoint: &str,
+    staged: &StagedDeployment,
+    project_id: i64,
+    built: &[StackService],
+) -> Result<String, String> {
+    let first = built.first().ok_or("没有待构建的服务。")?;
+    let base = compose_config_command(endpoint, staged, project_id, &first.reference)?;
+    let mut variables = String::new();
+    for image in built {
+        if !valid_compose_service(&image.service) {
+            return Err("构建服务名称无效。".into());
+        }
+        let variable = crate::project_config::image_variable(&image.service)?;
+        variables.push_str(&format!("{variable}={} ", shell_quote(&image.reference)?));
+    }
+    Ok(base.replacen("env ", &format!("env {variables}"), 1))
+}
+
+fn verified_stack_config(text: &str, built: &[StackService]) -> Result<Vec<StackService>, String> {
+    let config: Value = serde_json::from_str(text).map_err(|_| "远端 Compose 配置无法解析。")?;
+    let services = config
+        .get("services")
+        .and_then(Value::as_object)
+        .ok_or("远端 Compose 配置缺少服务。")?;
+    if services.is_empty() || services.len() > 100 {
+        return Err("Compose 服务数量不受支持。".into());
+    }
+    let mut resolved = Vec::new();
+    for (name, entry) in services {
+        if !valid_compose_service(name)
+            || entry.get("build").is_some_and(|build| !build.is_null())
+            || entry
+                .get("profiles")
+                .and_then(Value::as_array)
+                .is_some_and(|profiles| !profiles.is_empty())
+            || entry
+                .get("scale")
+                .is_some_and(|value| value.as_u64() != Some(1))
+            || entry
+                .pointer("/deploy/replicas")
+                .is_some_and(|value| value.as_u64() != Some(1))
+            || entry
+                .pointer("/healthcheck/disable")
+                .and_then(Value::as_bool)
+                == Some(true)
+        {
+            return Err("Compose 服务包含不安全的构建、扩容或健康设置。".into());
+        }
+        let reference = entry
+            .get("image")
+            .and_then(Value::as_str)
+            .ok_or("Compose 服务缺少镜像。")?;
+        if reference.is_empty() || reference.len() > 512 || reference.chars().any(char::is_control)
+        {
+            return Err("Compose 镜像引用无效。".into());
+        }
+        let image_ids = if let Some(expected) = built.iter().find(|item| item.service == *name) {
+            if reference != expected.reference
+                || validate_deployment_image_ids(&expected.image_ids).is_err()
+            {
+                return Err("远端构建镜像与发布计划不一致。".into());
+            }
+            expected.image_ids.clone()
+        } else {
+            Vec::new()
+        };
+        resolved.push(StackService {
+            service: name.clone(),
+            reference: reference.to_owned(),
+            image_ids,
+        });
+    }
+    if built
+        .iter()
+        .any(|image| !resolved.iter().any(|entry| entry.service == image.service))
+    {
+        return Err("Compose 缺少已构建的服务。".into());
+    }
+    Ok(resolved)
+}
+
+async fn validate_stack_on(
+    material: ConnectionMaterial,
+    staged: &StagedDeployment,
+    project_id: i64,
+    built: &[StackService],
+    cancel: &AtomicBool,
+) -> Result<Vec<StackService>, String> {
+    let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+        .await
+        .map_err(|_| "Compose 校验连接超时。")??;
+    let endpoint = local_docker_endpoint(&handle).await?;
+    let command = format!(
+        "{} config --format json",
+        stack_command(&endpoint, staged, project_id, built)?
+    );
+    let output = tokio::select! {
+        _ = wait_cancel(cancel) => return Err("整栈配置校验已取消。".into()),
+        result = tokio::time::timeout(Duration::from_secs(60), command_limited(&handle, &command, 128 * 1024 * 1024)) =>
+            result.map_err(|_| "远端 Compose 校验超时。")?.map_err(|_| "远端 Compose 配置校验失败。")?,
+    };
+    verified_stack_config(&output, built)
+}
+
+pub fn validate_staged_stack(
+    host: Host,
+    staged: &StagedDeployment,
+    project_id: i64,
+    built: &[StackService],
+    cancel: Arc<AtomicBool>,
+) -> Result<Vec<StackService>, String> {
+    let material = material_for(&host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化整栈校验环境。".to_owned())?
+        .block_on(validate_stack_on(
+            material, staged, project_id, built, &cancel,
+        ))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeploymentState {
     Healthy,
@@ -2451,10 +2580,20 @@ fn inspect_deployment_state(
         if !ids.iter().any(|expected| id == expected) || !seen.insert(id.to_owned()) {
             return Err("容器检查结果不完整或重复。".into());
         }
-        if !row
+        let actual_image = row
             .get("Image")
             .and_then(Value::as_str)
-            .is_some_and(|id| image_ids.iter().any(|expected| expected == id))
+            .ok_or("容器镜像 ID 缺失。")?;
+        if actual_image.len() != 71
+            || !actual_image.starts_with("sha256:")
+            || !actual_image[7..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || (!image_ids.is_empty()
+                && !row
+                    .get("Image")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| image_ids.iter().any(|expected| expected == id)))
             || row.get("ConfigImage").and_then(Value::as_str) != Some(reference)
         {
             return Ok(Some(DeploymentState::Failed));
@@ -2636,6 +2775,147 @@ pub fn check_staged_compose(
         .map_err(|_| "无法初始化状态核实环境。".to_owned())?
         .block_on(check_staged_compose_on(
             material, staged, project_id, service, reference, image_ids, &cancel,
+        ))
+}
+
+async fn start_stack_on(
+    material: ConnectionMaterial,
+    staged: &StagedDeployment,
+    project_id: i64,
+    built: &[StackService],
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err("整栈启动已取消。".into());
+    }
+    let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+        .await
+        .map_err(|_| "整栈启动连接超时。")??;
+    let endpoint = local_docker_endpoint(&handle).await?;
+    for image in built {
+        validate_deployment_image_ids(&image.image_ids)?;
+        let inspect = docker_command(
+            &endpoint,
+            &format!(
+                "image inspect --format '{{{{.Id}}}}' {}",
+                shell_quote(&image.reference)?
+            ),
+        );
+        let remote_id = archive_command(&handle, &inspect).await?;
+        if !image.image_ids.iter().any(|id| id == remote_id.trim()) {
+            return Err("远端构建镜像 tag 已变化，禁止启动。".into());
+        }
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("整栈启动已取消。".into());
+    }
+    let command = format!(
+        "{} up -d --no-build --pull missing",
+        stack_command(&endpoint, staged, project_id, built)?
+    );
+    tokio::select! {
+        _ = wait_cancel(cancel) => Err("整栈启动已取消，结果待核实。".into()),
+        result = tokio::time::timeout(Duration::from_secs(10 * 60), command_limited(&handle, &command, 64 * 1024)) =>
+            result.map_err(|_| "整栈启动超时，结果待核实。".to_owned())?
+                .map(|_| ())
+                .map_err(|_| "整栈启动未确认成功，需核实全部服务。".into()),
+    }
+}
+
+pub fn start_staged_stack(
+    host: Host,
+    staged: &StagedDeployment,
+    project_id: i64,
+    built: &[StackService],
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let material = material_for(&host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化整栈部署环境。".to_owned())?
+        .block_on(start_stack_on(material, staged, project_id, built, &cancel))
+}
+
+async fn check_stack_on(
+    material: ConnectionMaterial,
+    staged: &StagedDeployment,
+    project_id: i64,
+    built: &[StackService],
+    services: &[StackService],
+    cancel: &AtomicBool,
+) -> Result<DeploymentState, String> {
+    if services.is_empty() || services.len() > 100 {
+        return Err("整栈服务列表无效。".into());
+    }
+    let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+        .await
+        .map_err(|_| "整栈核实连接超时。")??;
+    let endpoint = local_docker_endpoint(&handle).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let mut pending = false;
+        for service in services {
+            let prefix = stack_command(&endpoint, staged, project_id, built)?;
+            let list = format!(
+                "{prefix} ps -a -q --no-trunc {}",
+                shell_quote(&service.service)?
+            );
+            let output = tokio::time::timeout(
+                Duration::from_secs(15),
+                command_limited(&handle, &list, 8192),
+            )
+            .await
+            .map_err(|_| "整栈容器列表检查超时。")??;
+            let ids: Vec<String> = output.lines().map(str::to_owned).collect();
+            if ids.is_empty() {
+                pending = true;
+                continue;
+            }
+            if ids.len() != 1 {
+                return Ok(DeploymentState::Failed);
+            }
+            let inspect = deployment_inspect_command(&endpoint, &ids)?;
+            let rows = tokio::time::timeout(
+                Duration::from_secs(15),
+                command_limited(&handle, &inspect, 64 * 1024),
+            )
+            .await
+            .map_err(|_| "整栈容器检查超时。")??;
+            match inspect_deployment_state(&rows, &ids, &service.reference, &service.image_ids)? {
+                Some(DeploymentState::Healthy) => {}
+                Some(_) => return Ok(DeploymentState::Failed),
+                None => pending = true,
+            }
+        }
+        if !pending {
+            return Ok(DeploymentState::Healthy);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(DeploymentState::Failed);
+        }
+        tokio::select! {
+            _ = wait_cancel(cancel) => return Err("整栈健康核实已取消，状态待核实。".into()),
+            _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+        }
+    }
+}
+
+pub fn check_staged_stack(
+    host: Host,
+    staged: &StagedDeployment,
+    project_id: i64,
+    built: &[StackService],
+    services: &[StackService],
+    cancel: Arc<AtomicBool>,
+) -> Result<DeploymentState, String> {
+    let material = material_for(&host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化整栈核实环境。".to_owned())?
+        .block_on(check_stack_on(
+            material, staged, project_id, built, services, &cancel,
         ))
 }
 
@@ -2888,6 +3168,67 @@ mod tests {
                 r#"{"services":{"web":{"image":"sample/app:v1","build":"."}}}"#,
                 "web",
                 "sample/app:v1"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn stack_config_requires_each_built_image_and_checks_all_services() {
+        let built = vec![
+            super::StackService {
+                service: "web".into(),
+                reference: "app:v1".into(),
+                image_ids: vec![format!("sha256:{}", "a".repeat(64))],
+            },
+            super::StackService {
+                service: "worker".into(),
+                reference: "worker:v1".into(),
+                image_ids: vec![format!("sha256:{}", "b".repeat(64))],
+            },
+        ];
+        let staged = super::StagedDeployment {
+            directory: "/root/test".into(),
+            compose_files: vec!["compose.yaml".into()],
+            env_path: "/root/test/.env".into(),
+        };
+        let command =
+            super::stack_command("unix:///var/run/docker.sock", &staged, 1, &built).unwrap();
+        assert!(command.contains("DEVINGPANEL_IMAGE_WEB='app:v1'"));
+        assert!(command.contains("DEVINGPANEL_IMAGE_WORKER='worker:v1'"));
+        let config = r#"{"services":{"web":{"image":"app:v1"},"worker":{"image":"worker:v1"},"db":{"image":"postgres:16"}}}"#;
+        assert_eq!(
+            super::verified_stack_config(config, &built).unwrap().len(),
+            3
+        );
+        assert!(
+            super::verified_stack_config(&config.replace("worker:v1", "worker:old"), &built)
+                .is_err()
+        );
+        assert!(
+            super::verified_stack_config(
+                &config.replace(
+                    "\"db\":{\"image\":\"postgres:16\"}",
+                    "\"db\":{\"image\":\"postgres:16\",\"build\":\".\"}"
+                ),
+                &built
+            )
+            .is_err()
+        );
+        assert!(
+            super::verified_stack_config(
+                &config.replace("\"worker\":{\"image\":\"worker:v1\"},", ""),
+                &built
+            )
+            .is_err()
+        );
+        assert!(
+            super::verified_stack_config(
+                &config.replace(
+                    "\"db\":{\"image\":\"postgres:16\"}",
+                    "\"db\":{\"image\":\"postgres:16\",\"profiles\":[\"optional\"]}"
+                ),
+                &built,
             )
             .is_err()
         );

@@ -4607,15 +4607,23 @@ impl AppView {
         let (title, content) = match self.project_tab {
             ProjectTab::Build => (
                 "构建配置",
-                format!(
-                    "镜像：{}  ·  Tag：{}  ·  平台：{}  ·  Dockerfile：{}  ·  Build args：{} 项  ·  部署服务：{}",
-                    project.image,
-                    project.tag_rule,
-                    project.platform,
-                    project.dockerfile,
-                    project.build_args.len(),
-                    project.service
-                ),
+                match crate::project_config::load(std::path::Path::new(&project.path)) {
+                    Ok(manifest) => format!(
+                        "共 {} 个镜像  ·  Tag：{}  ·  {}",
+                        manifest.builds.len(),
+                        manifest.tag_rule,
+                        manifest
+                            .builds
+                            .iter()
+                            .map(|build| format!(
+                                "{}：{}  ·  {}  ·  {}",
+                                build.service, build.image, build.platform, build.dockerfile
+                            ))
+                            .collect::<Vec<_>>()
+                            .join("  /  ")
+                    ),
+                    Err(_) => "配置已变化，请重新读取项目。".into(),
+                },
             ),
             ProjectTab::Compose => (
                 "Compose",

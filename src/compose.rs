@@ -1,3 +1,4 @@
+use crate::project_config;
 use crate::project_store::Project;
 use serde_json::Value;
 use std::fs::File;
@@ -132,7 +133,35 @@ pub fn inspect_summary(project: &Project) -> Result<Vec<ServiceSummary>, String>
         return Ok(Vec::new());
     }
     let raw = config(project)?;
-    validate_portability(&raw, &project.service)?;
+    validate_portability(
+        &raw,
+        if project.manifest_mode {
+            ""
+        } else {
+            &project.service
+        },
+    )?;
+    if project.manifest_mode {
+        let manifest = project_config::load(Path::new(&project.path))?;
+        let services = raw
+            .get("services")
+            .and_then(Value::as_object)
+            .ok_or("Compose 配置中没有服务。")?;
+        for build in manifest.builds {
+            let expected = format!("${{{}}}", project_config::image_variable(&build.service)?);
+            if services
+                .get(&build.service)
+                .and_then(|service| service.get("image"))
+                .and_then(Value::as_str)
+                != Some(expected.as_str())
+            {
+                return Err(format!(
+                    "服务 {} 必须使用 image: {expected}。",
+                    build.service
+                ));
+            }
+        }
+    }
     parse_summary(&raw)
 }
 
@@ -140,7 +169,27 @@ pub fn inspect_services(project: &Project) -> Result<Vec<Service>, String> {
     if project.compose_files.is_empty() {
         return Ok(Vec::new());
     }
-    parse_services(&config(project)?)
+    let raw = config(project)?;
+    let mut services = parse_services(&raw)?;
+    if project.manifest_mode {
+        let manifest = project_config::load(Path::new(&project.path))?;
+        for build in manifest.builds {
+            let expected = format!("${{{}}}", project_config::image_variable(&build.service)?);
+            if let Some(service) = services
+                .iter_mut()
+                .find(|entry| entry.name == build.service)
+            {
+                service.uses_project_image = raw
+                    .pointer(&format!("/services/{}/image", build.service))
+                    .and_then(Value::as_str)
+                    == Some(expected.as_str())
+                    && raw
+                        .pointer(&format!("/services/{}/build", build.service))
+                        .is_none();
+            }
+        }
+    }
+    Ok(services)
 }
 
 fn validate_portability(raw: &Value, target_service: &str) -> Result<(), String> {
@@ -157,16 +206,6 @@ fn validate_portability(raw: &Value, target_service: &str) -> Result<(), String>
     {
         return Err("部署服务必须精确使用 image: ${DEVINGPANEL_IMAGE}。".into());
     }
-    if let Some(target) = services.get(target_service)
-        && (target
-            .get("scale")
-            .is_some_and(|value| value.as_u64() != Some(1))
-            || target
-                .pointer("/deploy/replicas")
-                .is_some_and(|value| value.as_u64() != Some(1)))
-    {
-        return Err("当前仅支持部署服务的单个容器副本。".into());
-    }
     if raw.get("include").is_some() {
         return Err("暂不支持 Compose include。".into());
     }
@@ -179,7 +218,25 @@ fn validate_portability(raw: &Value, target_service: &str) -> Result<(), String>
             return Err("暂不支持本地文件型 configs/secrets。".into());
         }
     }
-    for service in services.values() {
+    for (name, service) in services {
+        if target_service.is_empty()
+            && service
+                .get("profiles")
+                .and_then(Value::as_array)
+                .is_some_and(|profiles| !profiles.is_empty())
+        {
+            return Err("整栈发布暂不支持 Compose profiles。".into());
+        }
+        if (target_service.is_empty() || name == target_service)
+            && (service
+                .get("scale")
+                .is_some_and(|value| value.as_u64() != Some(1))
+                || service
+                    .pointer("/deploy/replicas")
+                    .is_some_and(|value| value.as_u64() != Some(1)))
+        {
+            return Err("当前仅支持每个 Compose 服务的单个容器副本。".into());
+        }
         if service.get("build").is_some_and(|build| !build.is_null()) {
             return Err("所有远端服务都不能包含 build。".into());
         }
@@ -254,6 +311,11 @@ fn config(project: &Project) -> Result<Value, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     command.env_remove("DEVINGPANEL_IMAGE");
+    if project.manifest_mode {
+        for build in project_config::load(Path::new(&project.path))?.builds {
+            command.env_remove(project_config::image_variable(&build.service)?);
+        }
+    }
     let mut child = command
         .spawn()
         .map_err(|_| "本地 Docker Compose 不可用。".to_owned())?;
@@ -477,6 +539,13 @@ mod tests {
         let mut modified = base.clone();
         modified["services"]["web"]["deploy"] = json!({"replicas": 2});
         assert!(validate_portability(&modified, "web").is_err());
+        let mut modified = base.clone();
+        modified["services"]["worker"]["deploy"] = json!({"replicas": 2});
+        assert!(validate_portability(&modified, "web").is_ok());
+        assert!(validate_portability(&modified, "").is_err());
+        let mut modified = base.clone();
+        modified["services"]["worker"]["profiles"] = json!(["optional"]);
+        assert!(validate_portability(&modified, "").is_err());
         let mut modified = base.clone();
         modified["services"]["worker"]
             .as_object_mut()

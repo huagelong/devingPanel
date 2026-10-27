@@ -10,6 +10,7 @@ mod project_store;
 mod release;
 mod release_store;
 mod ssh;
+mod stack_release;
 mod ui;
 
 use gpui_kit::*;
