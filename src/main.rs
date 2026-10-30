@@ -1,3 +1,4 @@
+mod batch_store;
 mod build;
 mod compose;
 mod database;
@@ -11,6 +12,8 @@ mod release;
 mod release_archive;
 mod release_materials;
 mod release_store;
+mod rollback;
+mod rollback_store;
 mod ssh;
 mod stack_release;
 mod ui;

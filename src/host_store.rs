@@ -64,7 +64,7 @@ pub(crate) fn with_credential_lock<T>(
     operation()
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Host {
     pub id: i64,
     pub name: String,
@@ -416,6 +416,7 @@ fn cleanup_deleting_with(
     let mut failed = 0;
     for (id, credential_id) in deleting {
         if !matches!(unresolved_host_tasks(conn, id), Ok(0))
+            || !matches!(completed_host_tasks(conn, id), Ok(0))
             || delete(&credential_id).is_err()
             || finalize_host_deletion(conn, id).is_err()
         {
@@ -427,7 +428,8 @@ fn cleanup_deleting_with(
 
 fn finalize_host_deletion(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     let transaction = conn.unchecked_transaction()?;
-    if unresolved_host_tasks(&transaction, id)? != 0 {
+    if unresolved_host_tasks(&transaction, id)? != 0 || completed_host_tasks(&transaction, id)? != 0
+    {
         return Err(rusqlite::Error::InvalidQuery);
     }
     env_store::queue_for_host(&transaction, id)?;
@@ -437,9 +439,22 @@ fn finalize_host_deletion(conn: &Connection, id: i64) -> rusqlite::Result<()> {
 
 fn unresolved_host_tasks(conn: &Connection, id: i64) -> rusqlite::Result<i64> {
     conn.query_row(
-        "SELECT COUNT(*) FROM release_tasks WHERE host_id = ?1 AND outcome IN ('running', 'unknown', 'blocked')",
+        "SELECT (SELECT COUNT(*) FROM release_tasks WHERE host_id = ?1 AND outcome IN ('running', 'unknown', 'blocked'))
+              + (SELECT COUNT(*) FROM rollback_tasks r JOIN release_tasks source
+                 ON source.id = r.source_task_id WHERE source.host_id = ?1
+                 AND r.outcome IN ('running', 'unknown', 'blocked'))
+              + (SELECT COUNT(*) FROM release_batch_targets t JOIN release_batches b
+                 ON b.id = t.batch_id WHERE t.host_id = ?1
+                 AND b.state IN ('prepared', 'building', 'ready', 'running', 'paused', 'unknown'))",
         [id],
         |row| row.get(0),
+    )
+}
+
+fn completed_host_tasks(conn: &Connection, id: i64) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM release_tasks WHERE host_id = ?1 AND outcome = 'complete' AND health_result = 'healthy'",
+        [id], |row| row.get(0),
     )
 }
 
@@ -540,6 +555,25 @@ fn update_in(
         .map_err(|err| err.to_string())?;
     if unresolved_host_tasks(&transaction, id).map_err(|err| err.to_string())? != 0 {
         return Err("主机有未核实的发布任务，不能修改连接配置。".into());
+    }
+    if completed_host_tasks(&transaction, id).map_err(|err| err.to_string())? != 0 {
+        let old: (String, u16, String, String) = transaction
+            .query_row(
+                "SELECT address, port, username, auth FROM hosts WHERE id = ?1 AND deleting = 0",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|_| "主机不存在。")?;
+        if old
+            != (
+                input.address.clone(),
+                port,
+                input.username.clone(),
+                input.auth.clone(),
+            )
+        {
+            return Err("主机有已完成的受保护版本，不能更改连接目标。".into());
+        }
     }
     let conflicts: bool = transaction
         .query_row(
@@ -651,8 +685,10 @@ fn delete_in(
             |row| row.get(0),
         )
         .map_err(|_| "主机不存在。")?;
-    if unresolved_host_tasks(&transaction, id).map_err(|err| err.to_string())? != 0 {
-        return Err("主机有未核实的发布任务，不能删除或清理凭据。".into());
+    if unresolved_host_tasks(&transaction, id).map_err(|err| err.to_string())? != 0
+        || completed_host_tasks(&transaction, id).map_err(|err| err.to_string())? != 0
+    {
+        return Err("主机有未核实任务或已完成的受保护版本，不能删除或清理凭据。".into());
     }
     transaction
         .execute("UPDATE hosts SET deleting = 1 WHERE id = ?1", [id])
@@ -727,6 +763,35 @@ mod tests {
             })
             .unwrap();
         assert_eq!(deleting, 0);
+        conn.execute(
+            "UPDATE release_tasks SET outcome = 'failed' WHERE id = 'task'",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE release_tasks SET phase = 'checked', outcome = 'complete', health_result = 'healthy' WHERE id = 'task'", []).unwrap();
+        assert!(
+            delete_in(&conn, 2, |_| panic!(
+                "completed history must keep credential"
+            ))
+            .is_err()
+        );
+        assert!(
+            update_in(
+                &conn,
+                2,
+                HostUpdate {
+                    name: "web".into(),
+                    address: "203.0.113.11".into(),
+                    port: "22".into(),
+                    username: "root".into(),
+                    group: "prod".into(),
+                    auth: "password".into(),
+                    credential: None,
+                },
+                None
+            )
+            .is_err()
+        );
         conn.execute(
             "UPDATE release_tasks SET outcome = 'failed' WHERE id = 'task'",
             [],

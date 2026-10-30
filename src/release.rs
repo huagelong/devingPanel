@@ -142,13 +142,6 @@ pub fn plan_images(
     if !project_store::valid_image_name(&project.image) {
         return Err("项目镜像名无效。".into());
     }
-    if targets.is_empty() {
-        return Err("请先核对目标主机架构。".into());
-    }
-    let platforms = targets
-        .iter()
-        .map(|(_, platform)| platform.as_str())
-        .collect::<BTreeSet<_>>();
     let builds = if project.manifest_mode {
         project_config::load(Path::new(&project.path))?
             .builds
@@ -158,6 +151,36 @@ pub fn plan_images(
     } else {
         vec![(project.image.clone(), project.platform.clone())]
     };
+    plan_build_images(builds, base_tag, targets)
+}
+
+pub(crate) fn plan_manifest_images(
+    manifest: &project_config::Manifest,
+    base_tag: &str,
+    targets: &[(i64, String)],
+) -> Result<Vec<PlannedImage>, String> {
+    plan_build_images(
+        manifest
+            .builds
+            .iter()
+            .map(|build| (build.image.clone(), build.platform.clone())),
+        base_tag,
+        targets,
+    )
+}
+
+fn plan_build_images(
+    builds: impl IntoIterator<Item = (String, String)>,
+    base_tag: &str,
+    targets: &[(i64, String)],
+) -> Result<Vec<PlannedImage>, String> {
+    if targets.is_empty() {
+        return Err("请先核对目标主机架构。".into());
+    }
+    let platforms = targets
+        .iter()
+        .map(|(_, platform)| platform.as_str())
+        .collect::<BTreeSet<_>>();
     let mut planned = Vec::new();
     for (image, requested_platform) in builds {
         if !project_store::valid_image_name(&image) {
@@ -199,7 +222,12 @@ pub fn check_image_tags(
     targets: &[(i64, String)],
 ) -> Result<Vec<PlannedImage>, String> {
     let planned = plan_images(project, base_tag, targets)?;
-    for image in &planned {
+    check_planned_tags(&planned)?;
+    Ok(planned)
+}
+
+pub(crate) fn check_planned_tags(planned: &[PlannedImage]) -> Result<(), String> {
+    for image in planned {
         if docker::image_reference_exists(&image.reference)? {
             return Err(format!(
                 "本地镜像 tag 已存在：{}；请更换发布标识。",
@@ -207,7 +235,7 @@ pub fn check_image_tags(
             ));
         }
     }
-    Ok(planned)
+    Ok(())
 }
 
 fn verify_transfer(archive: &SavedArchive, uploaded: &ssh::UploadedArchive) -> Result<(), String> {
@@ -411,7 +439,7 @@ pub fn run_single_host_until_checked(
 ) -> Result<String, String> {
     let _release_guard = release_materials::acquire_guard(project_id)?;
     if project_store::effective(project_id)?.manifest_mode {
-        return crate::stack_release::run(project_id, host_id, base_tag, cancel, on_event);
+        return crate::stack_release::run(project_id, host_id, base_tag, None, cancel, on_event);
     }
     let (project, host, image, digest) =
         prepare_single_host(project_id, host_id, base_tag, cancel.clone())?;
@@ -647,6 +675,28 @@ pub fn run_single_host_until_checked(
     Ok(id)
 }
 
+pub fn run_single_host_confirmed(
+    project_id: i64,
+    host_id: i64,
+    base_tag: &str,
+    confirmed_digest: &str,
+    cancel: Arc<AtomicBool>,
+    on_event: impl FnMut(&str),
+) -> Result<String, String> {
+    let _release_guard = release_materials::acquire_guard(project_id)?;
+    if !project_store::effective(project_id)?.manifest_mode {
+        return Err("GUI 仅支持 YAML v2 发布。".into());
+    }
+    crate::stack_release::run(
+        project_id,
+        host_id,
+        base_tag,
+        Some(confirmed_digest),
+        cancel,
+        on_event,
+    )
+}
+
 pub fn observe_task(
     id: &str,
 ) -> Result<(release_store::TaskSnapshot, ssh::ReleaseObservation), String> {
@@ -659,6 +709,63 @@ pub fn observe_task_images(id: &str) -> Result<Vec<(String, bool)>, String> {
     let task = release_store::get_task(id)?;
     let images = release_store::historical_images(id)?;
     ssh::observe_historical_images(&task, &images)
+}
+
+pub struct CurrentVersionCheck {
+    pub matched_task_id: Option<String>,
+    pub containers: usize,
+    pub running_containers: usize,
+    pub all_healthy: bool,
+}
+
+fn matches_completed_services(
+    expected: &[release_store::ConfirmedService],
+    observed: &[ssh::ObservedContainer],
+) -> bool {
+    !expected.is_empty()
+        && expected.len() == observed.len()
+        && expected.iter().all(|service| {
+            observed
+                .iter()
+                .filter(|container| {
+                    container.service == service.service
+                        && container.status == "running"
+                        && container.config_image == service.reference
+                        && container.image_id == service.image_id
+                })
+                .count()
+                == 1
+        })
+}
+
+pub fn inspect_current_version(id: &str) -> Result<CurrentVersionCheck, String> {
+    let task = release_store::get_task(id)?;
+    let candidates = release_store::completed_versions_for(&task)?;
+    let observation = ssh::observe_release_project(&task)?;
+    let mut matched_task_id = None;
+    for candidate in candidates {
+        let services = release_store::confirmed_services(&candidate.id)?;
+        if matches_completed_services(&services, &observation.containers) {
+            if matched_task_id.is_some() {
+                return Err("远端容器同时匹配多条已完成版本，不能判定当前版本。".into());
+            }
+            matched_task_id = Some(candidate.id);
+        }
+    }
+    Ok(CurrentVersionCheck {
+        matched_task_id,
+        containers: observation.containers.len(),
+        running_containers: observation
+            .containers
+            .iter()
+            .filter(|item| item.status == "running")
+            .count(),
+        all_healthy: !observation.containers.is_empty()
+            && observation
+                .containers
+                .iter()
+                .all(|item| item.status == "running" && item.health.as_deref() == Some("healthy")),
+    })
 }
 
 pub struct PreviousVersionCheck {
@@ -704,6 +811,29 @@ pub fn confirm_absent_and_close(id: &str) -> Result<(), String> {
     release_store::resolve_absent(&task)
 }
 
+pub fn confirm_predeploy_unchanged(id: &str) -> Result<usize, String> {
+    let task = release_store::get_unresolved(id)?;
+    if task.phase != "uploading" || task.outcome != "unknown" {
+        return Err("仅上传结果不明、尚未进入镜像加载的任务可按旧版本关闭。".into());
+    }
+    let _guard = release_materials::acquire_guard(task.project_id)?;
+    let previous = release_store::current_completed_for(&task)?;
+    let snapshot = release_materials::load(&previous.id)?;
+    let images = release_store::historical_images(&previous.id)?;
+    let observed = ssh::verify_running_config_hashes(&previous, &snapshot, &images)?;
+    let expected = release_store::confirmed_services(&previous.id)?;
+    if !matches_completed_services(&expected, &observed.containers)
+        || observed
+            .containers
+            .iter()
+            .any(|item| item.health.as_deref() != Some("healthy"))
+    {
+        return Err("远端并非完整健康的已确认旧版本；仍保持阻断。".into());
+    }
+    release_store::resolve_predeploy_unchanged(&task, &previous.id, &observed.containers)?;
+    Ok(observed.containers.len())
+}
+
 pub fn confirm_healthy_and_complete(id: &str) -> Result<usize, String> {
     let task = release_store::get_unresolved(id)?;
     let _guard = release_materials::acquire_guard(task.project_id)?;
@@ -713,6 +843,64 @@ pub fn confirm_healthy_and_complete(id: &str) -> Result<usize, String> {
     {
         return Err("仅新任务的整栈健康结果可人工确认完成。".into());
     }
+    let observation = verify_healthy_release(&task)?;
+    release_store::complete_checked(&task, &observation)?;
+    Ok(observation.len())
+}
+
+pub struct UnknownUploadInspection {
+    pub archives: Vec<ssh::RemoteArchiveObservation>,
+    pub containers: Vec<ssh::ObservedContainer>,
+}
+
+pub fn inspect_unknown_upload(id: &str) -> Result<UnknownUploadInspection, String> {
+    let task = release_store::get_task(id)?;
+    if task.phase != "uploading" || task.outcome != "unknown" {
+        return Err("仅上传结果不明的任务可核实远端临时归档。".into());
+    }
+    let records = release_store::uploaded_archives(id)?;
+    let archives = if records.is_empty() {
+        Vec::new()
+    } else {
+        ssh::inspect_uploaded_archives(&task, &records)?
+    };
+    let containers = ssh::observe_release_project(&task)?.containers;
+    let current = release_store::get_task(id)?;
+    if current.phase != task.phase
+        || current.outcome != task.outcome
+        || current.host != task.host
+        || current.docker_endpoint != task.docker_endpoint
+        || current.docker_daemon_id != task.docker_daemon_id
+    {
+        return Err("核实期间任务或目标身份已变化，请重新读取。".into());
+    }
+    Ok(UnknownUploadInspection {
+        archives,
+        containers,
+    })
+}
+
+pub fn reconcile_interrupted_health(id: &str) -> Result<usize, String> {
+    let task = release_store::get_unresolved(id)?;
+    let _guard = release_materials::acquire_guard(task.project_id)?;
+    let eligible = (task.phase == "checking"
+        && matches!(task.outcome.as_str(), "unknown" | "running"))
+        || (task.phase == "deploying" && task.outcome == "unknown");
+    if !eligible || task.health_result.is_some() {
+        return Err("仅启动或健康结果不明的任务可人工只读恢复。".into());
+    }
+    if task.phase == "deploying" {
+        ssh::verify_start_completed(&task)?;
+    }
+    let observation = verify_healthy_release(&task)?;
+    release_store::reconcile_healthy(&task, &observation)?;
+    Ok(observation.len())
+}
+
+fn verify_healthy_release(
+    task: &release_store::TaskSnapshot,
+) -> Result<Vec<ssh::ObservedContainer>, String> {
+    let id = &task.id;
     let snapshot = release_materials::load(id)?;
     if snapshot.compose_files.is_empty() {
         return Err("当次 Compose 快照不完整。".into());
@@ -722,17 +910,16 @@ pub fn confirm_healthy_and_complete(id: &str) -> Result<usize, String> {
     for image in &built {
         crate::release_archive::verify(id, &image.service)?;
     }
-    ssh::verify_staged_materials(&task, &snapshot)?;
-    let remote_images = ssh::observe_historical_images(&task, &built)?;
+    ssh::verify_staged_materials(task, &snapshot)?;
+    let remote_images = ssh::observe_historical_images(task, &built)?;
     if remote_images.len() != built.len() || remote_images.iter().any(|(_, available)| !available) {
         return Err("远端自有镜像缺失或已变化，未确认完成。".into());
     }
-    let observation = ssh::observe_release_project(&task)?;
+    let observation = ssh::observe_release_project(task)?;
     if !matching_healthy_services(&services, &observation.containers) {
         return Err("远端整栈服务数量、镜像或健康状态与当次计划不符。".into());
     }
-    release_store::complete_checked(&task, &observation.containers)?;
-    Ok(observation.containers.len())
+    Ok(observation.containers)
 }
 
 fn matching_healthy_services(
@@ -762,13 +949,99 @@ fn matching_healthy_services(
 mod tests {
     use super::{
         check_project_config, checked_platform, deployment_files, finish_transfer,
-        matching_healthy_services, plan_images, source_digest, verify_transfer,
+        matches_completed_services, matching_healthy_services, plan_images, source_digest,
+        verify_transfer,
     };
     use crate::build::SavedArchive;
     use crate::project_store::Project;
-    use crate::release_store::PlannedService;
+    use crate::release_store::{ConfirmedService, PlannedService};
     use crate::ssh::ObservedContainer;
     use crate::ssh::TestResult;
+
+    fn isolated_series_data_dir() -> std::path::PathBuf {
+        let root = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        assert_eq!(root.parent(), Some(temp.as_path()));
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("devingpanel-v20-series-")
+        );
+        let data = root.join("devingPanel").canonicalize().unwrap();
+        assert_eq!(data.parent(), Some(root.as_path()));
+        assert!(data.join("state.sqlite3").is_file());
+        assert!(
+            !std::fs::symlink_metadata(data.join("state.sqlite3"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        data
+    }
+
+    fn create_isolated_stack_project() -> Project {
+        let data = isolated_series_data_dir();
+        let sentinel = 1_000_000_000_i64 + (uuid::Uuid::new_v4().as_u128() % 1_000_000_000) as i64;
+        crate::database::connect().unwrap().execute(
+            "INSERT INTO projects (id, name, path, dockerfile, image) VALUES (?1, ?2, ?3, 'Dockerfile', 'reserved')",
+            rusqlite::params![sentinel, format!("reserved-smoke-{sentinel}"), data.join(format!("reserved-{sentinel}")).to_string_lossy()],
+        ).unwrap();
+        let source =
+            std::path::PathBuf::from(std::env::var("DEVINGPANEL_TEST_STACK_FIXTURE").unwrap());
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let name = format!("stack-series-{}", &suffix[..12]);
+        let path = data.join(&name);
+        std::fs::create_dir(&path).unwrap();
+        for file in [
+            "compose.yaml",
+            "Dockerfile.web",
+            "Dockerfile.worker",
+            "probe-web.txt",
+            "probe-worker.txt",
+        ] {
+            std::fs::copy(source.join(file), path.join(file)).unwrap();
+        }
+        let manifest = std::fs::read_to_string(source.join("devingpanel.yaml"))
+            .unwrap()
+            .replace("stack-v2-success", &name);
+        std::fs::write(path.join("devingpanel.yaml"), manifest).unwrap();
+        let project = crate::project_store::create_from_manifest(&path).unwrap();
+        assert!(project.id > 1_000_000_000);
+        let host_id = *project.host_ids.first().unwrap();
+        let host = crate::host_store::list()
+            .unwrap()
+            .0
+            .into_iter()
+            .find(|host| host.id == host_id)
+            .unwrap();
+        let (endpoint, daemon_id) = crate::ssh::docker_identity_for_host(host.clone()).unwrap();
+        let probe = crate::release_store::TaskSnapshot {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project.id,
+            project_name: project.name.clone(),
+            host,
+            docker_endpoint: Some(endpoint),
+            docker_daemon_id: Some(daemon_id),
+            phase: "prepared".into(),
+            outcome: "running".into(),
+            health_result: None,
+            detail: String::new(),
+            started_at: String::new(),
+            execution_finished_at: None,
+            image_reference: String::new(),
+        };
+        crate::ssh::assert_empty_project_namespace(&probe).unwrap();
+        assert!(
+            crate::ssh::observe_release_project(&probe)
+                .unwrap()
+                .containers
+                .is_empty()
+        );
+        project
+    }
 
     fn project() -> Project {
         Project {
@@ -833,28 +1106,55 @@ mod tests {
     }
 
     #[test]
+    fn current_version_requires_exact_container_images_not_latest_task_order() {
+        let expected = vec![
+            ConfirmedService {
+                service: "web".into(),
+                reference: "app:v1".into(),
+                image_id: format!("sha256:{}", "a".repeat(64)),
+            },
+            ConfirmedService {
+                service: "db".into(),
+                reference: "postgres:16".into(),
+                image_id: format!("sha256:{}", "b".repeat(64)),
+            },
+        ];
+        let observed = vec![
+            ObservedContainer {
+                service: "web".into(),
+                status: "running".into(),
+                health: Some("healthy".into()),
+                image_id: expected[0].image_id.clone(),
+                config_image: expected[0].reference.clone(),
+            },
+            ObservedContainer {
+                service: "db".into(),
+                status: "running".into(),
+                health: Some("healthy".into()),
+                image_id: expected[1].image_id.clone(),
+                config_image: expected[1].reference.clone(),
+            },
+        ];
+        assert!(matches_completed_services(&expected, &observed));
+        let mut partial = observed.clone();
+        partial[0].image_id = format!("sha256:{}", "c".repeat(64));
+        assert!(!matches_completed_services(&expected, &partial));
+        partial = observed.clone();
+        partial[1].config_image = "postgres:17".into();
+        assert!(!matches_completed_services(&expected, &partial));
+        assert!(!matches_completed_services(&expected, &observed[..1]));
+        partial = observed.clone();
+        partial[0].status = "exited".into();
+        assert!(!matches_completed_services(&expected, &partial));
+        partial = observed.clone();
+        partial[1].service = "web".into();
+        assert!(!matches_completed_services(&expected, &partial));
+    }
+
+    #[test]
     #[ignore = "requires isolated APPDATA database copy, trusted VPS credential and local Docker; creates an isolated remote stack"]
     fn real_two_version_stack_release_and_completion() {
-        let source =
-            std::path::PathBuf::from(std::env::var("DEVINGPANEL_TEST_STACK_FIXTURE").unwrap());
-        let suffix = uuid::Uuid::new_v4().simple().to_string();
-        let name = format!("stack-series-{}", &suffix[..12]);
-        let path = crate::preferences::data_dir().unwrap().join(&name);
-        std::fs::create_dir(&path).unwrap();
-        for file in [
-            "compose.yaml",
-            "Dockerfile.web",
-            "Dockerfile.worker",
-            "probe-web.txt",
-            "probe-worker.txt",
-        ] {
-            std::fs::copy(source.join(file), path.join(file)).unwrap();
-        }
-        let manifest = std::fs::read_to_string(source.join("devingpanel.yaml"))
-            .unwrap()
-            .replace("stack-v2-success", &name);
-        std::fs::write(path.join("devingpanel.yaml"), manifest).unwrap();
-        let project = crate::project_store::create_from_manifest(&path).unwrap();
+        let project = create_isolated_stack_project();
         let host_id = *project
             .host_ids
             .first()
@@ -865,32 +1165,14 @@ mod tests {
             .into_iter()
             .find(|host| host.id == host_id)
             .unwrap();
-        let (endpoint, daemon_id) = crate::ssh::docker_identity_for_host(host.clone()).unwrap();
-        let probe = crate::release_store::TaskSnapshot {
-            id: uuid::Uuid::new_v4().to_string(),
-            project_id: project.id,
-            project_name: project.name.clone(),
-            host,
-            docker_endpoint: Some(endpoint),
-            docker_daemon_id: Some(daemon_id),
-            phase: "prepared".into(),
-            outcome: "running".into(),
-            health_result: None,
-            detail: String::new(),
-            started_at: String::new(),
-        };
-        assert!(
-            crate::ssh::observe_release_project(&probe)
-                .unwrap()
-                .containers
-                .is_empty(),
-            "refusing to use an existing remote Compose project"
-        );
+        assert_eq!(host.id, host_id);
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let first = super::run_single_host_until_checked(
+        let confirmed_digest = super::source_digest(&project).unwrap();
+        let first = super::run_single_host_confirmed(
             project.id,
             host_id,
             &format!("smoke{}", uuid::Uuid::new_v4().simple()),
+            &confirmed_digest,
             cancel.clone(),
             |_| {},
         )
@@ -907,10 +1189,11 @@ mod tests {
             crate::release_store::get_task(&first).unwrap().outcome,
             "complete"
         );
-        let second = super::run_single_host_until_checked(
+        let second = super::run_single_host_confirmed(
             project.id,
             host_id,
             &format!("smoke{}", uuid::Uuid::new_v4().simple()),
+            &confirmed_digest,
             cancel,
             |_| {},
         )
@@ -924,23 +1207,363 @@ mod tests {
             crate::release_store::get_task(&second).unwrap().outcome,
             "complete"
         );
+        if std::env::var("DEVINGPANEL_TEST_FORCE_MISSING_TARGET_TAGS").as_deref() == Ok("1") {
+            let source = crate::release_store::get_task(&second).unwrap();
+            let target = crate::release_store::get_task(&first).unwrap();
+            let images = crate::release_store::historical_images(&first).unwrap();
+            crate::ssh::remove_isolated_target_image_tags(&source, &target, &images).unwrap();
+        }
+        let interrupted =
+            std::env::var("DEVINGPANEL_TEST_INTERRUPT_ROLLBACK_CHECK").as_deref() == Ok("1");
+        let preview = crate::rollback::preview(&second).unwrap();
+        assert_eq!(preview.target_id, first);
+        assert_eq!(preview.observed.len(), 4);
+        let result = crate::rollback::run_confirmed(
+            &second,
+            Some(&preview.target_id),
+            Some(&preview.observed),
+            Some(&preview.missing_images),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |event| {
+                if interrupted && event == "核对恢复后的全部服务健康状态" {
+                    crate::ssh::inject_next_stack_check_disconnect(project.id);
+                }
+            },
+        );
+        let rollback_id = if interrupted {
+            assert!(result.unwrap_err().contains("SSH 连接中断"));
+            let pending = crate::rollback_store::recent(Some(project.id)).unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                (pending[0].phase.as_str(), pending[0].outcome.as_str()),
+                ("checking", "unknown")
+            );
+            let current: String = crate::database::connect()
+                .unwrap()
+                .query_row(
+                    "SELECT task_id FROM project_current_version WHERE project_id = ?1",
+                    [project.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(current, second);
+            let source = crate::release_store::get_task(&second).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                let remote = crate::ssh::observe_release_project(&source).unwrap();
+                if remote.containers.len() == 4
+                    && remote.containers.iter().all(|item| {
+                        item.status == "running" && item.health.as_deref() == Some("healthy")
+                    })
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "restored stack never became healthy"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            }
+            assert_eq!(crate::rollback::reconcile(&pending[0].id).unwrap(), 4);
+            let audit: i64 = crate::database::connect().unwrap().query_row(
+                "SELECT observed_containers FROM rollback_reconciliations WHERE rollback_id = ?1",
+                [&pending[0].id], |row| row.get(0)).unwrap();
+            assert_eq!(audit, 4);
+            pending[0].id.clone()
+        } else {
+            result.unwrap()
+        };
+        let conn = crate::database::connect().unwrap();
+        let (outcome, target): (String, String) = conn
+            .query_row(
+                "SELECT outcome, target_task_id FROM rollback_tasks WHERE id = ?1",
+                [&rollback_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (outcome.as_str(), target.as_str()),
+            ("complete", first.as_str())
+        );
+        assert_eq!(
+            super::inspect_current_version(&second)
+                .unwrap()
+                .matched_task_id
+                .as_deref(),
+            Some(first.as_str())
+        );
+    }
+
+    #[test]
+    #[ignore = "read-only SSH observation of an explicit high-ID project in an isolated APPDATA copy"]
+    fn real_isolated_series_observation() {
+        let _data = isolated_series_data_dir();
+        let project_id: i64 = std::env::var("DEVINGPANEL_TEST_SERIES_PROJECT_ID")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(project_id > 1_000_000_000);
+        let tasks = crate::release_store::recent(Some(project_id)).unwrap();
+        assert!(!tasks.is_empty());
+        let current = super::inspect_current_version(&tasks[0].id).unwrap();
+        eprintln!(
+            "matched completed version {:?}, all healthy {}",
+            current.matched_task_id, current.all_healthy
+        );
+        let retention = crate::release_store::retention_plan(project_id).unwrap();
+        assert!(!retention.unresolved);
+        assert_eq!(retention.entries.iter().filter(|entry| entry.class == crate::release_store::RetentionClass::LatestCompleted).count(), 1);
+        assert_eq!(
+            retention
+                .entries
+                .iter()
+                .find(|entry| entry.class == crate::release_store::RetentionClass::LatestCompleted)
+                .unwrap()
+                .task_id,
+            current.matched_task_id.as_ref().unwrap().as_str()
+        );
+        let local_archives = crate::release_archive::preview_local_reclaim(project_id).unwrap();
+        assert!(!local_archives.blocked);
+        if project_id == 1_210_048_068 {
+            assert!(local_archives.unavailable.is_empty());
+            assert_eq!(local_archives.candidates.len(), 2);
+            let candidate_ids = local_archives
+                .candidates
+                .iter()
+                .map(|entry| entry.task_id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(
+                candidate_ids,
+                std::collections::HashSet::from([
+                    "adaf8c60-f460-4f1d-9da6-1225c5fad7b7",
+                    "ba6717cf-7d58-488a-8a31-9393bd3df38c",
+                ])
+            );
+            assert!(
+                local_archives
+                    .candidates
+                    .iter()
+                    .all(|entry| entry.services == 2 && entry.verified_bytes > 0)
+            );
+        }
+        assert!(
+            local_archives
+                .candidates
+                .iter()
+                .all(|entry| Some(&entry.task_id) != current.matched_task_id.as_ref())
+        );
+        eprintln!(
+            "verified historical local archives: {} candidates, {} unavailable",
+            local_archives.candidates.len(),
+            local_archives.unavailable.len()
+        );
+        let completed = crate::release_store::current_completed_for(&tasks[0]).unwrap();
+        let snapshot = crate::release_materials::load(&completed.id).unwrap();
+        let images = crate::release_store::historical_images(&completed.id).unwrap();
+        crate::ssh::verify_running_config_hashes(&completed, &snapshot, &images).unwrap();
+        eprintln!("historical Compose hashes match current containers");
+        for task in tasks {
+            assert_eq!(task.project_id, project_id);
+            let observed = crate::ssh::observe_release_project(&task).unwrap();
+            eprintln!(
+                "task {} {} / {}: {} containers",
+                task.id,
+                task.phase,
+                task.outcome,
+                observed.containers.len()
+            );
+            for container in observed.containers {
+                eprintln!(
+                    "{} {} {:?}",
+                    container.service, container.status, container.health
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires explicit isolated high-ID VPS project with uploading/unknown and healthy prior version"]
+    fn real_close_predeploy_unknown_without_remote_changes() {
+        let _data = isolated_series_data_dir();
+        let project_id: i64 = std::env::var("DEVINGPANEL_TEST_SERIES_PROJECT_ID")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(project_id > 1_000_000_000);
+        let tasks = crate::release_store::recent(Some(project_id)).unwrap();
+        let pending = tasks
+            .iter()
+            .find(|task| task.phase == "uploading" && task.outcome == "unknown")
+            .expect("must select only the isolated unknown upload");
+        let before = super::inspect_current_version(&pending.id).unwrap();
+        assert_eq!(before.containers, 4);
+        assert!(before.all_healthy);
+        let previous_id = before
+            .matched_task_id
+            .expect("must match one completed version");
+        assert_eq!(super::confirm_predeploy_unchanged(&pending.id).unwrap(), 4);
+        let resolved = crate::release_store::get_task(&pending.id).unwrap();
+        assert_eq!(
+            (resolved.phase.as_str(), resolved.outcome.as_str()),
+            ("checked", "failed")
+        );
+        let audit: (String, i64) = crate::database::connect().unwrap().query_row(
+            "SELECT decision, observed_containers FROM release_task_resolutions WHERE task_id = ?1",
+            [&pending.id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(audit, ("confirmed_previous_running_predeploy".into(), 4));
+        let after = super::inspect_current_version(&pending.id).unwrap();
+        assert_eq!(after.matched_task_id.as_deref(), Some(previous_id.as_str()));
+        assert!(after.all_healthy);
+    }
+
+    #[test]
+    #[ignore = "one-shot isolated VPS release and confirmed rollback after manual upload resolution"]
+    fn real_resume_after_predeploy_close_and_rollback() {
+        let data = isolated_series_data_dir();
+        let project_id: i64 = std::env::var("DEVINGPANEL_TEST_SERIES_PROJECT_ID")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(project_id > 1_000_000_000);
+        let project = crate::project_store::effective(project_id).unwrap();
+        assert!(project.manifest_mode && project.name.starts_with("stack-series-"));
+        assert!(
+            std::path::Path::new(&project.path)
+                .canonicalize()
+                .unwrap()
+                .starts_with(&data)
+        );
+        assert_eq!(project.host_ids.len(), 1);
+        let tasks = crate::release_store::recent(Some(project_id)).unwrap();
+        let first = tasks
+            .iter()
+            .find(|task| {
+                task.outcome == "complete" && task.health_result.as_deref() == Some("healthy")
+            })
+            .expect("prior healthy version required");
+        assert!(tasks.iter().any(|task| task.phase == "checked"
+            && task.outcome == "failed"
+            && task.detail.contains("上传中断任务关闭")));
+        let first_id = first.id.clone();
+        let current = super::inspect_current_version(&first_id).unwrap();
+        assert_eq!(current.matched_task_id.as_deref(), Some(first_id.as_str()));
+        assert!(current.all_healthy);
+        let digest = super::source_digest(&project).unwrap();
+        let second = super::run_single_host_confirmed(
+            project_id,
+            project.host_ids[0],
+            &format!("smoke{}", uuid::Uuid::new_v4().simple()),
+            &digest,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(super::confirm_healthy_and_complete(&second).unwrap(), 4);
+        let preview = crate::rollback::preview(&second).unwrap();
+        assert_eq!(preview.target_id, first_id);
+        let rollback_id = crate::rollback::run_confirmed(
+            &second,
+            Some(&preview.target_id),
+            Some(&preview.observed),
+            Some(&preview.missing_images),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            crate::rollback_store::get(&rollback_id).unwrap().outcome,
+            "complete"
+        );
+        let after = super::inspect_current_version(&second).unwrap();
+        assert_eq!(after.matched_task_id.as_deref(), Some(first_id.as_str()));
+        assert!(after.all_healthy);
+    }
+
+    #[test]
+    #[ignore = "requires isolated APPDATA database copy, trusted VPS credential and local Docker; injects one client-side SSH check failure after remote startup"]
+    fn real_health_check_disconnect_and_read_only_reconciliation() {
+        let project = create_isolated_stack_project();
+        let host_id = project.host_ids[0];
+        let mut injected = false;
+        let result = super::run_single_host_until_checked(
+            project.id,
+            host_id,
+            &format!("drop{}", uuid::Uuid::new_v4().simple()),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |event| {
+                if event == "核对全部服务健康状态" {
+                    crate::ssh::inject_next_stack_check_disconnect(project.id);
+                    injected = true;
+                }
+            },
+        );
+        assert!(injected);
+        assert!(result.unwrap_err().contains("SSH 连接中断"));
+        let tasks = crate::release_store::recent(Some(project.id)).unwrap();
+        assert_eq!(tasks.len(), 1);
+        let task = &tasks[0];
+        assert_eq!(
+            (
+                task.phase.as_str(),
+                task.outcome.as_str(),
+                task.health_result.as_deref()
+            ),
+            ("checking", "unknown", None)
+        );
+        assert!(super::confirm_healthy_and_complete(&task.id).is_err());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let current = crate::ssh::observe_release_project(task).unwrap();
+            if current.containers.len() == 4
+                && current.containers.iter().all(|item| {
+                    item.status == "running" && item.health.as_deref() == Some("healthy")
+                })
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "remote stack never became healthy"
+            );
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+        assert_eq!(super::reconcile_interrupted_health(&task.id).unwrap(), 4);
+        let recovered = crate::release_store::get_task(&task.id).unwrap();
+        assert_eq!(
+            (
+                recovered.phase.as_str(),
+                recovered.outcome.as_str(),
+                recovered.health_result.as_deref()
+            ),
+            ("checked", "blocked", Some("healthy"))
+        );
+        let audit: i64 = crate::database::connect().unwrap().query_row(
+            "SELECT observed_containers FROM release_task_health_reconciliations WHERE task_id = ?1",
+            [&task.id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(audit, 4);
+        assert_eq!(super::confirm_healthy_and_complete(&task.id).unwrap(), 4);
+        assert_eq!(
+            crate::release_store::get_task(&task.id).unwrap().outcome,
+            "complete"
+        );
+        assert!(super::reconcile_interrupted_health(&task.id).is_err());
     }
 
     #[test]
     #[ignore = "continues an isolated two-version VPS test project; leaves its third release blocked/unhealthy"]
     fn real_failed_third_release_preserves_completed_versions() {
+        let data = isolated_series_data_dir().canonicalize().unwrap();
         let project_id: i64 = std::env::var("DEVINGPANEL_TEST_SERIES_PROJECT_ID")
             .unwrap()
             .parse()
             .unwrap();
+        assert!(project_id > 1_000_000_000);
         let source =
             std::path::PathBuf::from(std::env::var("DEVINGPANEL_TEST_FAILURE_FIXTURE").unwrap());
         let project = crate::project_store::effective(project_id).unwrap();
         assert!(project.name.starts_with("stack-series-"));
-        let data = crate::preferences::data_dir()
-            .unwrap()
-            .canonicalize()
-            .unwrap();
         assert!(std::path::Path::new(&project.path).starts_with(&data));
         let host_id = project.host_ids[0];
         let before: Vec<_> = crate::release_store::recent(Some(project_id))
@@ -949,9 +1572,13 @@ mod tests {
             .filter(|task| task.outcome == "complete")
             .collect();
         assert_eq!(before.len(), 2);
-        std::fs::copy(
-            source.join("compose.yaml"),
+        let faulty = std::fs::read_to_string(source.join("compose.yaml")).unwrap();
+        let marker = "\nnetworks:\n";
+        assert_eq!(faulty.matches(marker).count(), 1);
+        let sidecar = "\n  sidecar:\n    image: redis:7-alpine\n    command: ['redis-server', '--save', '', '--appendonly', 'no']\n    networks: [isolated]\n    healthcheck:\n      test: ['CMD', 'redis-cli', 'ping']\n      interval: 3s\n      timeout: 2s\n      retries: 20\n";
+        std::fs::write(
             std::path::Path::new(&project.path).join("compose.yaml"),
+            faulty.replace(marker, &format!("{sidecar}{marker}")),
         )
         .unwrap();
         let id = super::run_single_host_until_checked(
@@ -971,6 +1598,41 @@ mod tests {
             ),
             ("checked", "blocked", Some("failed"))
         );
+        let rollback_candidate = crate::rollback_store::candidate(&id).unwrap();
+        let (rolled_from, restored): (String, String) = crate::database::connect().unwrap().query_row(
+            "SELECT source_task_id, target_task_id FROM rollback_tasks WHERE project_id = ?1 AND outcome = 'complete'",
+            [project_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(rollback_candidate.target_task_id, restored);
+        assert_ne!(rollback_candidate.target_task_id, rolled_from);
+        let rollback_id = crate::rollback::run(
+            &id,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let (status, target): (String, String) = crate::database::connect()
+            .unwrap()
+            .query_row(
+                "SELECT outcome, target_task_id FROM rollback_tasks WHERE id = ?1",
+                [&rollback_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (status.as_str(), target.as_str()),
+            ("complete", restored.as_str())
+        );
+        let restored_state = super::inspect_current_version(&id).unwrap();
+        assert_eq!(
+            restored_state.matched_task_id.as_deref(),
+            Some(restored.as_str())
+        );
+        assert_eq!(restored_state.containers, 4);
+        assert_eq!(
+            crate::release_store::get_task(&id).unwrap().outcome,
+            "failed"
+        );
         assert!(super::confirm_healthy_and_complete(&id).is_err());
         let after: Vec<_> = crate::release_store::recent(Some(project_id))
             .unwrap()
@@ -985,6 +1647,17 @@ mod tests {
                 .collect::<std::collections::HashSet<_>>(),
             before.iter().map(|task| &task.id).collect()
         );
+        for old in &after {
+            crate::release_materials::load(&old.id).unwrap();
+            let images = crate::release_store::historical_images(&old.id).unwrap();
+            assert_eq!(images.len(), 2);
+            for image in &images {
+                crate::release_archive::verify(&old.id, &image.service).unwrap();
+            }
+            let remote = crate::ssh::observe_historical_images(old, &images).unwrap();
+            assert_eq!(remote.len(), images.len());
+            assert!(remote.iter().all(|(_, available)| *available));
+        }
     }
 
     #[test]

@@ -7,7 +7,7 @@ use rusqlite::params;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const SERVICE: &str = "devingPanel:release-materials";
 const CHUNK_UTF16: usize = 1000;
@@ -34,6 +34,13 @@ fn try_project_guard(project_id: i64) -> Result<Option<ReleaseGuard>, String> {
     }
     let _ = connect()?;
     let root: PathBuf = crate::preferences::data_dir().ok_or("无法确定本机配置目录。")?;
+    try_project_guard_at(&root, project_id)
+}
+
+fn try_project_guard_at(root: &Path, project_id: i64) -> Result<Option<ReleaseGuard>, String> {
+    if project_id <= 0 {
+        return Err("项目 ID 无效。".into());
+    }
     let path = root.join(format!("release-project-{project_id}.lock"));
     let mut options = OpenOptions::new();
     options.create(true).write(true);
@@ -141,6 +148,40 @@ pub fn recover_prepared() -> Result<usize, String> {
             }
         })
     })
+}
+
+fn recover_interrupted_batches_in<G>(
+    conn: &rusqlite::Connection,
+    mut guard: impl FnMut(i64) -> Result<Option<G>, String>,
+) -> Result<usize, String> {
+    let projects = crate::batch_store::interrupted_projects_in(conn)?;
+    let mut recovered = 0;
+    let mut failed = false;
+    for project_id in projects {
+        let Some(_guard) = (match guard(project_id) {
+            Ok(value) => value,
+            Err(_) => {
+                failed = true;
+                continue;
+            }
+        }) else {
+            continue;
+        };
+        match crate::batch_store::mark_interrupted_in(conn, project_id) {
+            Ok(true) => recovered += 1,
+            Ok(false) => {}
+            Err(_) => failed = true,
+        }
+    }
+    if failed {
+        Err("部分中断批次未能标为待核实；请检查数据库并重试。".into())
+    } else {
+        Ok(recovered)
+    }
+}
+
+pub fn recover_interrupted_batches() -> Result<usize, String> {
+    recover_interrupted_batches_in(&connect()?, try_project_guard)
 }
 
 fn chunk_private_text(value: &str) -> Result<Vec<String>, String> {
@@ -342,12 +383,214 @@ pub fn load(id: &str) -> Result<RestoredMaterials, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHUNK_UTF16, MAX_CHUNKS, MAX_MATERIAL_BYTES, prepare, recover_prepared_in};
+    use super::{
+        CHUNK_UTF16, MAX_CHUNKS, MAX_MATERIAL_BYTES, prepare, recover_interrupted_batches_in,
+        recover_prepared_in, try_project_guard_at,
+    };
     use crate::database::initialize;
     use crate::ssh::DeploymentFile;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use rusqlite::{Connection, params};
     use serde_json::Value;
+    use std::io::BufRead;
+
+    #[test]
+    #[ignore = "child process used by the file-backed project lock test"]
+    fn project_lock_probe_child() {
+        let root =
+            std::path::PathBuf::from(std::env::var_os("DEVINGPANEL_LOCK_TEST_ROOT").unwrap());
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("devingpanel-batch-restart-")
+        );
+        let expected = std::env::var("DEVINGPANEL_LOCK_TEST_ACQUIRES").unwrap() == "yes";
+        let guard = try_project_guard_at(&root, 91).unwrap();
+        assert_eq!(guard.is_some(), expected);
+    }
+
+    #[test]
+    #[ignore = "child process terminated by the interrupted batch recovery test"]
+    fn project_lock_crash_child() {
+        let root =
+            std::path::PathBuf::from(std::env::var_os("DEVINGPANEL_LOCK_TEST_ROOT").unwrap());
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("devingpanel-batch-restart-")
+        );
+        let _guard = try_project_guard_at(&root, 91).unwrap().unwrap();
+        println!("LOCK_HELD");
+        std::thread::park();
+    }
+
+    #[test]
+    fn startup_keeps_active_batch_running_until_its_project_lock_is_free() {
+        let root = std::env::temp_dir().join(format!(
+            "devingpanel-batch-restart-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("state.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO release_batches (id, project_id, config_sha256, state)
+            VALUES ('batch', 91, 'digest', 'running');
+            INSERT INTO release_tasks (id, project_id, host_id, project_name, host_name,
+                host_address, host_port, host_username, host_auth, host_fingerprint,
+                docker_endpoint, docker_daemon_id, image_reference, platform, config_sha256,
+                phase, outcome) VALUES ('task', 91, 11, 'test', 'one',
+                'one.invalid', 22, 'root', 'password', 'SHA256:test',
+                'unix:///var/run/docker.sock', 'DAEMON:ONE', 'test:v1', 'linux/amd64',
+                'digest', 'loading', 'running');
+            INSERT INTO release_batch_targets (batch_id, ordinal, host_id, host_name,
+                host_group, host_address, host_port, host_username, host_auth, host_fingerprint,
+                platform, docker_endpoint, docker_daemon_id, state, release_task_id)
+            VALUES ('batch', 0, 11, 'one', 'test', 'one.invalid', 22, 'root',
+                'password', 'SHA256:test', 'linux/amd64', 'unix:///var/run/docker.sock',
+                'DAEMON:ONE', 'running', 'task'),
+                ('batch', 1, 12, 'two', 'test', 'two.invalid', 22, 'root',
+                 'password', 'SHA256:test', 'linux/amd64', 'unix:///var/run/docker.sock',
+                 'DAEMON:TWO', 'waiting', NULL);",
+        )
+        .unwrap();
+        let active = try_project_guard_at(&root, 91).unwrap().unwrap();
+        let probe = |acquires: bool| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "release_materials::tests::project_lock_probe_child",
+                ])
+                .env("DEVINGPANEL_LOCK_TEST_ROOT", &root)
+                .env(
+                    "DEVINGPANEL_LOCK_TEST_ACQUIRES",
+                    if acquires { "yes" } else { "no" },
+                )
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x0800_0000);
+            }
+            assert!(
+                command.status().unwrap().success(),
+                "child lock probe failed"
+            );
+        };
+        probe(false);
+        assert_eq!(
+            recover_interrupted_batches_in(&conn, |id| try_project_guard_at(&root, id)).unwrap(),
+            0
+        );
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM release_batches WHERE id='batch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "running");
+        drop(active);
+        probe(true);
+        drop(conn);
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "release_materials::tests::project_lock_crash_child",
+                "--nocapture",
+            ])
+            .env("DEVINGPANEL_LOCK_TEST_ROOT", &root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let mut child = command.spawn().unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            assert!(
+                output.read_line(&mut line).unwrap() > 0,
+                "child did not acquire lock"
+            );
+            if line.contains("LOCK_HELD") {
+                break;
+            }
+            line.clear();
+        }
+        probe(false);
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+        probe(true);
+        let reopened = Connection::open(&path).unwrap();
+        reopened.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        assert_eq!(
+            recover_interrupted_batches_in(&reopened, |id| try_project_guard_at(&root, id))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            recover_interrupted_batches_in(&reopened, |id| try_project_guard_at(&root, id))
+                .unwrap(),
+            0
+        );
+        let state: String = reopened
+            .query_row(
+                "SELECT state FROM release_batches WHERE id='batch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "unknown");
+        let outcome: String = reopened
+            .query_row(
+                "SELECT outcome FROM release_tasks WHERE id='task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outcome, "unknown");
+        let targets = reopened
+            .prepare(
+                "SELECT state FROM release_batch_targets WHERE batch_id='batch' ORDER BY ordinal",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(targets, ["unknown", "waiting"]);
+        drop(reopened);
+        std::fs::remove_file(root.join("release-project-91.lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn project_guard_excludes_an_active_release_and_allows_crash_recovery() {
+        let root = std::env::temp_dir().join(format!("devingpanel-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let first = try_project_guard_at(&root, 4).unwrap().unwrap();
+        assert!(try_project_guard_at(&root, 4).unwrap().is_none());
+        assert!(try_project_guard_at(&root, 5).unwrap().is_some());
+        drop(first);
+        assert!(try_project_guard_at(&root, 4).unwrap().is_some());
+        for project in [4, 5] {
+            std::fs::remove_file(root.join(format!("release-project-{project}.lock"))).unwrap();
+        }
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn private_snapshot_preserves_compose_and_env_without_local_plaintext_files() {
@@ -604,59 +847,5 @@ mod tests {
             std::fs::remove_dir(root).unwrap();
         }
         result.unwrap();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "purges only isolated stack-series test material credentials before removing its APPDATA copy"]
-    fn purge_isolated_series_credentials() {
-        let project_id: i64 = std::env::var("DEVINGPANEL_TEST_PURGE_PROJECT_ID")
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(project_id > 3);
-        let project = crate::project_store::effective(project_id).unwrap();
-        assert!(project.name.starts_with("stack-series-"));
-        let root = crate::preferences::data_dir()
-            .unwrap()
-            .canonicalize()
-            .unwrap();
-        assert!(std::path::Path::new(&project.path).starts_with(&root));
-        let conn = crate::database::connect().unwrap();
-        let mut query = conn
-            .prepare(
-                "SELECT t.id, m.state, m.chunks FROM release_tasks t
-            JOIN release_materials m ON m.task_id = t.id
-            WHERE t.project_id = ?1 AND t.outcome IN ('complete','blocked')",
-            )
-            .unwrap();
-        let rows = query
-            .query_map([project_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(rows.len(), 3);
-        for (id, state, chunks) in rows {
-            let count = if state == "ready" && (1..=super::MAX_CHUNKS as i64).contains(&chunks) {
-                chunks as usize
-            } else {
-                super::MAX_CHUNKS
-            };
-            crate::host_store::with_credential_lock(|| {
-                if super::cleanup(&id, count) {
-                    Ok(())
-                } else {
-                    Err("隔离测试凭据清理失败。".into())
-                }
-            })
-            .unwrap();
-            assert!(super::load(&id).is_err());
-        }
     }
 }

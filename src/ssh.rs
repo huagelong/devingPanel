@@ -4,19 +4,19 @@ use base64::Engine as _;
 use russh::client;
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{ChannelMsg, Disconnect};
-use russh_sftp::client::RawSftpSession;
-use russh_sftp::client::SftpSession;
+use russh_sftp::client::{Config as SftpConfig, RawSftpSession, SftpSession};
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::io::SeekFrom;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc::SyncSender,
 };
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 pub enum TestResult {
     NeedsTrust {
@@ -66,6 +66,15 @@ impl DockerInstallSource {
 const DOCKER_GPG_FINGERPRINT: &str = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88";
 pub const VERIFIED_REGISTRY_MIRRORS: [&str; 2] =
     ["https://docker.1panel.live", "https://docker.m.daocloud.io"];
+
+fn sftp_upload_config() -> SftpConfig {
+    // Bound pipelining and allow slow servers enough time to acknowledge each write.
+    SftpConfig {
+        max_concurrent_writes: 4,
+        request_timeout_secs: 60,
+        ..Default::default()
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum MirrorConfigResult {
@@ -224,6 +233,16 @@ pub struct UploadedArchive {
     pub image_ids: Vec<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct RemoteArchiveObservation {
+    pub service: String,
+    pub directory: String,
+    pub state: String,
+    pub expected_bytes: u64,
+    pub actual_bytes: Option<u64>,
+    pub digest_matches: Option<bool>,
+}
+
 pub struct DeploymentFile {
     pub path: String,
     pub bytes: Vec<u8>,
@@ -297,7 +316,7 @@ fn shell_quote(value: &str) -> Result<String, String> {
     Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
 }
 
-fn validated_upload_directory(raw: &str) -> Result<String, String> {
+pub(crate) fn validated_upload_directory(raw: &str) -> Result<String, String> {
     let name = raw
         .strip_prefix("/tmp/devingpanel.")
         .ok_or("远端临时目录路径无效。")?;
@@ -436,7 +455,7 @@ fn validate_container_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn same_connection_target(current: &Host, expected: &Host) -> bool {
+pub(crate) fn same_connection_target(current: &Host, expected: &Host) -> bool {
     current.id == expected.id
         && current.address == expected.address
         && current.port == expected.port
@@ -584,6 +603,7 @@ pub fn disk_preview(expected_host: Host) -> Result<DiskPreview, String> {
         })
 }
 
+#[cfg(test)]
 async fn execute_disk_prune(material: ConnectionMaterial) -> Result<Option<String>, String> {
     let handle = trusted_handle(material).await?;
     let endpoint = local_docker_endpoint(&handle).await?;
@@ -623,19 +643,6 @@ async fn execute_disk_prune(material: ConnectionMaterial) -> Result<Option<Strin
         Some(_) => Err("远端 Docker 报告清理失败；请到主机核对详情。".into()),
         None => Err("SSH 连接中断，清理结果待核实；请到主机核对，不要盲目重试。".into()),
     }
-}
-
-pub fn disk_prune(expected_host: Host) -> Result<Option<String>, String> {
-    let material = material_for(&expected_host)?;
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|_| "无法初始化 SSH 运行环境。")?
-        .block_on(async {
-            tokio::time::timeout(Duration::from_secs(120), execute_disk_prune(material))
-                .await
-                .map_err(|_| "清理超时，远端结果待核实；请到主机核对，不要盲目重试。")?
-        })
 }
 
 async fn execute_container_command(
@@ -725,9 +732,16 @@ async fn command_limited(
         }
     }
     if exit != Some(0) {
-        return Err("远端 Docker、Compose 或系统工具不可用，或当前用户没有权限。".into());
+        return Err(command_exit_error(exit));
     }
     String::from_utf8(bytes).map_err(|_| "远端检查输出编码无效。".into())
+}
+
+fn command_exit_error(exit: Option<u32>) -> String {
+    match exit {
+        Some(code) => format!("远端命令以退出码 {code} 结束。"),
+        None => "远端 SSH 会话未返回命令退出状态。".into(),
+    }
 }
 
 async fn command(handle: &client::Handle<HostKeyChecker>, command: &str) -> Result<String, String> {
@@ -1938,7 +1952,7 @@ async fn upload_to_directory(
     .map_err(|_| "远端 SFTP 服务不可用。")?;
     let sftp = tokio::time::timeout(
         Duration::from_secs(10),
-        SftpSession::new(channel.into_stream()),
+        SftpSession::new_with_config(channel.into_stream(), sftp_upload_config()),
     )
     .await
     .map_err(|_| "SFTP 协议握手超时。")?
@@ -2053,9 +2067,38 @@ async fn transfer_archive(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<UploadedArchive, String> {
+    Box::pin(transfer_archive_to(
+        material,
+        source,
+        size,
+        cancel,
+        progress,
+        ArchiveTransferOptions::default(),
+    ))
+    .await
+}
+
+#[derive(Default)]
+struct ArchiveTransferOptions<'a> {
+    directory: Option<&'a str>,
+    preserve_on_error: bool,
+    expected_identity: Option<ReleaseDockerIdentity<'a>>,
+}
+
+async fn transfer_archive_to(
+    material: ConnectionMaterial,
+    source: &std::path::Path,
+    size: u64,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+    options: ArchiveTransferOptions<'_>,
+) -> Result<UploadedArchive, String> {
     let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
         .await
         .map_err(|_| "SSH 连接超时，传输未开始。")??;
+    if let Some(identity) = options.expected_identity {
+        checked_release_endpoint(&handle, identity).await?;
+    }
     let available_kib = disk_available(&archive_command(&handle, "df -Pk /tmp").await?)?;
     if size.saturating_add(64 * 1024 * 1024) > available_kib.saturating_mul(1024) {
         return Err("远端 /tmp 可用空间不足，传输未开始。".into());
@@ -2063,16 +2106,28 @@ async fn transfer_archive(
     if cancel.load(Ordering::Relaxed) {
         return Err("镜像传输已取消，传输未开始。".into());
     }
-    let directory = validated_upload_directory(&format!(
-        "/tmp/devingpanel.{}",
-        uuid::Uuid::new_v4().simple()
-    ))?;
-    let create = archive_command(&handle, &format!(
-        "mkdir -m 700 -- {directory} && chmod 700 -- {directory} && test \"$(stat -c %a -- {directory})\" = 700"
-    )).await;
+    let directory = validated_upload_directory(
+        &options
+            .directory
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("/tmp/devingpanel.{}", uuid::Uuid::new_v4().simple())),
+    )?;
+    let create = if options.preserve_on_error {
+        archive_command(&handle, &format!(
+            "sh -c 'if test -L {directory}; then exit 1; \
+             elif test -e {directory}; then test -d {directory} && test \"$(stat -c %a -- {directory})\" = 700; \
+             else mkdir -m 700 -- {directory}; fi'"
+        )).await
+    } else {
+        archive_command(&handle, &format!(
+            "mkdir -m 700 -- {directory} && chmod 700 -- {directory} && test \"$(stat -c %a -- {directory})\" = 700"
+        )).await
+    };
     if let Err(error) = create {
-        // A timed-out mkdir may have succeeded; the random path is known, so try to remove it.
-        let _ = archive_command(&handle, &format!("rmdir -- {directory}")).await;
+        if !options.preserve_on_error {
+            // A timed-out mkdir may have succeeded; the random path is known.
+            let _ = archive_command(&handle, &format!("rmdir -- {directory}")).await;
+        }
         return Err(format!(
             "无法安全创建远端临时目录：{error}；请核对 {directory} 是否残留。"
         ));
@@ -2084,6 +2139,11 @@ async fn transfer_archive(
     .await
     .unwrap_or_else(|_| Err("镜像传输超时，远端结果待核实。".to_owned()));
     if result.is_err() {
+        if options.preserve_on_error {
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+            return result
+                .map_err(|error| format!("{error}；保留预留临时目录 {directory} 待核实。"));
+        }
         let cleanup = archive_command(&handle, &cleanup_archive_command(&directory)?).await;
         let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
         return result.map_err(|error| match cleanup {
@@ -2120,6 +2180,355 @@ pub fn upload_archive(
             &cancel,
             &mut progress,
         ))
+}
+
+pub fn upload_archive_at(
+    expected_host: Host,
+    source: &std::path::Path,
+    directory: &str,
+    cancel: Arc<AtomicBool>,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<UploadedArchive, String> {
+    let directory = validated_upload_directory(directory)?;
+    let material = material_for(&expected_host)?;
+    let size = std::fs::metadata(source)
+        .map_err(|_| "本地镜像归档不存在。")?
+        .len();
+    if size == 0 {
+        return Err("本地镜像归档为空。".into());
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化传输环境。")?
+        .block_on(Box::pin(transfer_archive_to(
+            material,
+            source,
+            size,
+            &cancel,
+            &mut progress,
+            ArchiveTransferOptions {
+                directory: Some(&directory),
+                ..Default::default()
+            },
+        )))
+}
+
+pub fn upload_unknown_archive_at(
+    expected_host: Host,
+    identity: ReleaseDockerIdentity<'_>,
+    source: &std::path::Path,
+    directory: &str,
+    cancel: Arc<AtomicBool>,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<UploadedArchive, String> {
+    let directory = validated_upload_directory(directory)?;
+    let material = material_for(&expected_host)?;
+    let size = std::fs::metadata(source)
+        .map_err(|_| "本地镜像归档不存在。")?
+        .len();
+    if size == 0 {
+        return Err("本地镜像归档为空。".into());
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化传输环境。".to_owned())?
+        .block_on(Box::pin(transfer_archive_to(
+            material,
+            source,
+            size,
+            &cancel,
+            &mut progress,
+            ArchiveTransferOptions {
+                directory: Some(&directory),
+                preserve_on_error: true,
+                expected_identity: Some(identity),
+            },
+        )))
+}
+
+fn remote_archive_size(output: &str) -> Result<Option<u64>, String> {
+    let status = output.trim();
+    if status == "missing" {
+        return Ok(None);
+    }
+    let size = status
+        .strip_prefix("size:")
+        .and_then(|text| text.parse::<u64>().ok())
+        .ok_or("远端临时归档类型或大小无法核实。")?;
+    Ok(Some(size))
+}
+
+async fn remote_archive_size_on(
+    handle: &client::Handle<HostKeyChecker>,
+    directory: &str,
+) -> Result<Option<u64>, String> {
+    let directory = validated_upload_directory(directory)?;
+    let path = format!("{directory}/image.tar");
+    let command = format!(
+        "sh -c 'if test -L {directory}; then echo invalid; \
+         elif test ! -e {directory}; then echo missing; \
+         elif test ! -d {directory}; then echo invalid; \
+         elif test \"$(stat -c %a -- {directory})\" != 700; then echo invalid; \
+         elif test -L {path}; then echo invalid; \
+         elif test -f {path}; then stat -c \"size:%s\" -- {path}; \
+         elif test -e {path}; then echo invalid; else echo missing; fi'"
+    );
+    remote_archive_size(&archive_command(handle, &command).await?)
+}
+
+async fn resume_uploaded_archive_on(
+    material: ConnectionMaterial,
+    identity: ReleaseDockerIdentity<'_>,
+    record: &crate::release_store::UploadedArchiveRecord,
+    source: &std::path::Path,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<UploadedArchive, String> {
+    let directory = validated_upload_directory(&record.directory)?;
+    let path = format!("{directory}/image.tar");
+    let source_bytes = tokio::fs::metadata(source)
+        .await
+        .map_err(|_| "本地归档不存在。")?
+        .len();
+    if source_bytes != record.bytes
+        || source_bytes == 0
+        || record.sha256.len() != 64
+        || !record.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("本地归档与上传意图不一致。".into());
+    }
+    let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+        .await
+        .map_err(|_| "续传 SSH 连接超时。")??;
+    checked_release_endpoint(&handle, identity).await?;
+    let offset = remote_archive_size_on(&handle, &directory)
+        .await?
+        .ok_or("远端部分归档不存在，不能按原路径续传。")?;
+    if offset > record.bytes {
+        return Err("远端归档大于预期，禁止续传。".into());
+    }
+    let available = disk_available(&archive_command(&handle, "df -Pk /tmp").await?)?;
+    if record.bytes - offset + 64 * 1024 * 1024 > available.saturating_mul(1024) {
+        return Err("远端 /tmp 可用空间不足，未续传。".into());
+    }
+    let mut local = tokio::fs::File::open(source)
+        .await
+        .map_err(|_| "无法读取本地镜像归档。")?;
+    let mut hasher = Sha256::new();
+    let mut remaining = offset;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("续传预检已取消。".into());
+        }
+        let length = remaining.min(buffer.len() as u64) as usize;
+        let read = tokio::time::timeout(Duration::from_secs(60), local.read(&mut buffer[..length]))
+            .await
+            .map_err(|_| "本地归档前缀读取超时。")?
+            .map_err(|_| "本地归档前缀不可读取。")?;
+        if read == 0 {
+            return Err("本地归档在核对期间缩短。".into());
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    let remote_digest = archive_command_with_timeout(
+        &handle,
+        &format!("sha256sum -- {path}"),
+        Duration::from_secs(60 * 60),
+    )
+    .await?;
+    if format!("{:x}", hasher.clone().finalize()) != verified_sha256(&remote_digest)? {
+        return Err("远端部分归档与本地前缀 SHA-256 不符，禁止续传。".into());
+    }
+    if offset < record.bytes {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("续传已取消。".into());
+        }
+        let channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|_| "无法打开续传 SFTP 会话。")?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|_| "续传 SFTP 子系统不可用。")?;
+        let sftp = SftpSession::new_with_config(channel.into_stream(), sftp_upload_config())
+            .await
+            .map_err(|_| "续传 SFTP 协议握手失败。")?;
+        let metadata = sftp
+            .metadata(path.clone())
+            .await
+            .map_err(|_| "远端归档属性不可读。")?;
+        if metadata.len() != offset
+            || metadata
+                .permissions
+                .is_none_or(|mode| mode & 0o777 != 0o600)
+        {
+            return Err("远端归档大小或权限已变化，禁止续传。".into());
+        }
+        let mut remote = sftp
+            .open_with_flags_and_attributes(
+                path.clone(),
+                OpenFlags::WRITE,
+                FileAttributes::default(),
+            )
+            .await
+            .map_err(|_| "无法打开远端部分归档。")?;
+        remote
+            .seek(SeekFrom::Start(offset))
+            .await
+            .map_err(|_| "远端归档无法定位续传偏移。")?;
+        let mut copied = offset;
+        progress(copied, record.bytes);
+        while copied < record.bytes {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("镜像续传已取消，远端结果待核实。".into());
+            }
+            let read = tokio::time::timeout(Duration::from_secs(60), local.read(&mut buffer))
+                .await
+                .map_err(|_| "本地归档读取超时。")?
+                .map_err(|_| "本地归档读取失败。")?;
+            if read == 0 || copied + read as u64 > record.bytes {
+                return Err("本地归档在续传期间变化。".into());
+            }
+            tokio::time::timeout(Duration::from_secs(60), remote.write_all(&buffer[..read]))
+                .await
+                .map_err(|_| "远端续传写入超时，结果待核实。")?
+                .map_err(|_| "远端续传写入失败，结果待核实。")?;
+            hasher.update(&buffer[..read]);
+            copied += read as u64;
+            progress(copied.min(record.bytes - 1), record.bytes);
+        }
+        tokio::time::timeout(Duration::from_secs(60), remote.close())
+            .await
+            .map_err(|_| "续传文件关闭超时，结果待核实。")?
+            .map_err(|_| "续传文件关闭失败，结果待核实。")?;
+        let _ = sftp.close().await;
+    }
+    if format!("{:x}", hasher.finalize()) != record.sha256.to_ascii_lowercase()
+        || remote_archive_size_on(&handle, &directory).await? != Some(record.bytes)
+        || verified_sha256(
+            &archive_command_with_timeout(
+                &handle,
+                &format!("sha256sum -- {path}"),
+                Duration::from_secs(60 * 60),
+            )
+            .await?,
+        )? != record.sha256.to_ascii_lowercase()
+    {
+        return Err("续传后本机或远端完整归档校验不符，禁止加载。".into());
+    }
+    progress(record.bytes, record.bytes);
+    let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+    Ok(UploadedArchive {
+        directory,
+        path,
+        bytes: record.bytes,
+        sha256: record.sha256.to_ascii_lowercase(),
+        image_ids: Vec::new(),
+    })
+}
+
+pub fn resume_uploaded_archive(
+    expected_host: Host,
+    identity: ReleaseDockerIdentity<'_>,
+    record: &crate::release_store::UploadedArchiveRecord,
+    source: &std::path::Path,
+    cancel: Arc<AtomicBool>,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<UploadedArchive, String> {
+    let material = material_for(&expected_host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化续传环境。".to_owned())?
+        .block_on(resume_uploaded_archive_on(
+            material,
+            identity,
+            record,
+            source,
+            &cancel,
+            &mut progress,
+        ))
+}
+
+pub fn inspect_uploaded_archives(
+    task: &TaskSnapshot,
+    records: &[crate::release_store::UploadedArchiveRecord],
+) -> Result<Vec<RemoteArchiveObservation>, String> {
+    if records.is_empty() || records.len() > 100 {
+        return Err("任务没有可核实的远端归档记录。".into());
+    }
+    let endpoint = task
+        .docker_endpoint
+        .as_deref()
+        .ok_or("任务缺少 Docker endpoint 快照。")?;
+    let daemon_id = task
+        .docker_daemon_id
+        .as_deref()
+        .ok_or("任务缺少 Docker daemon 身份快照。")?;
+    let mut directories = HashSet::new();
+    for record in records {
+        validated_upload_directory(&record.directory)?;
+        if record.service.is_empty()
+            || record.service.len() > 128
+            || record.service.chars().any(char::is_control)
+            || record.bytes == 0
+            || record.sha256.len() != 64
+            || !record.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !directories.insert(&record.directory)
+        {
+            return Err("远端归档意图无效或路径重复。".into());
+        }
+    }
+    let material = material_for(&task.host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化远端归档核实环境。".to_owned())?
+        .block_on(async {
+            let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+                .await
+                .map_err(|_| "远端归档核实连接超时。")??;
+            checked_release_endpoint(
+                &handle,
+                ReleaseDockerIdentity {
+                    endpoint,
+                    daemon_id,
+                },
+            )
+            .await?;
+            let mut observations = Vec::with_capacity(records.len());
+            for record in records {
+                let directory = &record.directory;
+                let path = format!("{directory}/image.tar");
+                let actual_bytes = remote_archive_size_on(&handle, directory).await?;
+                let digest_matches = if actual_bytes == Some(record.bytes) {
+                    let digest = archive_command_with_timeout(
+                        &handle,
+                        &format!("sha256sum -- {path}"),
+                        Duration::from_secs(60),
+                    )
+                    .await?;
+                    Some(verified_sha256(&digest)? == record.sha256.to_ascii_lowercase())
+                } else {
+                    None
+                };
+                observations.push(RemoteArchiveObservation {
+                    service: record.service.clone(),
+                    directory: directory.clone(),
+                    state: record.state.clone(),
+                    expected_bytes: record.bytes,
+                    actual_bytes,
+                    digest_matches,
+                });
+            }
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+            Ok(observations)
+        })
 }
 
 #[allow(dead_code)] // The release coordinator calls this after docker load or on retry.
@@ -2258,7 +2667,7 @@ async fn stage_deployment_on(
         .map_err(|_| "远端 SFTP 不可用。")?;
         let sftp = tokio::time::timeout(
             Duration::from_secs(10),
-            SftpSession::new(channel.into_stream()),
+            SftpSession::new_with_config(channel.into_stream(), sftp_upload_config()),
         )
         .await
         .map_err(|_| "部署 SFTP 协议握手超时。")?
@@ -2773,6 +3182,71 @@ pub fn observe_release_project(task: &TaskSnapshot) -> Result<ReleaseObservation
         ))
 }
 
+#[cfg(test)]
+pub(crate) fn assert_empty_project_namespace(task: &TaskSnapshot) -> Result<(), String> {
+    if task.project_id <= 1_000_000_000 {
+        return Err("隔离测试项目 ID 不够独立。".into());
+    }
+    let endpoint = task
+        .docker_endpoint
+        .as_deref()
+        .ok_or("测试缺少 Docker endpoint。")?;
+    let daemon_id = task
+        .docker_daemon_id
+        .as_deref()
+        .ok_or("测试缺少 Docker daemon ID。")?;
+    let material = material_for(&task.host)?;
+    tokio::runtime::Builder::new_current_thread().enable_all().build()
+        .map_err(|_| "无法初始化隔离资源检查。")?
+        .block_on(async {
+            let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+                .await.map_err(|_| "隔离资源检查连接超时。")??;
+            let endpoint = checked_release_endpoint(&handle,
+                ReleaseDockerIdentity { endpoint, daemon_id }).await?;
+            for command in [
+                format!("network ls --filter label=com.docker.compose.project=dp{} --format '{{{{.ID}}}}'", task.project_id),
+                format!("volume ls --filter label=com.docker.compose.project=dp{} --format '{{{{.Name}}}}'", task.project_id),
+            ] {
+                if !archive_command(&handle, &docker_command(&endpoint, &command)).await?.trim().is_empty() {
+                    return Err("远端已存在同名 Compose 网络或卷，拒绝隔离测试。".into());
+                }
+            }
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+            Ok(())
+        })
+}
+
+async fn verify_snapshot_files(
+    handle: &client::Handle<HostKeyChecker>,
+    directory: &str,
+    snapshot: &crate::release_materials::RestoredMaterials,
+) -> Result<(), String> {
+    for file in &snapshot.compose_files {
+        validated_release_file(&file.path)?;
+        let path = shell_quote(&format!("{directory}/{}", file.path))?;
+        let output = archive_command_with_timeout(
+            handle,
+            &format!("sha256sum -- {path}"),
+            Duration::from_secs(30),
+        )
+        .await?;
+        if verified_sha256(&output)? != format!("{:x}", Sha256::digest(&file.bytes)) {
+            return Err("远端 Compose 文件已变化或丢失。".into());
+        }
+    }
+    let env_path = shell_quote(&format!("{directory}/.env"))?;
+    let output = archive_command_with_timeout(
+        handle,
+        &format!("sha256sum -- {env_path}"),
+        Duration::from_secs(30),
+    )
+    .await?;
+    if verified_sha256(&output)? != format!("{:x}", Sha256::digest(&snapshot.env_file)) {
+        return Err("远端环境快照已变化或丢失。".into());
+    }
+    Ok(())
+}
+
 pub fn verify_staged_materials(
     task: &TaskSnapshot,
     snapshot: &crate::release_materials::RestoredMaterials,
@@ -2807,31 +3281,182 @@ pub fn verify_staged_materials(
             .await?;
             let home = archive_command(&handle, "sh -c 'printf %s \"$HOME\"'").await?;
             let directory = validated_release_directory(&home, task.project_id, &task.id)?;
-            for file in &snapshot.compose_files {
-                validated_release_file(&file.path)?;
-                let path = shell_quote(&format!("{directory}/{}", file.path))?;
-                let output = archive_command_with_timeout(
-                    &handle,
-                    &format!("sha256sum -- {path}"),
-                    Duration::from_secs(30),
-                )
-                .await?;
-                if verified_sha256(&output)? != format!("{:x}", Sha256::digest(&file.bytes)) {
-                    return Err("远端 Compose 文件已变化或丢失。".into());
-                }
-            }
-            let env_path = shell_quote(&format!("{directory}/.env"))?;
-            let output = archive_command_with_timeout(
+            verify_snapshot_files(&handle, &directory, snapshot).await?;
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+            Ok(())
+        })
+}
+
+pub fn verify_start_completed(task: &TaskSnapshot) -> Result<(), String> {
+    let endpoint = task
+        .docker_endpoint
+        .as_deref()
+        .ok_or("任务缺少 Docker endpoint 身份。")?;
+    let daemon_id = task
+        .docker_daemon_id
+        .as_deref()
+        .ok_or("任务缺少 Docker daemon 身份。")?;
+    let material = material_for(&task.host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化启动完成核实环境。".to_owned())?
+        .block_on(async {
+            let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+                .await
+                .map_err(|_| "启动完成标记连接超时。")??;
+            checked_release_endpoint(
                 &handle,
-                &format!("sha256sum -- {env_path}"),
-                Duration::from_secs(30),
+                ReleaseDockerIdentity {
+                    endpoint,
+                    daemon_id,
+                },
             )
             .await?;
-            if verified_sha256(&output)? != format!("{:x}", Sha256::digest(&snapshot.env_file)) {
-                return Err("远端环境快照已变化或丢失。".into());
+            let home = archive_command(&handle, "sh -c 'printf %s \"$HOME\"'").await?;
+            let directory = validated_release_directory(&home, task.project_id, &task.id)?;
+            let marker = shell_quote(&format!("{directory}/.compose-start-complete"))?;
+            let directory = shell_quote(&directory)?;
+            let command = format!(
+                "test -d {directory} && test ! -L {directory} && \
+                 test \"$(stat -c %a -- {directory})\" = 700 && \
+                 test -f {marker} && test ! -L {marker} && \
+                 test \"$(stat -c %a -- {marker})\" = 600 && \
+                 test \"$(stat -c %u -- {marker})\" = \"$(id -u)\" && cat -- {marker}"
+            );
+            let content = archive_command(&handle, &command)
+                .await
+                .map_err(|error| format!("远端 Compose 启动完成标记不可核实：{error}"))?;
+            let expected = format!(
+                "{}:{}",
+                task.project_id,
+                uuid::Uuid::parse_str(&task.id).map_err(|_| "发布任务 ID 无效。")?
+            );
+            if content.trim() != expected {
+                return Err("远端 Compose 启动完成标记缺失或不匹配，仍保持待核实。".into());
             }
             let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
             Ok(())
+        })
+}
+
+fn parse_compose_hashes(text: &str) -> Result<HashMap<String, String>, String> {
+    let mut hashes = HashMap::new();
+    for line in text.lines() {
+        let (service, hash) = line.split_once(' ').ok_or("Compose 配置哈希格式无效。")?;
+        if !valid_compose_service(service)
+            || !valid_config_hash(hash)
+            || hashes.insert(service.to_owned(), hash.to_owned()).is_some()
+        {
+            return Err("Compose 配置哈希无效或重复。".into());
+        }
+    }
+    if hashes.is_empty() || hashes.len() > 100 {
+        return Err("Compose 配置哈希集合无效。".into());
+    }
+    Ok(hashes)
+}
+
+fn valid_config_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn verify_container_config_hashes(
+    ids: &[String],
+    rows: &str,
+    expected: &HashMap<String, String>,
+) -> Result<(), String> {
+    let mut seen_ids = HashSet::new();
+    let mut seen_services = HashSet::new();
+    for line in rows.lines() {
+        let row: Value = serde_json::from_str(line).map_err(|_| "容器配置哈希无法解析。")?;
+        let id = row
+            .get("Id")
+            .and_then(Value::as_str)
+            .ok_or("容器标识缺失。")?;
+        let service = row
+            .get("Service")
+            .and_then(Value::as_str)
+            .ok_or("容器服务标签缺失。")?;
+        let hash = row
+            .get("ConfigHash")
+            .and_then(Value::as_str)
+            .ok_or("容器缺少 Compose 配置哈希。")?;
+        if !ids.iter().any(|item| item == id)
+            || !seen_ids.insert(id.to_owned())
+            || !seen_services.insert(service.to_owned())
+            || !valid_config_hash(hash)
+            || expected.get(service).map(String::as_str) != Some(hash)
+        {
+            return Err("容器配置与历史 Compose 快照不一致。".into());
+        }
+    }
+    if seen_ids.len() != ids.len() || seen_services.len() != expected.len() {
+        return Err("历史 Compose 服务集合与当前容器不一致。".into());
+    }
+    Ok(())
+}
+
+pub fn verify_running_config_hashes(
+    task: &TaskSnapshot,
+    snapshot: &crate::release_materials::RestoredMaterials,
+    images: &[crate::release_store::HistoricalImage],
+) -> Result<ReleaseObservation, String> {
+    if snapshot.compose_files.is_empty() || snapshot.compose_files.len() > 16 {
+        return Err("部署文件快照无效。".into());
+    }
+    let endpoint = task
+        .docker_endpoint
+        .as_deref()
+        .ok_or("历史版本缺少 Docker endpoint。")?;
+    let daemon = task
+        .docker_daemon_id
+        .as_deref()
+        .ok_or("历史版本缺少 Docker daemon。")?;
+    let built = images
+        .iter()
+        .map(|image| StackService {
+            service: image.service.clone(),
+            reference: image.reference.clone(),
+            image_ids: image.image_ids.clone(),
+        })
+        .collect::<Vec<_>>();
+    let material = material_for(&task.host)?;
+    tokio::runtime::Builder::new_current_thread().enable_all().build()
+        .map_err(|_| "无法初始化配置哈希核实环境。".to_owned())?
+        .block_on(async {
+            let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+                .await.map_err(|_| "配置哈希核实连接超时。")??;
+            let checked = checked_release_endpoint(&handle, ReleaseDockerIdentity { endpoint, daemon_id: daemon }).await?;
+            let home = archive_command(&handle, "sh -c 'printf %s \"$HOME\"'").await?;
+            let directory = validated_release_directory(&home, task.project_id, &task.id)?;
+            verify_snapshot_files(&handle, &directory, snapshot).await?;
+            let staged = StagedDeployment {
+                env_path: format!("{directory}/.env"),
+                compose_files: snapshot.compose_files.iter().map(|file| file.path.clone()).collect(),
+                directory,
+            };
+            let command = format!("{} config --hash '*'", stack_command(&checked, &staged, task.project_id, &built)?);
+            let hashes = parse_compose_hashes(&tokio::time::timeout(Duration::from_secs(30),
+                command_limited(&handle, &command, 16 * 1024)).await.map_err(|_| "历史 Compose 哈希计算超时。")??)?;
+            let list = docker_command(&checked, &format!(
+                "ps -a --no-trunc --filter label=com.docker.compose.project=dp{} --format '{{{{.ID}}}}'", task.project_id));
+            let output = tokio::time::timeout(Duration::from_secs(15), command_limited(&handle, &list, 8192))
+                .await.map_err(|_| "当前容器列表核实超时。")??;
+            let ids = output.lines().map(str::to_owned).collect::<Vec<_>>();
+            if ids.is_empty() || ids.len() != hashes.len() || ids.len() > 100
+                || ids.iter().any(|id| validate_container_id(id).is_err())
+            {
+                return Err("当前容器与历史 Compose 服务数量不一致。".into());
+            }
+            let template = r#"{"Id":{{json .Id}},"Service":{{json (index .Config.Labels "com.docker.compose.service")}},"ConfigHash":{{json (index .Config.Labels "com.docker.compose.config-hash")}},"Image":{{json .Image}},"ConfigImage":{{json .Config.Image}},"Status":{{json .State.Status}},"Health":{{with index .State "Health"}}{{json .Status}}{{else}}null{{end}}}"#;
+            let inspect = docker_command(&checked, &format!("container inspect --format {} {}", shell_quote(template)?, ids.join(" ")));
+            let rows = tokio::time::timeout(Duration::from_secs(15), command_limited(&handle, &inspect, 32 * 1024))
+                .await.map_err(|_| "当前容器配置哈希核实超时。")??;
+            verify_container_config_hashes(&ids, &rows, &hashes)?;
+            let observed = parse_release_observation(&ids, &rows)?;
+            verify_snapshot_files(&handle, &staged.directory, snapshot).await?;
+            Ok(observed)
         })
 }
 
@@ -2860,7 +3485,7 @@ async fn observe_historical_images_on(
     material: ConnectionMaterial,
     identity: ReleaseDockerIdentity<'_>,
     images: &[crate::release_store::HistoricalImage],
-) -> Result<Vec<(String, bool)>, String> {
+) -> Result<Vec<(String, HistoricalImageState)>, String> {
     if images.is_empty() || images.len() > 16 {
         return Err("历史镜像计划无效。".into());
     }
@@ -2904,7 +3529,7 @@ async fn observe_historical_images_on(
         .await
         .map_err(|_| "历史镜像列表核实超时。")??;
         if !output.lines().any(|line| line == image.reference) {
-            results.push((image.service.clone(), false));
+            results.push((image.service.clone(), HistoricalImageState::Missing));
             continue;
         }
         let format = concat!(
@@ -2919,10 +3544,12 @@ async fn observe_historical_images_on(
         )
         .await
         .map_err(|_| "历史镜像元数据核实超时。")??;
-        results.push((
-            image.service.clone(),
-            historical_image_matches(&output, image)?,
-        ));
+        let state = if historical_image_matches(&output, image)? {
+            HistoricalImageState::Matching
+        } else {
+            HistoricalImageState::Changed
+        };
+        results.push((image.service.clone(), state));
     }
     let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
     Ok(results)
@@ -2932,6 +3559,23 @@ pub fn observe_historical_images(
     task: &TaskSnapshot,
     images: &[crate::release_store::HistoricalImage],
 ) -> Result<Vec<(String, bool)>, String> {
+    Ok(historical_image_states(task, images)?
+        .into_iter()
+        .map(|(service, state)| (service, state == HistoricalImageState::Matching))
+        .collect())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoricalImageState {
+    Matching,
+    Missing,
+    Changed,
+}
+
+pub fn historical_image_states(
+    task: &TaskSnapshot,
+    images: &[crate::release_store::HistoricalImage],
+) -> Result<Vec<(String, HistoricalImageState)>, String> {
     let endpoint = task
         .docker_endpoint
         .as_deref()
@@ -3173,12 +3817,84 @@ pub fn check_staged_compose(
         ))
 }
 
+struct StackStartPolicy<'a> {
+    expected_images: &'a [StackService],
+    pull_missing: bool,
+    remove_orphans: bool,
+    record_completion: bool,
+}
+
+fn stack_up_command(
+    endpoint: &str,
+    staged: &StagedDeployment,
+    project_id: i64,
+    built: &[StackService],
+    policy: &StackStartPolicy<'_>,
+) -> Result<String, String> {
+    let pull = if policy.pull_missing {
+        "missing"
+    } else {
+        "never"
+    };
+    let orphans = if policy.remove_orphans {
+        " --remove-orphans"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "{} up -d --no-build --pull {pull}{orphans}",
+        stack_command(endpoint, staged, project_id, built)?
+    ))
+}
+
+fn stack_start_command(
+    endpoint: &str,
+    staged: &StagedDeployment,
+    project_id: i64,
+    built: &[StackService],
+    policy: &StackStartPolicy<'_>,
+) -> Result<String, String> {
+    let up = stack_up_command(endpoint, staged, project_id, built, policy)?;
+    if !policy.record_completion {
+        return Ok(up);
+    }
+    let task_id = staged
+        .directory
+        .rsplit('/')
+        .next()
+        .ok_or("远端发布目录缺少任务 ID。")?;
+    let task_id = uuid::Uuid::parse_str(task_id).map_err(|_| "远端发布目录任务 ID 无效。")?;
+    let marker = shell_quote(&format!("{}/.compose-start-complete", staged.directory))?;
+    let temporary = shell_quote(&format!("{}/.compose-start-complete.tmp", staged.directory))?;
+    let directory = shell_quote(&staged.directory)?;
+    let content = shell_quote(&format!("{project_id}:{task_id}"))?;
+    let completion =
+        format!("(umask 077; printf %s {content} > {temporary} && mv -- {temporary} {marker})");
+    #[cfg(test)]
+    let completion = if project_id > 1_000_000_000
+        && TEST_FAIL_NEXT_STACK_COMPLETION
+            .compare_exchange(project_id, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        "false".to_owned()
+    } else {
+        completion
+    };
+    Ok(format!(
+        "test -d {directory} && test ! -L {directory} && \
+         test ! -e {marker} && test ! -L {marker} && \
+         test ! -e {temporary} && test ! -L {temporary} && \
+         {up} && {completion}"
+    ))
+}
+
 async fn start_stack_on(
     material: ConnectionMaterial,
     identity: ReleaseDockerIdentity<'_>,
     staged: &StagedDeployment,
     project_id: i64,
     built: &[StackService],
+    policy: StackStartPolicy<'_>,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) {
@@ -3188,7 +3904,7 @@ async fn start_stack_on(
         .await
         .map_err(|_| "整栈启动连接超时。")??;
     let endpoint = checked_release_endpoint(&handle, identity).await?;
-    for image in built {
+    for image in policy.expected_images {
         validate_deployment_image_ids(&image.image_ids)?;
         let inspect = docker_command(
             &endpoint,
@@ -3205,16 +3921,13 @@ async fn start_stack_on(
     if cancel.load(Ordering::Relaxed) {
         return Err("整栈启动已取消。".into());
     }
-    let command = format!(
-        "{} up -d --no-build --pull missing",
-        stack_command(&endpoint, staged, project_id, built)?
-    );
+    let command = stack_start_command(&endpoint, staged, project_id, built, &policy)?;
     tokio::select! {
         _ = wait_cancel(cancel) => Err("整栈启动已取消，结果待核实。".into()),
         result = tokio::time::timeout(Duration::from_secs(10 * 60), command_limited(&handle, &command, 64 * 1024)) =>
             result.map_err(|_| "整栈启动超时，结果待核实。".to_owned())?
                 .map(|_| ())
-                .map_err(|_| "整栈启动未确认成功，需核实全部服务。".into()),
+                .map_err(|error| format!("整栈启动未确认成功：{error} 远端状态待核实。")),
     }
 }
 
@@ -3227,12 +3940,66 @@ pub fn start_staged_stack(
     cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let material = material_for(&host)?;
-    tokio::runtime::Builder::new_current_thread()
+    let result = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|_| "无法初始化整栈部署环境。".to_owned())?
         .block_on(start_stack_on(
-            material, identity, staged, project_id, built, &cancel,
+            material,
+            identity,
+            staged,
+            project_id,
+            built,
+            StackStartPolicy {
+                expected_images: built,
+                pull_missing: true,
+                remove_orphans: false,
+                record_completion: true,
+            },
+            &cancel,
+        ));
+    #[cfg(test)]
+    if result.is_ok()
+        && project_id > 1_000_000_000
+        && TEST_DISCONNECT_NEXT_STACK_START
+            .compare_exchange(project_id, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        return Err("测试注入：整栈启动响应丢失，远端结果待核实。".into());
+    }
+    result
+}
+
+pub fn start_staged_rollback(
+    host: Host,
+    identity: ReleaseDockerIdentity<'_>,
+    staged: &StagedDeployment,
+    project_id: i64,
+    built: &[StackService],
+    expected_images: &[StackService],
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    if expected_images.is_empty() || expected_images.len() > 100 {
+        return Err("回滚服务镜像列表无效。".into());
+    }
+    let material = material_for(&host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化回滚环境。")?
+        .block_on(start_stack_on(
+            material,
+            identity,
+            staged,
+            project_id,
+            built,
+            StackStartPolicy {
+                expected_images,
+                pull_missing: false,
+                remove_orphans: true,
+                record_completion: false,
+            },
+            &cancel,
         ))
 }
 
@@ -3325,6 +4092,14 @@ pub fn check_staged_stack(
     services: &[StackService],
     cancel: Arc<AtomicBool>,
 ) -> Result<DeploymentState, String> {
+    #[cfg(test)]
+    if project_id > 1_000_000_000
+        && TEST_DISCONNECT_NEXT_STACK_CHECK
+            .compare_exchange(project_id, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        return Err("测试注入：健康核实 SSH 连接中断，结果待核实。".into());
+    }
     let material = material_for(&host)?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3333,6 +4108,176 @@ pub fn check_staged_stack(
         .block_on(check_stack_on(
             material, identity, staged, project_id, built, services, &cancel,
         ))
+}
+
+#[cfg(test)]
+static TEST_DISCONNECT_NEXT_STACK_CHECK: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+#[cfg(test)]
+static TEST_DISCONNECT_NEXT_STACK_START: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+#[cfg(test)]
+static TEST_FAIL_NEXT_STACK_COMPLETION: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+#[cfg(test)]
+pub(crate) fn inject_next_stack_completion_failure(project_id: i64) {
+    assert!(project_id > 1_000_000_000);
+    assert_eq!(
+        TEST_FAIL_NEXT_STACK_COMPLETION.swap(project_id, Ordering::SeqCst),
+        0
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn inject_next_stack_start_ack_loss(project_id: i64) {
+    assert!(project_id > 1_000_000_000);
+    assert_eq!(
+        TEST_DISCONNECT_NEXT_STACK_START.swap(project_id, Ordering::SeqCst),
+        0
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn inject_next_stack_check_disconnect(project_id: i64) {
+    assert!(project_id > 1_000_000_000);
+    assert_eq!(
+        TEST_DISCONNECT_NEXT_STACK_CHECK.swap(project_id, Ordering::SeqCst),
+        0
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn remove_isolated_target_image_tags(
+    source: &TaskSnapshot,
+    target: &TaskSnapshot,
+    images: &[crate::release_store::HistoricalImage],
+) -> Result<(), String> {
+    if source.project_id <= 1_000_000_000
+        || source.project_id != target.project_id
+        || images.len() != 2
+        || source.outcome != "complete"
+        || target.outcome != "complete"
+        || source.docker_daemon_id != target.docker_daemon_id
+    {
+        return Err("仅允许隔离测试版本的两份自有镜像 tag。".into());
+    }
+    let root = std::path::PathBuf::from(std::env::var_os("APPDATA").ok_or("APPDATA 缺失。")?)
+        .canonicalize()
+        .map_err(|_| "隔离目录缺失。")?;
+    if root.parent()
+        != Some(
+            std::env::temp_dir()
+                .canonicalize()
+                .map_err(|_| "临时目录缺失。")?
+                .as_path(),
+        )
+        || !root.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .starts_with("devingpanel-v20-series-")
+        })
+        || root
+            .join("devingPanel")
+            .canonicalize()
+            .ok()
+            .and_then(|data| data.parent().map(|parent| parent == root))
+            != Some(true)
+    {
+        return Err("必须使用隔离 APPDATA。".into());
+    }
+    let project = crate::project_store::effective(source.project_id)?;
+    if !project.name.starts_with("stack-series-")
+        || images
+            .iter()
+            .any(|image| !image.reference.starts_with(&format!("{}-", project.name)))
+    {
+        return Err("测试镜像引用不属于隔离项目。".into());
+    }
+    let running = observe_release_project(source)?;
+    if running.containers.len() != 4
+        || images.iter().any(|image| {
+            running
+                .containers
+                .iter()
+                .any(|container| container.config_image == image.reference)
+        })
+    {
+        return Err("目标镜像 tag 仍被当前容器使用。".into());
+    }
+    let material = material_for(&source.host)?;
+    let endpoint = source
+        .docker_endpoint
+        .as_deref()
+        .ok_or("Docker endpoint 缺失。")?;
+    let daemon_id = source
+        .docker_daemon_id
+        .as_deref()
+        .ok_or("Docker daemon 缺失。")?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化镜像测试。")?
+        .block_on(async {
+            let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+                .await
+                .map_err(|_| "测试 SSH 连接超时。")??;
+            checked_release_endpoint(
+                &handle,
+                ReleaseDockerIdentity {
+                    endpoint,
+                    daemon_id,
+                },
+            )
+            .await?;
+            for image in images {
+                let reference = shell_quote(&image.reference)?;
+                let inspect_format = concat!(
+                    "image inspect --format '",
+                    r#"{"Id":{{json .Id}},"Os":{{json .Os}},"Architecture":{{json .Architecture}}}"#,
+                    "' "
+                );
+                let metadata = archive_command(&handle,
+                    &docker_command(endpoint, &format!("{inspect_format}{reference}"))).await?;
+                if !historical_image_matches(&metadata, image)? {
+                    return Err("测试目标镜像 tag 已变化，禁止删除。".into());
+                }
+                let all = archive_command(&handle,
+                    &docker_command(endpoint, "ps -a --no-trunc --format '{{.ID}}'")) .await?;
+                let ids: Vec<String> = all.lines().map(str::to_owned).collect();
+                if ids.len() > 100 || ids.iter().any(|id| id.len() != 64 || validate_container_id(id).is_err()) {
+                    return Err("无法完整核实 daemon 上的容器引用。".into());
+                }
+                if !ids.is_empty() {
+                    let output = archive_command_with_timeout(&handle,
+                        &deployment_inspect_command(endpoint, &ids)?, Duration::from_secs(20)).await?;
+                    for line in output.lines() {
+                        let row: Value = serde_json::from_str(line).map_err(|_| "容器镜像引用无法解析。")?;
+                        if row.get("ConfigImage").and_then(Value::as_str) == Some(&image.reference) {
+                            return Err("其他容器仍使用目标镜像 tag，禁止测试移除。".into());
+                        }
+                    }
+                    if output.lines().count() != ids.len() {
+                        return Err("daemon 容器元数据不完整。".into());
+                    }
+                }
+                let command = docker_command(
+                    endpoint,
+                    &format!("image rm -- {reference}"),
+                );
+                archive_command(&handle, &command).await?;
+            }
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+            Ok::<(), String>(())
+        })?;
+    if historical_image_states(source, images)?
+        .iter()
+        .any(|(_, state)| *state != HistoricalImageState::Missing)
+    {
+        return Err("测试目标镜像 tag 未全部移除。".into());
+    }
+    Ok(())
 }
 
 fn validated_load_target(
@@ -3490,22 +4435,181 @@ pub fn load_uploaded_archive(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_command_exit_error_keeps_status_without_output() {
+        assert_eq!(
+            super::command_exit_error(Some(17)),
+            "远端命令以退出码 17 结束。"
+        );
+        assert_eq!(
+            super::command_exit_error(None),
+            "远端 SSH 会话未返回命令退出状态。"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "read-only Docker state audit of an isolated LAN startup with no completion marker"]
+    async fn isolated_lan_second_unknown_container_states() {
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        assert_eq!(
+            appdata.parent().unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .join("target/isolated-tests/ui-lan-recovery-5c842ae5a3de461684a8f2b1bd0400d3")
+                .canonicalize()
+                .unwrap()
+        );
+        let batch = crate::batch_store::get("0e1ffb0e-25ba-4537-a76e-a3c164ffaf0b").unwrap();
+        assert_eq!(batch.project_id, 1856624454);
+        assert_eq!(batch.state, "unknown");
+        let target = &batch.targets[1];
+        assert_eq!(target.host.address, "192.168.63.130");
+        assert_eq!(
+            target.docker_daemon_id,
+            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"
+        );
+        let handle = super::trusted_handle(super::material_for(&target.host).unwrap())
+            .await
+            .unwrap();
+        let endpoint = super::checked_release_endpoint(
+            &handle,
+            super::ReleaseDockerIdentity {
+                endpoint: &target.docker_endpoint,
+                daemon_id: &target.docker_daemon_id,
+            },
+        )
+        .await
+        .unwrap();
+        let output = super::command_limited(
+            &handle,
+            &super::docker_command(
+                &endpoint,
+                "ps --all --no-trunc --filter label=com.docker.compose.project=dp1856624454 --format '{{json .}}'",
+            ),
+            65536,
+        )
+        .await
+        .unwrap();
+        let rows = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 4);
+        for row in rows {
+            let id = row["ID"].as_str().unwrap();
+            assert_eq!(id.len(), 64);
+            assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            let labels = super::archive_command(
+                &handle,
+                &super::docker_command(
+                    &endpoint,
+                    &format!("inspect --format '{{{{json .Config.Labels}}}}' {id}"),
+                ),
+            )
+            .await
+            .unwrap();
+            let labels: serde_json::Value = serde_json::from_str(labels.trim()).unwrap();
+            assert_eq!(labels["com.docker.compose.project"], "dp1856624454");
+            let state = super::archive_command(
+                &handle,
+                &super::docker_command(
+                    &endpoint,
+                    &format!("inspect --format '{{{{json .State}}}}' {id}"),
+                ),
+            )
+            .await
+            .unwrap();
+            let state: serde_json::Value = serde_json::from_str(state.trim()).unwrap();
+            eprintln!(
+                "{}: status={}, error={}, started={}, finished={}",
+                labels["com.docker.compose.service"],
+                state["Status"],
+                state["Error"],
+                state["StartedAt"],
+                state["FinishedAt"]
+            );
+            if let Some(health) = state["Health"].as_object() {
+                let checks = health["Log"].as_array().unwrap();
+                eprintln!(
+                    "{} health: status={}, checks={:?}",
+                    labels["com.docker.compose.service"],
+                    health["Status"],
+                    checks
+                        .iter()
+                        .map(|check| (
+                            check["Start"].as_str().unwrap_or_default(),
+                            check["ExitCode"].as_i64().unwrap_or_default()
+                        ))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        let active = super::archive_command(
+            &handle,
+            "sh -c \"pgrep -af 'docker.*[d]p1856624454' || true\"",
+        )
+        .await
+        .unwrap();
+        eprintln!("matching Compose processes: {}", active.trim());
+        let events = super::command_limited(
+            &handle,
+            &super::docker_command(
+                &endpoint,
+                "events --since '2026-10-30T01:44:30Z' --until '2026-10-30T01:44:50Z' --filter label=com.docker.compose.project=dp1856624454 --format '{{json .}}'",
+            ),
+            65536,
+        )
+        .await
+        .unwrap();
+        eprintln!("bounded project events: {}", events.lines().count());
+        for line in events.lines() {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            eprintln!(
+                "event {} {} {}",
+                event["timeNano"],
+                event["Action"],
+                event["Actor"]["Attributes"]["com.docker.compose.service"]
+            );
+        }
+        let _ = handle
+            .disconnect(russh::Disconnect::ByApplication, "", "en")
+            .await;
+    }
+
     use super::{
         ContainerAction, DeploymentState, DockerInstallSource, LogEvent, LogLineBuffer, TestResult,
         apt_candidates_use_source, cleanup_archive_command, container_command, cpu_counters,
         default_route_interface, disk_available, disk_percent, docker_install_commands,
         execute_container_action, execute_disk_prune, fetch_disk_preview, fetch_inventory,
         fetch_monitor, follow_logs, image_size_bytes, inspect_deployment_state, memory_kib,
-        merged_mirror_config, mirrors_active, network_bytes, parse_disk_preview, parse_inventory,
-        probe, safe_version, same_connection_target, shell_quote, valid_docker_signing_key,
+        merged_mirror_config, mirrors_active, network_bytes, parse_compose_hashes,
+        parse_disk_preview, parse_inventory, probe, remote_archive_size, safe_version,
+        same_connection_target, sftp_upload_config, shell_quote, valid_docker_signing_key,
         validated_release_directory, validated_release_file, validated_upload_directory,
-        verified_compose_config, verified_sha256,
+        verified_compose_config, verified_sha256, verify_container_config_hashes,
     };
     use crate::host_store::{ConnectionMaterial, Host};
     use crate::release_store::HistoricalImage;
     use russh::server::{self, Auth, Msg, Server as _, Session};
     use russh::{Channel, ChannelId};
     use russh_sftp::protocol::{Attrs, FileAttributes, Handle, OpenFlags, Status, StatusCode};
+
+    #[test]
+    fn remote_uploads_bound_inflight_writes_and_ack_timeout() {
+        assert_eq!(sftp_upload_config().max_concurrent_writes, 4);
+        assert_eq!(sftp_upload_config().request_timeout_secs, 60);
+    }
+
+    #[test]
+    fn remote_archive_probe_rejects_ambiguous_file_types_and_sizes() {
+        assert_eq!(remote_archive_size("missing\n").unwrap(), None);
+        assert_eq!(remote_archive_size("size:262144\n").unwrap(), Some(262144));
+        assert!(remote_archive_size("invalid\n").is_err());
+        assert!(remote_archive_size("size:-1\n").is_err());
+        assert!(remote_archive_size("size:12\nsize:13\n").is_err());
+    }
     use sha2::Digest;
     use std::collections::HashMap;
     use std::sync::{
@@ -3513,6 +4617,26 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
+
+    #[test]
+    fn compose_hashes_reject_drift_missing_and_duplicate_services() {
+        let web = "a".repeat(64);
+        let db = "b".repeat(64);
+        let expected = parse_compose_hashes(&format!("web {web}\ndb {db}\n")).unwrap();
+        let ids = vec!["c".repeat(64), "d".repeat(64)];
+        let rows = format!(
+            "{{\"Id\":\"{}\",\"Service\":\"web\",\"ConfigHash\":\"{web}\"}}\n{{\"Id\":\"{}\",\"Service\":\"db\",\"ConfigHash\":\"{db}\"}}",
+            ids[0], ids[1]
+        );
+        assert!(verify_container_config_hashes(&ids, &rows, &expected).is_ok());
+        assert!(verify_container_config_hashes(&ids, &rows.replace(&db, &web), &expected).is_err());
+        assert!(
+            verify_container_config_hashes(&ids, &rows.replace("\"db\"", "\"web\""), &expected)
+                .is_err()
+        );
+        assert!(parse_compose_hashes(&format!("web {web}\nweb {web}")).is_err());
+        assert!(parse_compose_hashes("web bad").is_err());
+    }
 
     #[test]
     fn deployment_paths_are_private_and_cannot_escape_the_release_root() {
@@ -3616,6 +4740,73 @@ mod tests {
         };
         let command =
             super::stack_command("unix:///var/run/docker.sock", &staged, 1, &built).unwrap();
+        let rollback_command = super::stack_up_command(
+            "unix:///var/run/docker.sock",
+            &staged,
+            1,
+            &built,
+            &super::StackStartPolicy {
+                expected_images: &built,
+                pull_missing: false,
+                remove_orphans: true,
+                record_completion: false,
+            },
+        )
+        .unwrap();
+        assert!(rollback_command.ends_with("up -d --no-build --pull never --remove-orphans"));
+        let normal_command = super::stack_up_command(
+            "unix:///var/run/docker.sock",
+            &staged,
+            1,
+            &built,
+            &super::StackStartPolicy {
+                expected_images: &built,
+                pull_missing: true,
+                remove_orphans: false,
+                record_completion: true,
+            },
+        )
+        .unwrap();
+        assert!(normal_command.ends_with("up -d --no-build --pull missing"));
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let release_dir =
+            format!("/root/.local/share/devingpanel/projects/1001/releases/{task_id}");
+        let staged_release = super::StagedDeployment {
+            env_path: format!("{release_dir}/.env"),
+            directory: release_dir.clone(),
+            compose_files: vec!["compose.yaml".into()],
+        };
+        let start = super::stack_start_command(
+            "unix:///var/run/docker.sock",
+            &staged_release,
+            1001,
+            &built,
+            &super::StackStartPolicy {
+                expected_images: &built,
+                pull_missing: true,
+                remove_orphans: false,
+                record_completion: true,
+            },
+        )
+        .unwrap();
+        assert!(start.contains("up -d --no-build --pull missing && (umask 077;"));
+        assert!(start.contains(&format!("{release_dir}/.compose-start-complete")));
+        assert!(start.contains(&format!("1001:{task_id}")));
+        assert!(
+            super::stack_start_command(
+                "unix:///var/run/docker.sock",
+                &staged,
+                1,
+                &built,
+                &super::StackStartPolicy {
+                    expected_images: &built,
+                    pull_missing: true,
+                    remove_orphans: false,
+                    record_completion: true,
+                },
+            )
+            .is_err()
+        );
         assert!(command.contains("DEVINGPANEL_IMAGE_WEB='app:v1'"));
         assert!(command.contains("DEVINGPANEL_IMAGE_WORKER='worker:v1'"));
         let config = r#"{"services":{"web":{"image":"app:v1"},"worker":{"image":"worker:v1"},"db":{"image":"postgres:16"}}}"#;
@@ -3931,85 +5122,6 @@ mod tests {
         );
         task.docker_daemon_id = Some("changed-daemon".into());
         assert!(super::observe_historical_images(&task, &images).is_err());
-    }
-
-    #[test]
-    #[ignore = "removes only an explicitly selected isolated stack-series Compose project on the test VPS"]
-    fn real_cleanup_isolated_series_stack() {
-        let project_id: i64 = std::env::var("DEVINGPANEL_TEST_CLEANUP_PROJECT_ID")
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(project_id > 3);
-        let project = crate::project_store::effective(project_id).unwrap();
-        assert!(project.name.starts_with("stack-series-"));
-        let data = crate::preferences::data_dir()
-            .unwrap()
-            .canonicalize()
-            .unwrap();
-        assert!(std::path::Path::new(&project.path).starts_with(&data));
-        let task = crate::release_store::recent(Some(project_id))
-            .unwrap()
-            .into_iter()
-            .find(|task| task.phase == "checked" && task.outcome == "blocked")
-            .expect("isolated failing release not found");
-        let images = crate::release_store::historical_images(&task.id).unwrap();
-        let built: Vec<_> = images
-            .into_iter()
-            .map(|image| super::StackService {
-                service: image.service,
-                reference: image.reference,
-                image_ids: image.image_ids,
-            })
-            .collect();
-        let files = crate::release_materials::load(&task.id).unwrap();
-        let before = super::observe_release_project(&task).unwrap();
-        assert_eq!(before.containers.len(), 4);
-        let material = super::material_for(&task.host).unwrap();
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let handle = super::trusted_handle(material).await?;
-                let identity = super::ReleaseDockerIdentity {
-                    endpoint: task.docker_endpoint.as_deref().unwrap(),
-                    daemon_id: task.docker_daemon_id.as_deref().unwrap(),
-                };
-                let endpoint = super::checked_release_endpoint(&handle, identity).await?;
-                let home = super::archive_command(&handle, "sh -c 'printf %s \"$HOME\"'").await?;
-                let directory = super::validated_release_directory(&home, project_id, &task.id)?;
-                let staged = super::StagedDeployment {
-                    env_path: format!("{directory}/.env"),
-                    compose_files: files
-                        .compose_files
-                        .iter()
-                        .map(|file| file.path.clone())
-                        .collect(),
-                    directory,
-                };
-                let command = format!(
-                    "{} down --remove-orphans",
-                    super::stack_command(&endpoint, &staged, project_id, &built)?
-                );
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(120),
-                    super::command_limited(&handle, &command, 64 * 1024),
-                )
-                .await
-                .map_err(|_| "隔离 Compose 清理超时，状态待核实。")??;
-                let _ = handle
-                    .disconnect(russh::Disconnect::ByApplication, "", "en")
-                    .await;
-                Ok::<_, String>(())
-            })
-            .unwrap();
-        assert!(
-            super::observe_release_project(&task)
-                .unwrap()
-                .containers
-                .is_empty()
-        );
     }
 
     #[test]
@@ -4397,7 +5509,7 @@ mod tests {
             address: "web.example".into(),
             port: 22,
             username: "root".into(),
-            group: String::new(),
+            group: "test".into(),
             auth: "password".into(),
             trusted_fingerprint: Some("SHA256:known".into()),
         };
@@ -4408,6 +5520,9 @@ mod tests {
         changed = host.clone();
         changed.trusted_fingerprint = None;
         assert!(!same_connection_target(&host, &changed));
+        changed = host.clone();
+        changed.group.clear();
+        assert!(same_connection_target(&host, &changed));
     }
 
     #[test]
@@ -4506,6 +5621,7 @@ mod tests {
         upload_channels: Arc<tokio::sync::Mutex<HashMap<ChannelId, Channel<Msg>>>>,
         upload_files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         upload_fail_write: Arc<AtomicBool>,
+        upload_fail_after: Arc<AtomicUsize>,
         load_tag_exists: Arc<AtomicBool>,
         load_no_exit: Arc<AtomicBool>,
         docker_missing: Arc<AtomicBool>,
@@ -4514,6 +5630,7 @@ mod tests {
     struct MemorySftp {
         files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         fail_write: Arc<AtomicBool>,
+        fail_after: Arc<AtomicUsize>,
     }
 
     impl russh_sftp::server::Handler for MemorySftp {
@@ -4530,16 +5647,24 @@ mod tests {
             flags: OpenFlags,
             attrs: FileAttributes,
         ) -> Result<Handle, Self::Error> {
-            if !flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE)
-                || attrs.permissions != Some(0o600)
+            let mut files = self.files.lock().unwrap();
+            if flags.contains(OpenFlags::WRITE)
+                && !flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUDE)
+                && attrs.permissions.is_none()
             {
+                if !files.contains_key(&filename) {
+                    return Err(StatusCode::NoSuchFile);
+                }
+            } else if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE)
+                && attrs.permissions == Some(0o600)
+            {
+                if files.contains_key(&filename) {
+                    return Err(StatusCode::Failure);
+                }
+                files.insert(filename.clone(), Vec::new());
+            } else {
                 return Err(StatusCode::PermissionDenied);
             }
-            let mut files = self.files.lock().unwrap();
-            if files.contains_key(&filename) {
-                return Err(StatusCode::Failure);
-            }
-            files.insert(filename.clone(), Vec::new());
             Ok(Handle {
                 id,
                 handle: filename,
@@ -4553,11 +5678,14 @@ mod tests {
             offset: u64,
             bytes: Vec<u8>,
         ) -> Result<Status, Self::Error> {
-            if self.fail_write.load(Ordering::SeqCst) {
-                return Err(StatusCode::PermissionDenied);
-            }
             let mut files = self.files.lock().unwrap();
             let data = files.get_mut(&handle).ok_or(StatusCode::NoSuchFile)?;
+            let fail_after = self.fail_after.load(Ordering::SeqCst);
+            if self.fail_write.load(Ordering::SeqCst)
+                || (fail_after != 0 && data.len() >= fail_after)
+            {
+                return Err(StatusCode::PermissionDenied);
+            }
             if offset != data.len() as u64 {
                 return Err(StatusCode::Failure);
             }
@@ -4616,10 +5744,15 @@ mod tests {
                     session.channel_success(channel)?;
                     let files = self.upload_files.clone();
                     let fail_write = self.upload_fail_write.clone();
+                    let fail_after = self.upload_fail_after.clone();
                     tokio::spawn(async move {
                         russh_sftp::server::run(
                             stream.into_stream(),
-                            MemorySftp { files, fail_write },
+                            MemorySftp {
+                                files,
+                                fail_write,
+                                fail_after,
+                            },
                         )
                         .await;
                     });
@@ -4757,6 +5890,20 @@ mod tests {
                 session.close(channel)?;
                 return Ok(());
             }
+            if data == b"diagnostic-exit-17" {
+                session.channel_success(channel)?;
+                session.data(channel, b"SECRET=not-for-errors\n".to_vec())?;
+                session.exit_status_request(channel, 17)?;
+                session.eof(channel)?;
+                session.close(channel)?;
+                return Ok(());
+            }
+            if data == b"diagnostic-no-exit" {
+                session.channel_success(channel)?;
+                session.data(channel, b"SECRET=not-for-errors\n".to_vec())?;
+                session.close(channel)?;
+                return Ok(());
+            }
             if data == br#"docker --host unix:///var/run/docker.sock image inspect --format '{"Id":{{json .Id}},"Os":{{json .Os}},"Architecture":{{json .Architecture}}}' app:load-test"# {
                 let response = format!(
                     "{{\"Id\":\"sha256:{}\",\"Os\":\"linux\",\"Architecture\":\"amd64\"}}\n",
@@ -4781,6 +5928,36 @@ mod tests {
                 session.data(channel, b"2026-10-26 stdout".to_vec())?;
                 session.extended_data(channel, 1, b"2026-10-26 stderr\n".to_vec())?;
                 session.data(channel, b"\n".to_vec())?;
+                session.exit_status_request(channel, 0)?;
+                session.eof(channel)?;
+                session.close(channel)?;
+                return Ok(());
+            }
+            if self.upload_sftp.load(Ordering::SeqCst)
+                && let Ok(text) = std::str::from_utf8(data)
+                && let Some(directory) = text
+                    .strip_prefix("sh -c 'if test -L ")
+                    .and_then(|value| value.split_once(';').map(|(directory, _)| directory))
+            {
+                super::validated_upload_directory(directory)
+                    .map_err(|_| russh::Error::Disconnect)?;
+                let response =
+                    if text.contains("then echo invalid") && text.contains("stat -c \"size:%s\"") {
+                        self.upload_files
+                            .lock()
+                            .unwrap()
+                            .get(&format!("{directory}/image.tar"))
+                            .map_or_else(
+                                || "missing\n".to_owned(),
+                                |bytes| format!("size:{}\n", bytes.len()),
+                            )
+                    } else if text.contains("then exit 1") && text.contains("mkdir -m 700") {
+                        String::new()
+                    } else {
+                        return Err(russh::Error::Disconnect);
+                    };
+                session.channel_success(channel)?;
+                session.data(channel, response.into_bytes())?;
                 session.exit_status_request(channel, 0)?;
                 session.eof(channel)?;
                 session.close(channel)?;
@@ -4912,6 +6089,7 @@ mod tests {
         let upload_sftp = Arc::new(AtomicBool::new(false));
         let upload_files = Arc::new(Mutex::new(HashMap::new()));
         let upload_fail_write = Arc::new(AtomicBool::new(false));
+        let upload_fail_after = Arc::new(AtomicUsize::new(0));
         let load_tag_exists = Arc::new(AtomicBool::new(false));
         let load_no_exit = Arc::new(AtomicBool::new(false));
         let docker_missing = Arc::new(AtomicBool::new(false));
@@ -4941,6 +6119,7 @@ mod tests {
             upload_channels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             upload_files: upload_files.clone(),
             upload_fail_write: upload_fail_write.clone(),
+            upload_fail_after: upload_fail_after.clone(),
             load_tag_exists: load_tag_exists.clone(),
             load_no_exit: load_no_exit.clone(),
             docker_missing: docker_missing.clone(),
@@ -5392,6 +6571,159 @@ mod tests {
             assert!(failure.is_err());
             assert!(upload_files.lock().unwrap().is_empty());
             upload_fail_write.store(false, Ordering::SeqCst);
+            let reserved = format!("/tmp/devingpanel.{}", uuid::Uuid::new_v4().simple());
+            let identity = super::ReleaseDockerIdentity {
+                endpoint: "unix:///var/run/docker.sock",
+                daemon_id: "TEST:ID",
+            };
+            upload_fail_write.store(true, Ordering::SeqCst);
+            let interrupted = Box::pin(super::transfer_archive_to(
+                material(Some(fingerprint.clone())),
+                &archive_path,
+                bytes.len() as u64,
+                &AtomicBool::new(false),
+                &mut |_, _| {},
+                super::ArchiveTransferOptions {
+                    directory: Some(&reserved),
+                    preserve_on_error: true,
+                    expected_identity: Some(identity),
+                },
+            ))
+            .await;
+            assert!(interrupted.is_err());
+            let path = format!("{reserved}/image.tar");
+            assert!(upload_files.lock().unwrap().contains_key(&path));
+            upload_fail_write.store(false, Ordering::SeqCst);
+            let record = crate::release_store::UploadedArchiveRecord {
+                service: "web".into(),
+                directory: reserved.clone(),
+                bytes: bytes.len() as u64,
+                sha256: format!("{:x}", sha2::Sha256::digest(&bytes)),
+                state: "reserved".into(),
+            };
+            upload_files
+                .lock()
+                .unwrap()
+                .insert(path.clone(), bytes[..65_536].to_vec());
+            upload_files.lock().unwrap().get_mut(&path).unwrap()[0] ^= 1;
+            assert!(
+                Box::pin(super::resume_uploaded_archive_on(
+                    material(Some(fingerprint.clone())),
+                    identity,
+                    &record,
+                    &archive_path,
+                    &AtomicBool::new(false),
+                    &mut |_, _| {},
+                ))
+                .await
+                .err()
+                .unwrap()
+                .contains("前缀 SHA-256 不符")
+            );
+            assert_eq!(
+                upload_files.lock().unwrap().get(&path).unwrap().len(),
+                65_536
+            );
+            upload_files.lock().unwrap().get_mut(&path).unwrap()[0] ^= 1;
+            upload_fail_after.store(100_000, Ordering::SeqCst);
+            assert!(
+                Box::pin(super::resume_uploaded_archive_on(
+                    material(Some(fingerprint.clone())),
+                    identity,
+                    &record,
+                    &archive_path,
+                    &AtomicBool::new(false),
+                    &mut |_, _| {},
+                ))
+                .await
+                .is_err()
+            );
+            let partial = upload_files.lock().unwrap().get(&path).unwrap().clone();
+            assert!(partial.len() >= 100_000 && partial.len() < bytes.len());
+            assert_eq!(partial, bytes[..partial.len()]);
+            upload_fail_after.store(0, Ordering::SeqCst);
+            Box::pin(super::resume_uploaded_archive_on(
+                material(Some(fingerprint.clone())),
+                identity,
+                &record,
+                &archive_path,
+                &AtomicBool::new(false),
+                &mut |_, _| {},
+            ))
+            .await
+            .unwrap();
+            assert_eq!(upload_files.lock().unwrap().get(&path), Some(&bytes));
+            let mut mismatched = record;
+            mismatched.sha256 = "0".repeat(64);
+            assert!(
+                Box::pin(super::resume_uploaded_archive_on(
+                    material(Some(fingerprint.clone())),
+                    identity,
+                    &mismatched,
+                    &archive_path,
+                    &AtomicBool::new(false),
+                    &mut |_, _| {},
+                ))
+                .await
+                .is_err()
+            );
+            assert_eq!(upload_files.lock().unwrap().get(&path), Some(&bytes));
+            let cleanup_handle = super::trusted_handle(material(Some(fingerprint.clone())))
+                .await
+                .unwrap();
+            super::archive_command(
+                &cleanup_handle,
+                &super::cleanup_archive_command(&reserved).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert!(upload_files.lock().unwrap().is_empty());
+            let missing = format!("/tmp/devingpanel.{}", uuid::Uuid::new_v4().simple());
+            upload_fail_write.store(true, Ordering::SeqCst);
+            assert!(
+                Box::pin(super::transfer_archive_to(
+                    material(Some(fingerprint.clone())),
+                    &archive_path,
+                    bytes.len() as u64,
+                    &AtomicBool::new(false),
+                    &mut |_, _| {},
+                    super::ArchiveTransferOptions {
+                        directory: Some(&missing),
+                        preserve_on_error: true,
+                        expected_identity: Some(identity),
+                    },
+                ))
+                .await
+                .is_err()
+            );
+            let missing_path = format!("{missing}/image.tar");
+            assert!(upload_files.lock().unwrap().remove(&missing_path).is_some());
+            upload_fail_write.store(false, Ordering::SeqCst);
+            Box::pin(super::transfer_archive_to(
+                material(Some(fingerprint.clone())),
+                &archive_path,
+                bytes.len() as u64,
+                &AtomicBool::new(false),
+                &mut |_, _| {},
+                super::ArchiveTransferOptions {
+                    directory: Some(&missing),
+                    preserve_on_error: true,
+                    expected_identity: Some(identity),
+                },
+            ))
+            .await
+            .unwrap();
+            assert_eq!(
+                upload_files.lock().unwrap().get(&missing_path),
+                Some(&bytes)
+            );
+            super::archive_command(
+                &cleanup_handle,
+                &super::cleanup_archive_command(&missing).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert!(upload_files.lock().unwrap().is_empty());
             std::fs::remove_file(&archive_path).unwrap();
             upload_sftp.store(false, Ordering::SeqCst);
             let unknown = execute_container_action(
@@ -5412,7 +6744,7 @@ mod tests {
                 .unwrap()
                 .to_string();
             assert!(probe(wrong_material).await.is_err());
-            let mut key_material = material(Some(fingerprint));
+            let mut key_material = material(Some(fingerprint.clone()));
             key_material.host.auth = "key".into();
             key_material.credential = user_key
                 .to_openssh(russh::keys::ssh_key::LineEnding::LF)
@@ -5422,6 +6754,24 @@ mod tests {
                 probe(key_material).await.unwrap(),
                 TestResult::Connected { .. }
             ));
+            let diagnostic = super::trusted_handle(material(Some(fingerprint)))
+                .await
+                .unwrap();
+            assert_eq!(
+                super::command_limited(&diagnostic, "diagnostic-exit-17", 1024)
+                    .await
+                    .unwrap_err(),
+                "远端命令以退出码 17 结束。"
+            );
+            assert_eq!(
+                super::command_limited(&diagnostic, "diagnostic-no-exit", 1024)
+                    .await
+                    .unwrap_err(),
+                "远端 SSH 会话未返回命令退出状态。"
+            );
+            let _ = diagnostic
+                .disconnect(russh::Disconnect::ByApplication, "", "en")
+                .await;
             assert!(attempts.load(Ordering::SeqCst) >= 3);
             handle.shutdown("done".into());
         };

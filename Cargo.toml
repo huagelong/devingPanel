@@ -20,4 +20,5 @@ uuid = { version = "1", features = ["v4"] }
 yaml-rust2 = "0.13"
 
 [dev-dependencies]
+gpui-pre = { version = "=0.3.9", features = ["test-support"] }
 rand = "0.10"

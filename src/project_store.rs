@@ -516,13 +516,38 @@ pub fn update(id: i64, input: NewProject) -> Result<Project, String> {
 fn delete_in(conn: &Connection, id: i64) -> Result<(), String> {
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|err| err.to_string())?;
-    let unresolved: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM release_tasks WHERE project_id = ?1 AND outcome IN ('running', 'unknown', 'blocked')",
-        [id],
-        |row| row.get(0),
-    ).map_err(|err| err.to_string())?;
+    let batch_history: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM release_batches WHERE project_id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(|err| err.to_string())?;
+    if batch_history != 0 {
+        return Err("项目有发布批次历史，不能删除或复用项目 ID。".into());
+    }
+    let unresolved: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM release_tasks WHERE project_id = ?1 AND (
+            outcome IN ('running', 'unknown', 'blocked')
+            OR (outcome = 'complete' AND health_result = 'healthy'))",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(|err| err.to_string())?;
     if unresolved != 0 {
-        return Err("项目有未核实的发布任务，不能删除。".into());
+        return Err("项目有未核实任务或已完成的受保护版本，不能删除。".into());
+    }
+    let rollback_active: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM rollback_tasks WHERE project_id = ?1
+         AND outcome IN ('running', 'unknown', 'blocked')",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(|err| err.to_string())?;
+    if rollback_active != 0 {
+        return Err("项目有待核实的回滚任务，不能删除。".into());
     }
     env_store::queue_for_project(&transaction, id).map_err(|err| err.to_string())?;
     if transaction
@@ -838,6 +863,31 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn active_batch_prevents_project_deletion() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, name, path, dockerfile, image, manifest_mode)
+            VALUES (7, 'app', '.', 'Dockerfile', 'app', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO release_batches (id, project_id, config_sha256, state)
+            VALUES ('batch', 7, ?1, 'prepared')",
+            ["a".repeat(64)],
+        )
+        .unwrap();
+        assert!(delete_in(&conn, 7).is_err());
+        conn.execute(
+            "UPDATE release_batches SET state = 'terminated' WHERE id = 'batch'",
+            [],
+        )
+        .unwrap();
+        assert!(delete_in(&conn, 7).is_err());
+    }
+
+    #[test]
     fn imports_developer_manifest_and_never_falls_back_to_stale_db_fields() {
         let directory = std::env::temp_dir().join(format!(
             "devingpanel-manifest-{}",
@@ -1004,6 +1054,13 @@ mod tests {
              'SHA256:known', 'app:v1', 'linux/amd64', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'loading', 'unknown')",
             [first.id],
         ).unwrap();
+        assert!(delete_in(&conn, first.id).is_err());
+        conn.execute(
+            "UPDATE release_tasks SET outcome = 'failed' WHERE id = 'task'",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE release_tasks SET phase = 'checked', outcome = 'complete', health_result = 'healthy' WHERE id = 'task'", []).unwrap();
         assert!(delete_in(&conn, first.id).is_err());
         conn.execute(
             "UPDATE release_tasks SET outcome = 'failed' WHERE id = 'task'",
@@ -1361,7 +1418,7 @@ mod tests {
             [("A".into(), "1".into()), ("B".into(), "2".into())]
         );
         assert_eq!(list_in(&reopened).unwrap()[0].service, "web");
-        reopened.pragma_update(None, "user_version", 21).unwrap();
+        reopened.pragma_update(None, "user_version", 32).unwrap();
         assert!(initialize(&reopened).is_err());
         drop(reopened);
         set_compose_files_in(
@@ -1424,7 +1481,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 20);
+        assert_eq!(version, 31);
         let project = &list_in(&conn).unwrap()[0];
         assert_eq!(project.image, "repo/app");
         assert_eq!(project.platform, "linux/arm64");

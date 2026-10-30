@@ -1,15 +1,164 @@
 use crate::project_config;
 use crate::project_store::Project;
+use crate::ssh::DeploymentFile;
 use serde_json::Value;
-use std::fs::File;
-use std::io::Read;
-use std::path::{Component, Path};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use yaml_rust2::{Yaml, YamlLoader, yaml::Hash};
 
 const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
+
+struct SnapshotDirectory {
+    root: PathBuf,
+    files: Vec<PathBuf>,
+}
+
+impl Drop for SnapshotDirectory {
+    fn drop(&mut self) {
+        let mut directories = Vec::new();
+        for path in &self.files {
+            let _ = fs::remove_file(path);
+            for directory in path.parent().into_iter().flat_map(Path::ancestors) {
+                if directory == self.root || !directory.starts_with(&self.root) {
+                    break;
+                }
+                directories.push(directory.to_path_buf());
+            }
+        }
+        directories.sort_by(|a, b| {
+            b.components()
+                .count()
+                .cmp(&a.components().count())
+                .then_with(|| a.cmp(b))
+        });
+        directories.dedup();
+        for directory in directories {
+            let _ = fs::remove_dir(directory);
+        }
+        let _ = fs::remove_dir(&self.root);
+    }
+}
+
+pub(crate) fn config_snapshot(files: &[DeploymentFile], env_file: &[u8]) -> Result<Value, String> {
+    if files.is_empty() || files.len() > 16 || files[0].path.contains('/') {
+        return Err("批次 Compose 文件列表无效。".into());
+    }
+    let parent = crate::preferences::data_dir().ok_or("无法确定本机配置目录。")?;
+    fs::create_dir_all(&parent).map_err(|_| "无法创建本机配置目录。")?;
+    let root = parent.join(format!("batch-config-{}", uuid::Uuid::new_v4().simple()));
+    fs::create_dir(&root).map_err(|_| "无法创建临时 Compose 配置目录。")?;
+    let mut cleanup = SnapshotDirectory {
+        root: root.clone(),
+        files: Vec::new(),
+    };
+    let mut command = Command::new("docker");
+    command
+        .arg("compose")
+        .arg("--project-directory")
+        .arg(&root)
+        .arg("--env-file")
+        .arg(root.join(".env"));
+    for file in files {
+        crate::ssh::validated_release_file(&file.path)?;
+        let path = root.join(&file.path);
+        cleanup.files.push(path.clone());
+        fs::create_dir_all(path.parent().ok_or("Compose 临时路径无效。")?)
+            .map_err(|_| "无法创建 Compose 临时子目录。")?;
+        write_snapshot_file(&path, &file.bytes)?;
+        command.arg("-f").arg(path);
+    }
+    let env_path = root.join(".env");
+    cleanup.files.push(env_path.clone());
+    write_snapshot_file(&env_path, env_file)?;
+    let source = std::str::from_utf8(env_file).map_err(|_| "批次环境文件不是 UTF-8。")?;
+    for line in source.lines().filter(|line| !line.is_empty()) {
+        let (name, _) = line.split_once('=').ok_or("批次环境文件格式无效。")?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err("批次环境变量名无效。".into());
+        }
+        command.env_remove(name);
+    }
+    command
+        .args([
+            "config",
+            "--no-path-resolution",
+            "--no-env-resolution",
+            "--format",
+            "json",
+        ])
+        .current_dir(&root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    run_config(command)
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::config_snapshot;
+    use crate::ssh::DeploymentFile;
+
+    #[test]
+    #[ignore = "requires local Docker Compose CLI; creates only temporary config files"]
+    fn frozen_compose_uses_its_environment_and_cleans_temporary_files() {
+        let files = vec![DeploymentFile {
+            path: "compose.yaml".into(),
+            bytes: b"services:\n  web:\n    image: ${DEVINGPANEL_IMAGE_WEB}\n    healthcheck:\n      test: [CMD-SHELL, \"true\"]\n".to_vec(),
+        }];
+        let before = std::fs::read_dir(crate::preferences::data_dir().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("batch-config-")
+            })
+            .count();
+        let resolved =
+            config_snapshot(&files, b"DEVINGPANEL_IMAGE_WEB=\"app:test-amd64\"\n").unwrap();
+        assert_eq!(resolved["services"]["web"]["image"], "app:test-amd64");
+        assert_eq!(
+            resolved["services"]["web"]["healthcheck"]["test"],
+            serde_json::json!(["CMD-SHELL", "true"])
+        );
+        let after = std::fs::read_dir(crate::preferences::data_dir().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("batch-config-")
+            })
+            .count();
+        assert_eq!(before, after);
+    }
+}
+
+fn write_snapshot_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| "无法创建临时 Compose 文件。")?;
+    file.write_all(bytes)
+        .map_err(|_| "无法保存临时 Compose 文件。")?;
+    file.sync_all()
+        .map_err(|_| "无法持久化临时 Compose 文件。".to_owned())
+}
 
 fn yaml_field<'a>(map: &'a Hash, key: &str, depth: usize) -> Result<Option<&'a Yaml>, String> {
     if depth > 16 {
@@ -316,6 +465,10 @@ fn config(project: &Project) -> Result<Value, String> {
             command.env_remove(project_config::image_variable(&build.service)?);
         }
     }
+    run_config(command)
+}
+
+fn run_config(mut command: Command) -> Result<Value, String> {
     let mut child = command
         .spawn()
         .map_err(|_| "本地 Docker Compose 不可用。".to_owned())?;

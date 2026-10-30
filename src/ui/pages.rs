@@ -1,7 +1,7 @@
 use super::*;
 use crate::host_store::{HostUpdate, NewHost};
 use crate::project_store::{BuildConfig, NewProject};
-use chrono::Local;
+use chrono::{Local, NaiveDateTime};
 use gpui_kit::component::Disableable;
 use gpui_kit::component::WindowExt;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -40,6 +40,169 @@ fn generate_release_tag(project: &Project) -> Result<String, String> {
         tag = tag.replace("{git-sha}", sha);
     }
     Ok(tag)
+}
+
+fn history_tag(reference: &str) -> String {
+    let tag = reference
+        .rsplit_once(':')
+        .map(|(_, tag)| tag)
+        .unwrap_or(reference);
+    tag.strip_suffix("-amd64")
+        .or_else(|| tag.strip_suffix("-arm64"))
+        .unwrap_or(tag)
+        .to_owned()
+}
+
+fn history_duration(start: &str, finished: Option<&str>) -> String {
+    let Some(finished) = finished else {
+        return "—".into();
+    };
+    let parse = |value| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S");
+    match (parse(start), parse(finished)) {
+        (Ok(start), Ok(finished)) => {
+            let secs = (finished - start).num_seconds().max(0);
+            format!("{}分{}秒", secs / 60, secs % 60)
+        }
+        _ => "—".into(),
+    }
+}
+
+fn batch_phase_label(phase: &str) -> &'static str {
+    match phase {
+        "prepared" => "等待构建",
+        "building" | "built" => "本机构建",
+        "uploading" | "uploaded" => "镜像传输",
+        "loading" | "loaded" => "镜像加载",
+        "awaiting_deployment" | "staging" | "staged" => "准备 Compose",
+        "validating" | "validated" => "校验 Compose",
+        "deploying" => "启动服务",
+        "checking" | "checked" => "健康检查",
+        _ => "阶段待核实",
+    }
+}
+
+fn resumable_upload_inspection(check: &release::UnknownUploadInspection) -> bool {
+    check.containers.is_empty()
+        && check
+            .archives
+            .iter()
+            .all(|archive| match archive.actual_bytes {
+                None => archive.state == "reserved",
+                Some(size) if size < archive.expected_bytes => archive.state == "reserved",
+                Some(size) if size == archive.expected_bytes => {
+                    archive.digest_matches == Some(true)
+                }
+                _ => false,
+            })
+}
+
+pub(super) fn next_confirmed_batch_host(batch: &batch_store::BatchRecord) -> Option<i64> {
+    if batch.state != "running" {
+        return None;
+    }
+    let index = batch
+        .targets
+        .iter()
+        .position(|target| target.state == "waiting")?;
+    if index == 0
+        || batch.targets[index].release_task_id.is_some()
+        || batch.targets[index + 1..]
+            .iter()
+            .any(|target| target.state != "waiting" || target.release_task_id.is_some())
+        || batch.targets[..index].iter().any(|target| {
+            let expected = match target.state.as_str() {
+                "healthy" => "complete",
+                "skipped" => "failed",
+                _ => return true,
+            };
+            target.release_task_id.is_none() || target.task_outcome.as_deref() != Some(expected)
+        })
+    {
+        return None;
+    }
+    Some(batch.targets[index].host.id)
+}
+
+enum DeployRunEvent {
+    Stage(String),
+    Transfer { sent: u64, total: u64 },
+    Finished(Result<(String, usize), String>),
+}
+
+const MULTI_HOST_START_ENABLED: bool = false;
+
+enum BatchStartEvent {
+    Stage(String),
+    Transfer { sent: u64, total: u64 },
+    Finished(Result<stack_release::BatchProgress, stack_release::BatchRunError>),
+}
+
+fn transfer_progress(event: &str) -> Option<(u64, u64)> {
+    let text = event.strip_prefix("镜像传输 ")?.strip_suffix(" 字节")?;
+    let (sent, total) = text.split_once('/')?;
+    let (sent, total) = (sent.parse::<u64>().ok()?, total.parse::<u64>().ok()?);
+    (total > 0 && sent <= total).then_some((sent, total))
+}
+
+enum RollbackRunEvent {
+    Stage(String),
+    Finished(Result<String, String>),
+}
+
+fn safe_deploy_stage(event: &str) -> Option<String> {
+    // Build output can contain source or credential data; only display coordinator-owned stages.
+    const STAGES: &[&str] = &[
+        "构建镜像：",
+        "核对构建后 Compose：",
+        "传输镜像：",
+        "远端加载镜像：",
+        "上传 Compose 和环境配置",
+        "校验所有 Compose 服务",
+        "启动全部 Compose 服务",
+        "核对全部服务健康状态",
+        "核对全部 Compose 服务健康状态",
+    ];
+    STAGES
+        .iter()
+        .find(|stage| event.starts_with(**stage))
+        .map(|stage| {
+            if stage.ends_with('：') {
+                stage.trim_end_matches('：').to_owned()
+            } else {
+                (*stage).to_owned()
+            }
+        })
+}
+
+fn safe_rollback_stage(event: &str) -> Option<&'static str> {
+    const STAGES: &[&str] = &[
+        "恢复历史镜像：",
+        "上传历史 Compose 和环境快照",
+        "核对目标版本全部服务配置",
+        "恢复上一健康版本",
+        "核对恢复后的全部服务健康状态",
+    ];
+    STAGES
+        .iter()
+        .find(|stage| event.starts_with(**stage))
+        .map(|stage| {
+            if stage.ends_with('：') {
+                "恢复历史镜像"
+            } else {
+                *stage
+            }
+        })
+}
+
+fn same_deploy_host(a: &Host, b: &Host) -> bool {
+    a.id == b.id
+        && a.name == b.name
+        && a.address == b.address
+        && a.port == b.port
+        && a.username == b.username
+        && a.group == b.group
+        && a.auth == b.auth
+        && a.trusted_fingerprint == b.trusted_fingerprint
 }
 
 fn display_path(path: &Path, narrow: bool, first_line: usize) -> String {
@@ -3111,6 +3274,12 @@ impl AppView {
                                 view.target_form = None;
                             }
                             if view.deploy_project_id == Some(id) {
+                                view.clear_batch_preflight();
+                                view.deploy_tag_plan_generation =
+                                    view.deploy_tag_plan_generation.wrapping_add(1);
+                                view.deploy_tag_plan = None;
+                                view.deploy_batch_plan = None;
+                                view.deploy_tag_plan_loading = false;
                                 if let Some(cancel) = view.deploy_target_cancel.take() {
                                     cancel.store(true, Ordering::Relaxed);
                                 }
@@ -4661,39 +4830,160 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         match project_id {
-            Some(id) if !self.release_project_loading.insert(id) => return,
-            None if self.release_tasks_loading => return,
+            Some(id) if !self.release_project_loading.insert(id) => {
+                self.release_project_refresh_pending.insert(id);
+                return;
+            }
+            None if self.release_tasks_loading => {
+                self.release_tasks_refresh_pending = true;
+                return;
+            }
             None => self.release_tasks_loading = true,
             _ => {}
         }
+        self.retention_epoch = self.retention_epoch.wrapping_add(1);
+        self.retention_reports.clear();
+        self.retention_loading.clear();
+        self.local_archive_previews.clear();
+        self.local_archive_preview_loading.clear();
+        self.current_version_checks.clear();
+        self.current_version_loading.clear();
+        self.release_upload_inspection_generation =
+            self.release_upload_inspection_generation.wrapping_add(1);
+        self.release_upload_inspections.clear();
+        self.release_upload_inspecting.clear();
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { release_store::recent(project_id) })
+                .spawn(async move {
+                    Ok::<_, String>((
+                        release_store::recent(project_id)?,
+                        rollback_store::recent(project_id)?,
+                        batch_store::recent(project_id)?,
+                    ))
+                })
                 .await;
             let _ = view.update(cx, |view, cx| {
                 match (project_id, result) {
-                    (Some(id), Ok(tasks)) => {
+                    (Some(id), Ok((tasks, rollbacks, batches))) => {
                         view.release_project_loading.remove(&id);
                         view.release_project_tasks.insert(id, tasks);
+                        view.rollback_project_tasks.insert(id, rollbacks);
+                        view.release_project_batches.insert(id, batches);
                         view.release_project_errors.remove(&id);
+                        view.retention_reports.remove(&id);
                     }
                     (Some(id), Err(error)) => {
                         view.release_project_loading.remove(&id);
+                        view.release_project_tasks.remove(&id);
+                        view.rollback_project_tasks.remove(&id);
+                        view.release_project_batches.remove(&id);
                         view.release_project_errors.insert(id, error);
                     }
-                    (None, Ok(tasks)) => {
+                    (None, Ok((tasks, rollbacks, batches))) => {
                         view.release_tasks_loading = false;
                         view.release_tasks = tasks;
+                        view.rollback_tasks = rollbacks;
+                        view.release_batches = batches;
                         view.release_tasks_error = None;
                     }
                     (None, Err(error)) => {
                         view.release_tasks_loading = false;
+                        view.release_tasks.clear();
+                        view.rollback_tasks.clear();
+                        view.release_batches.clear();
                         view.release_tasks_error = Some(error);
                     }
                 }
                 view.previous_version_checks.clear();
+                view.retention_epoch = view.retention_epoch.wrapping_add(1);
+                view.retention_reports.clear();
+                view.retention_loading.clear();
+                view.local_archive_previews.clear();
+                view.local_archive_preview_loading.clear();
+                view.current_version_checks.clear();
+                view.current_version_loading.clear();
+                cx.notify();
+                let repeat = match project_id {
+                    Some(id) => view.release_project_refresh_pending.remove(&id),
+                    None => std::mem::take(&mut view.release_tasks_refresh_pending),
+                };
+                if repeat {
+                    view.refresh_release_tasks(project_id, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn inspect_release_retention(&mut self, project_id: i64, cx: &mut Context<Self>) {
+        if !self.retention_loading.insert(project_id) {
+            return;
+        }
+        let epoch = self.retention_epoch;
+        self.retention_reports.remove(&project_id);
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { release_store::retention_plan(project_id) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if view.retention_epoch != epoch {
+                    return;
+                }
+                view.retention_loading.remove(&project_id);
+                view.retention_reports.insert(project_id, result);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn inspect_local_archive_preview(&mut self, project_id: i64, cx: &mut Context<Self>) {
+        if !self.local_archive_preview_loading.insert(project_id) {
+            return;
+        }
+        let epoch = self.retention_epoch;
+        self.local_archive_previews.remove(&project_id);
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { release_archive::preview_local_reclaim(project_id) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if view.retention_epoch != epoch {
+                    return;
+                }
+                view.local_archive_preview_loading.remove(&project_id);
+                view.local_archive_previews.insert(project_id, result);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn inspect_current_version(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.current_version_loading.insert(id.clone()) {
+            return;
+        }
+        let epoch = self.retention_epoch;
+        self.current_version_checks.remove(&id);
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let key = id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { release::inspect_current_version(&id) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if view.retention_epoch != epoch {
+                    return;
+                }
+                view.current_version_loading.remove(&key);
+                view.current_version_checks.insert(key, result);
                 cx.notify();
             });
         })
@@ -4781,6 +5071,357 @@ impl AppView {
         .detach();
     }
 
+    fn inspect_release_upload(&mut self, id: String, cx: &mut Context<Self>) {
+        let eligible = self
+            .release_tasks
+            .iter()
+            .chain(
+                self.release_project_tasks
+                    .values()
+                    .flat_map(|tasks| tasks.iter()),
+            )
+            .any(|task| task.id == id && task.phase == "uploading" && task.outcome == "unknown");
+        if !eligible || !self.release_upload_inspecting.insert(id.clone()) {
+            return;
+        }
+        let generation = self.release_upload_inspection_generation;
+        self.release_upload_inspections.remove(&id);
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let key = id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { release::inspect_unknown_upload(&id) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if view.release_upload_inspection_generation != generation {
+                    return;
+                }
+                view.release_upload_inspecting.remove(&key);
+                view.release_upload_inspections.insert(key, result);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_resume_unknown_upload(
+        &mut self,
+        task_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(check) = self
+            .release_upload_inspections
+            .get(&task_id)
+            .and_then(|result| result.as_ref().ok())
+        else {
+            return;
+        };
+        if !resumable_upload_inspection(check) {
+            return;
+        }
+        let Some(batch_id) = self
+            .release_batches
+            .iter()
+            .chain(
+                self.release_project_batches
+                    .values()
+                    .flat_map(|items| items.iter()),
+            )
+            .find(|batch| {
+                batch.state == "unknown"
+                    && batch.targets.iter().any(|target| {
+                        target.state == "unknown"
+                            && target.release_task_id.as_deref() == Some(&task_id)
+                    })
+            })
+            .map(|batch| batch.id.clone())
+        else {
+            return;
+        };
+        if self.batch_resolving.contains(&batch_id) || self.deploy_run_busy {
+            return;
+        }
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm_view = view.clone();
+            let batch = batch_id.clone();
+            let task = task_id.clone();
+            dialog.title("确认断点续传当前主机").w(px(560.))
+                .child(div().flex().flex_col().gap_3()
+                    .child("将重新核对 YAML、目标主机与 Docker daemon、版本材料、远端容器和镜像；部分 tar 必须与本机归档前缀 SHA-256 一致，否则不写入。")
+                    .child("只续传当前主机并继续加载与整栈健康检查；成功后仍须人工确认健康，不会自动部署下一台。网络中断时继续保留结果待核实和远端 tar，不自动重试。"))
+                .footer(div().flex().justify_end().gap_2()
+                    .child(Button::new("batch-resume-cancel").debug_selector(|| "batch-resume-cancel".into()).label("取消")
+                        .on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("batch-resume-confirm").primary().label("确认核对并续传")
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let batch = batch.clone();
+                            let task = task.clone();
+                            let _ = confirm_view.update(cx, |view, cx| view.start_resume_unknown_batch(batch, task, window, cx));
+                        })))
+        });
+    }
+
+    fn watch_batch_stage(
+        &mut self,
+        poll_id: String,
+        poll_stage: Arc<Mutex<String>>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let next = poll_stage
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                let active = view
+                    .update(cx, |view, cx| {
+                        if !view.batch_resolving.contains(&poll_id) {
+                            return false;
+                        }
+                        if !next.is_empty()
+                            && view.batch_operation_stage.get(&poll_id) != Some(&next)
+                        {
+                            view.batch_operation_stage.insert(poll_id.clone(), next);
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !active {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn start_resume_unknown_batch(
+        &mut self,
+        batch_id: String,
+        task_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project_id) = self
+            .release_batches
+            .iter()
+            .chain(
+                self.release_project_batches
+                    .values()
+                    .flat_map(|items| items.iter()),
+            )
+            .find(|batch| batch.id == batch_id && batch.state == "unknown")
+            .map(|batch| batch.project_id)
+        else {
+            return;
+        };
+        if self.deploy_run_busy || !self.batch_resolving.insert(batch_id.clone()) {
+            return;
+        }
+        self.batch_operation_stage
+            .insert(batch_id.clone(), "重新核对批次材料…".into());
+        cx.notify();
+        let stage = Arc::new(Mutex::new(String::new()));
+        let worker_stage = stage.clone();
+        self.watch_batch_stage(batch_id.clone(), stage, cx);
+        cx.spawn_in(window, async move |view, cx| {
+            let run_id = batch_id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    stack_release::resume_unknown_batch_upload(
+                        &run_id,
+                        &task_id,
+                        Arc::new(AtomicBool::new(false)),
+                        |event| {
+                            *worker_stage
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = event.into();
+                        },
+                    )
+                })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.batch_resolving.remove(&batch_id);
+                    view.batch_operation_stage.remove(&batch_id);
+                    view.refresh_release_tasks(None, cx);
+                    view.refresh_release_tasks(Some(project_id), cx);
+                    cx.notify();
+                });
+                window.push_notification(
+                    match result {
+                        Ok(stack_release::BatchProgress::AwaitingConfirmation { .. }) => {
+                            Notification::success(
+                                "当前主机已通过健康检查；请在历史中人工确认后再继续",
+                            )
+                        }
+                        Ok(stack_release::BatchProgress::Complete { .. }) => {
+                            Notification::success("批次已完成")
+                        }
+                        Err(error) => Notification::warning(format!(
+                            "批次 {}：{}",
+                            batch_id.chars().take(8).collect::<String>(),
+                            error.message
+                        )),
+                    },
+                    app,
+                );
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_continue_batch(
+        &mut self,
+        batch_id: String,
+        expected_host_id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(batch) = self
+            .release_batches
+            .iter()
+            .chain(
+                self.release_project_batches
+                    .values()
+                    .flat_map(|items| items.iter()),
+            )
+            .find(|batch| batch.id == batch_id)
+        else {
+            return;
+        };
+        let next = next_confirmed_batch_host(batch);
+        if next != Some(expected_host_id)
+            || self.batch_resolving.contains(&batch_id)
+            || self.deploy_run_busy
+        {
+            return;
+        }
+        let host_name = batch
+            .targets
+            .iter()
+            .find(|target| target.host.id == expected_host_id)
+            .map(|target| target.host.name.clone())
+            .unwrap_or_default();
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm_view = view.clone();
+            let id = batch_id.clone();
+            dialog.title("确认继续下一台主机").w(px(560.))
+                .child(div().flex().flex_col().gap_3()
+                    .child(format!("下一台：{host_name}。此前已健康的主机不会重建或回滚。"))
+                    .child("将重新核对 YAML、逐主机环境、共享归档、可信 SSH 与 Docker daemon；然后上传镜像、启动完整 Compose 栈并核实全部服务。若出现失败或未知结果会暂停，不自动推进。"))
+                .footer(div().flex().justify_end().gap_2()
+                    .child(Button::new("batch-continue-cancel")
+                        .debug_selector(|| "batch-continue-cancel".into()).label("取消")
+                        .on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("batch-continue-confirm")
+                        .debug_selector(|| "batch-continue-confirm".into())
+                        .primary().label("确认继续")
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let id = id.clone();
+                            let _ = confirm_view.update(cx, |view, cx| {
+                                view.start_continue_batch(id, expected_host_id, window, cx)
+                            });
+                        })))
+        });
+    }
+
+    fn start_continue_batch(
+        &mut self,
+        batch_id: String,
+        expected_host_id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(batch) = self
+            .release_batches
+            .iter()
+            .chain(
+                self.release_project_batches
+                    .values()
+                    .flat_map(|items| items.iter()),
+            )
+            .find(|batch| batch.id == batch_id)
+        else {
+            return;
+        };
+        let next = next_confirmed_batch_host(batch);
+        if self.deploy_run_busy
+            || next != Some(expected_host_id)
+            || !self.batch_resolving.insert(batch_id.clone())
+        {
+            return;
+        }
+        let project_id = batch.project_id;
+        self.batch_operation_stage
+            .insert(batch_id.clone(), "重新确认批次目标…".into());
+        let stage = Arc::new(Mutex::new(String::new()));
+        let worker_stage = stage.clone();
+        self.watch_batch_stage(batch_id.clone(), stage, cx);
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let run_id = batch_id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    let confirmed = stack_release::reconfirm_batch(&run_id, cancel.clone())
+                        .map_err(|message| stack_release::BatchRunError {
+                            batch_id: Some(run_id.clone()),
+                            message,
+                        })?;
+                    stack_release::continue_batch_sequential(
+                        &run_id,
+                        Some(expected_host_id),
+                        &confirmed,
+                        cancel,
+                        |event| {
+                            *worker_stage
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = event.into();
+                        },
+                    )
+                })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.batch_resolving.remove(&batch_id);
+                    view.batch_operation_stage.remove(&batch_id);
+                    view.refresh_release_tasks(None, cx);
+                    view.refresh_release_tasks(Some(project_id), cx);
+                    cx.notify();
+                });
+                window.push_notification(
+                    match result {
+                        Ok(stack_release::BatchProgress::AwaitingConfirmation { .. }) => {
+                            Notification::success("当前主机健康检查通过；请人工确认后再继续")
+                        }
+                        Ok(stack_release::BatchProgress::Complete { .. }) => {
+                            Notification::success("批次全部目标已处理完毕")
+                        }
+                        Err(error) => Notification::warning(format!(
+                            "批次 {}：{}",
+                            batch_id.chars().take(8).collect::<String>(),
+                            error.message
+                        )),
+                    },
+                    app,
+                );
+            });
+        })
+        .detach();
+    }
+
     fn inspect_previous_version(&mut self, id: String, cx: &mut Context<Self>) {
         if !self.previous_version_checking.insert(id.clone()) {
             return;
@@ -4816,6 +5457,7 @@ impl AppView {
             let _ = cx.update(|window, app| {
                 let _ = view.update(app, |view, cx| {
                     view.release_recovery_busy = false;
+                    view.release_recovery_error = result.as_ref().err().cloned();
                     view.refresh_release_tasks(None, cx);
                     if let Some(project_id) = view.project_id {
                         view.refresh_release_tasks(Some(project_id), cx);
@@ -4827,6 +5469,41 @@ impl AppView {
                         Ok(count) => {
                             Notification::success(format!("已清理 {count} 条构建前中断任务"))
                         }
+                        Err(error) => Notification::warning(error),
+                    },
+                    app,
+                );
+            });
+        })
+        .detach();
+    }
+
+    fn inspect_interrupted_batches(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.release_recovery_busy {
+            return;
+        }
+        self.release_recovery_busy = true;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { release_materials::recover_interrupted_batches() })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.release_recovery_busy = false;
+                    view.release_recovery_error = result.as_ref().err().cloned();
+                    view.refresh_release_tasks(None, cx);
+                    if let Some(project_id) = view.project_id {
+                        view.refresh_release_tasks(Some(project_id), cx);
+                    }
+                    cx.notify();
+                });
+                window.push_notification(
+                    match result {
+                        Ok(count) => Notification::success(format!(
+                            "{count} 条无执行锁的中断批次已标为待核实；未操作 VPS"
+                        )),
                         Err(error) => Notification::warning(error),
                     },
                     app,
@@ -4932,6 +5609,87 @@ impl AppView {
         .detach();
     }
 
+    fn confirm_close_predeploy_task(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let eligible = self
+            .release_tasks
+            .iter()
+            .chain(
+                self.release_project_tasks
+                    .values()
+                    .flat_map(|tasks| tasks.iter()),
+            )
+            .any(|task| task.id == id && task.phase == "uploading" && task.outcome == "unknown");
+        if !eligible
+            || self.release_resolving.contains(&id)
+            || self.deploy_run_busy
+            || self.rollback_running.is_some()
+        {
+            return;
+        }
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm_view = view.clone();
+            let task_id = id.clone();
+            dialog.title("核实并关闭上传中断任务").w(px(540.))
+                .child(div().flex().flex_col().gap_3()
+                    .child("该任务停在镜像传输阶段，尚未进入远端镜像加载或 Compose 启动。将重新核对当前版本指针、可信 Docker daemon、历史 Compose/.env 与逐服务配置哈希、镜像 ID 和健康状态。")
+                    .child("请在无外部 Docker 修改的维护窗口确认。仅全部匹配时，才将本次任务标记失败并解除阻断；不会重试发布、执行 Compose、删除镜像或清理可能残留的远端临时 tar。临时文件仍需人工排查。"))
+                .footer(div().flex().justify_end().gap_2()
+                    .child(Button::new("predeploy-close-cancel").label("取消")
+                        .on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("predeploy-close-confirm").danger().label("重新核实并关闭")
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let id = task_id.clone();
+                            let _ = confirm_view.update(cx, |view, cx| view.close_predeploy_task(id, window, cx));
+                        })))
+        });
+    }
+
+    fn close_predeploy_task(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project_id) = self
+            .release_tasks
+            .iter()
+            .chain(
+                self.release_project_tasks
+                    .values()
+                    .flat_map(|tasks| tasks.iter()),
+            )
+            .find(|task| task.id == id)
+            .map(|task| task.project_id)
+        else {
+            return;
+        };
+        if !self.release_resolving.insert(id.clone()) {
+            return;
+        }
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let key = id.clone();
+            let result = cx.background_executor()
+                .spawn(async move { release::confirm_predeploy_unchanged(&id) }).await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.release_resolving.remove(&key);
+                    view.release_observations.remove(&key);
+                    view.current_version_checks.remove(&key);
+                    view.refresh_release_tasks(None, cx);
+                    view.refresh_release_tasks(Some(project_id), cx);
+                    cx.notify();
+                });
+                window.push_notification(match result {
+                    Ok(count) => Notification::success(format!("已核实旧版本 {count} 个服务健康；上传中断任务已关闭，临时 tar 待人工检查")),
+                    Err(error) => Notification::error(format!("{error}；仍保持发布阻断。")),
+                }, app);
+            });
+        }).detach();
+    }
+
     fn confirm_complete_task(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         let eligible = self
             .release_tasks
@@ -4961,7 +5719,9 @@ impl AppView {
                 .footer(div().flex().justify_end().gap_2()
                     .child(Button::new("release-complete-cancel").label("取消")
                         .on_click(|_, window, cx| window.close_dialog(cx)))
-                    .child(Button::new("release-complete-confirm").label("重新核实并确认完成")
+                    .child(Button::new("release-complete-confirm")
+                        .debug_selector(|| "release-complete-confirm-button".into())
+                        .label("重新核实并确认完成")
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let id = task_id.clone();
@@ -5018,22 +5778,957 @@ impl AppView {
         .detach();
     }
 
+    fn confirm_reconcile_health(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let start_unknown = self
+            .release_tasks
+            .iter()
+            .chain(
+                self.release_project_tasks
+                    .values()
+                    .flat_map(|tasks| tasks.iter()),
+            )
+            .find(|task| {
+                task.id == id
+                    && task.health_result.is_none()
+                    && ((task.phase == "checking"
+                        && matches!(task.outcome.as_str(), "unknown" | "running"))
+                        || (task.phase == "deploying" && task.outcome == "unknown"))
+            })
+            .map(|task| task.phase == "deploying");
+        let Some(start_unknown) = start_unknown else {
+            return;
+        };
+        if self.release_resolving.contains(&id) {
+            return;
+        }
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm_view = view.clone();
+            let task_id = id.clone();
+            dialog.title(if start_unknown {
+                "核实启动响应不明的远端状态"
+            } else {
+                "重新核实未确认的健康结果"
+            }).w(px(520.))
+                .child(div().flex().flex_col().gap_3()
+                    .child(if start_unknown {
+                        "启动命令的客户端响应未确认。必须先核对该任务的远端启动完成标记，再只读核实版本材料、镜像及完整容器集合；仅全部服务与计划一致且 healthy 时恢复记录。缺少标记时仍保持待核实。"
+                    } else {
+                        "启动已确认，但健康核实结果不明。将重新只读核实全部版本材料、镜像、容器和健康状态；仅全部服务 healthy 时恢复记录。"
+                    })
+                    .child("不会重新执行 Compose、自动确认发布完成或继续下一台；恢复后仍须单独确认健康发布完成。"))
+                .footer(div().flex().justify_end().gap_2()
+                    .child(Button::new("release-reconcile-cancel")
+                        .debug_selector(|| "release-reconcile-cancel".into())
+                        .label("取消")
+                        .on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("release-reconcile-confirm")
+                        .debug_selector(|| "release-reconcile-confirm-button".into())
+                        .label("只读核实并恢复记录")
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let id = task_id.clone();
+                            let _ = confirm_view.update(cx, |view, cx| view.reconcile_health_task(id, window, cx));
+                        })))
+        });
+    }
+
+    fn reconcile_health_task(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project_id) = self
+            .release_tasks
+            .iter()
+            .chain(
+                self.release_project_tasks
+                    .values()
+                    .flat_map(|tasks| tasks.iter()),
+            )
+            .find(|task| task.id == id)
+            .map(|task| task.project_id)
+        else {
+            return;
+        };
+        if !self.release_resolving.insert(id.clone()) {
+            return;
+        }
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let key = id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { release::reconcile_interrupted_health(&id) })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.release_resolving.remove(&key);
+                    view.release_observations.remove(&key);
+                    view.refresh_release_tasks(None, cx);
+                    view.refresh_release_tasks(Some(project_id), cx);
+                    cx.notify();
+                });
+                window.push_notification(
+                    match result {
+                        Ok(count) => Notification::success(format!(
+                            "已重新核实 {count} 个服务健康；仍需确认发布完成"
+                        )),
+                        Err(error) => Notification::warning(error),
+                    },
+                    app,
+                );
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_reconcile_rollback(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let eligible = self
+            .rollback_tasks
+            .iter()
+            .chain(
+                self.rollback_project_tasks
+                    .values()
+                    .flat_map(|tasks| tasks.iter()),
+            )
+            .any(|task| {
+                task.id == id
+                    && matches!(
+                        (task.phase.as_str(), task.outcome.as_str()),
+                        ("checking", "unknown" | "running") | ("checked", "blocked")
+                    )
+            });
+        if !eligible || self.release_resolving.contains(&id) {
+            return;
+        }
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm_view = view.clone();
+            let task_id = id.clone();
+            dialog.title("只读核实回滚结果").w(px(520.))
+                .child(div().flex().flex_col().gap_3()
+                    .child("将重新核验目标历史材料、远端自有镜像和完整 Compose 项目容器；只有全部服务使用目标镜像且 healthy，才更新当前版本指针并解除阻断。")
+                    .child("不会重新执行 Compose、上传镜像或清理临时归档；正在部署或镜像加载结果不明的任务不能使用。"))
+                .footer(div().flex().justify_end().gap_2()
+                    .child(Button::new("rollback-reconcile-cancel").label("取消")
+                        .on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("rollback-reconcile-confirm").label("重新核实")
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let id = task_id.clone();
+                            let _ = confirm_view.update(cx, |view, cx| view.reconcile_rollback_task(id, window, cx));
+                        })))
+        });
+    }
+
+    fn reconcile_rollback_task(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project_id) = self
+            .rollback_tasks
+            .iter()
+            .chain(
+                self.rollback_project_tasks
+                    .values()
+                    .flat_map(|tasks| tasks.iter()),
+            )
+            .find(|task| task.id == id)
+            .map(|task| task.project_id)
+        else {
+            return;
+        };
+        if !self.release_resolving.insert(id.clone()) {
+            return;
+        }
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let key = id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::rollback::reconcile(&id) })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.release_resolving.remove(&key);
+                    view.refresh_release_tasks(None, cx);
+                    view.refresh_release_tasks(Some(project_id), cx);
+                    cx.notify();
+                });
+                window.push_notification(
+                    match result {
+                        Ok(count) => Notification::success(format!(
+                            "已只读确认 {count} 个服务恢复目标健康版本"
+                        )),
+                        Err(error) => Notification::warning(error),
+                    },
+                    app,
+                );
+            });
+        })
+        .detach();
+    }
+
+    fn preview_rollback(&mut self, source_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.deploy_run_busy
+            || self.rollback_running.is_some()
+            || !self.rollback_previewing.insert(source_id.clone())
+        {
+            return;
+        }
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let id = source_id.clone();
+                    async move { crate::rollback::preview(&id) }
+                })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.rollback_previewing.remove(&source_id);
+                    if let Ok(preview) = result {
+                        view.confirm_rollback(preview, window, cx);
+                    } else if let Err(error) = result {
+                        window.push_notification(Notification::error(error), cx);
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn confirm_rollback(
+        &mut self,
+        preview: crate::rollback::RollbackPreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.deploy_run_busy || self.rollback_running.is_some() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.rollback_confirmed_pair =
+                Some((preview.source_id.clone(), preview.target_id.clone()));
+        }
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let approved = preview.clone();
+            let confirm_view = view.clone();
+            dialog.title("确认回滚整个 Compose 项目").w(px(600.))
+                .child(div().flex().flex_col().gap_3()
+                    .child(format!("项目：{} · 主机：{} ({})", preview.project_name, preview.host_name, preview.host_endpoint))
+                    .child(format!("源版本 {} → 健康目标版本 {}", preview.source_id, preview.target_id))
+                    .child(format!("当前服务：{}", preview.source_services.join(" · ")))
+                    .child(format!("目标服务：{}", preview.target_services.join(" · ")))
+                    .child(format!("{} 份目标镜像 tag 缺失，将从本机已校验归档恢复。", preview.missing_images.len()))
+                    .child("执行前会重新检查版本、归档、镜像和容器；Compose 可能重建或移除源版本的服务。结果不确定时保持阻断，绝不自动重试。"))
+                .footer(div().flex().justify_end().gap_2()
+                    .child(Button::new("rollback-cancel").label("取消")
+                        .on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("rollback-confirm").danger().debug_selector(|| "rollback-confirm-button".into()).label("确认执行回滚")
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let preview = approved.clone();
+                            let _ = confirm_view.update(cx, |view, cx| view.start_rollback(preview, window, cx));
+                        })))
+        });
+    }
+
+    fn start_rollback(
+        &mut self,
+        preview: crate::rollback::RollbackPreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.deploy_run_busy || self.rollback_running.is_some() {
+            return;
+        }
+        self.rollback_running = Some(preview.source_id.clone());
+        self.rollback_stage = "重新核实回滚条件".into();
+        cx.notify();
+        let (tx, rx) = mpsc::channel::<RollbackRunEvent>();
+        let project_id = preview.project_id;
+        cx.background_executor()
+            .spawn({
+                async move {
+                    let result = crate::rollback::run_confirmed(
+                        &preview.source_id,
+                        Some(&preview.target_id),
+                        Some(&preview.observed),
+                        Some(&preview.missing_images),
+                        Arc::new(AtomicBool::new(false)),
+                        |event| {
+                            if let Some(stage) = safe_rollback_stage(event) {
+                                let _ = tx.send(RollbackRunEvent::Stage(stage.into()));
+                            }
+                        },
+                    );
+                    let _ = tx.send(RollbackRunEvent::Finished(result));
+                }
+            })
+            .detach();
+        cx.spawn_in(window, async move |view, cx| {
+            loop {
+                match rx.try_recv() {
+                    Ok(RollbackRunEvent::Stage(stage)) => {
+                        let _ = view.update(cx, |view, cx| {
+                            view.rollback_stage = stage;
+                            cx.notify();
+                        });
+                    }
+                    Ok(RollbackRunEvent::Finished(result)) => {
+                        let _ = cx.update(|window, app| {
+                            let _ = view.update(app, |view, cx| {
+                                view.rollback_running = None;
+                                view.rollback_stage.clear();
+                                view.refresh_release_tasks(None, cx);
+                                view.refresh_release_tasks(Some(project_id), cx);
+                                cx.notify();
+                            });
+                            window.push_notification(
+                                match result {
+                                    Ok(id) => Notification::success(format!(
+                                        "回滚 {id} 完成，目标服务全部健康"
+                                    )),
+                                    Err(error) => Notification::error(format!(
+                                        "{error}；请在历史页核实，勿重复执行。"
+                                    )),
+                                },
+                                app,
+                            );
+                        });
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        let _ = cx.update(|window, app| {
+                            let _ = view.update(app, |view, cx| {
+                                view.rollback_running = None;
+                                view.rollback_stage = "执行中断，结果需人工核实".into();
+                                view.refresh_release_tasks(None, cx);
+                                view.refresh_release_tasks(Some(project_id), cx);
+                                cx.notify();
+                            });
+                            window.push_notification(
+                                Notification::error(
+                                    "回滚执行异常中断，请先在历史页核实，不得重试。",
+                                ),
+                                app,
+                            );
+                        });
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(200))
+                            .await
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn history_batch(
+        &self,
+        project_id: Option<i64>,
+        batch_id: &str,
+    ) -> Option<&batch_store::BatchRecord> {
+        let batches = match project_id {
+            Some(id) => self.release_project_batches.get(&id)?,
+            None => &self.release_batches,
+        };
+        batches.iter().find(|batch| batch.id == batch_id)
+    }
+
+    fn confirm_batch_resolution(
+        &mut self,
+        project_id: Option<i64>,
+        batch_id: String,
+        host_id: Option<i64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let batch = self.history_batch(project_id, &batch_id).filter(|batch| {
+            matches!(
+                batch.state.as_str(),
+                "prepared" | "building" | "ready" | "paused" | "running"
+            )
+        });
+        let Some(batch) = batch else { return };
+        if self.batch_resolving.contains(&batch_id) {
+            return;
+        }
+        let unstarted = matches!(batch.state.as_str(), "prepared" | "building" | "ready");
+        if unstarted
+            && (host_id.is_some()
+                || batch
+                    .targets
+                    .iter()
+                    .any(|target| target.state != "waiting" || target.release_task_id.is_some()))
+        {
+            return;
+        }
+        let host_name = if let Some(host_id) = host_id {
+            if batch.state != "paused" {
+                return;
+            }
+            let Some(target) = batch
+                .targets
+                .iter()
+                .find(|target| target.host.id == host_id && target.state == "failed")
+            else {
+                return;
+            };
+            target.host.name.clone()
+        } else {
+            String::new()
+        };
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm_view = view.clone();
+            let id = batch_id.clone();
+            let title = if host_id.is_some() { "跳过失败主机" } else { "终止批次" };
+            let detail = if host_id.is_some() {
+                format!("将 {host_name} 标记为已跳过；该主机不会变成健康成功。若后面还有目标，本次只解除暂停，不会自动部署下一台。")
+            } else if unstarted {
+                "终止尚未开始远端发布的批次；可能残留的本机镜像和共享归档需人工核对。".into()
+            } else {
+                "终止剩余目标；此前已健康的主机保持现状，不执行回滚。".into()
+            };
+            dialog.title(title).w(px(520.))
+                .child(div().flex().flex_col().gap_3()
+                    .child(detail)
+                    .child("确认时会重新核对数据库中的批次和任务状态。不会操作远端 Docker、删除镜像或归档；若有待核实结果则拒绝。"))
+                .footer(div().flex().justify_end().gap_2()
+                    .child(Button::new("batch-resolution-cancel")
+                        .debug_selector(|| "batch-resolution-cancel".into()).label("取消")
+                        .on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("batch-resolution-confirm")
+                        .debug_selector(|| "batch-resolution-confirm".into())
+                        .danger().label("确认处置")
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let id = id.clone();
+                            let _ = confirm_view.update(cx, |view, cx| {
+                                view.resolve_batch(project_id, id, host_id, unstarted, window, cx)
+                            });
+                        })))
+        });
+    }
+
+    fn resolve_batch(
+        &mut self,
+        source_project_id: Option<i64>,
+        batch_id: String,
+        host_id: Option<i64>,
+        unstarted: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(batch) = self
+            .history_batch(source_project_id, &batch_id)
+            .filter(|batch| {
+                matches!(
+                    batch.state.as_str(),
+                    "prepared" | "building" | "ready" | "paused" | "running"
+                )
+            })
+        else {
+            return;
+        };
+        if unstarted != matches!(batch.state.as_str(), "prepared" | "building" | "ready") {
+            return;
+        }
+        let project_id = batch.project_id;
+        if !self.batch_resolving.insert(batch_id.clone()) {
+            return;
+        }
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let operation_id = batch_id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    match host_id {
+                        Some(host_id) => batch_store::skip_failed(&operation_id, host_id),
+                        None if unstarted => batch_store::terminate_unstarted(&operation_id),
+                        None => batch_store::terminate_resolved(&operation_id),
+                    }
+                })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.batch_resolving.remove(&batch_id);
+                    view.refresh_release_tasks(None, cx);
+                    view.refresh_release_tasks(Some(project_id), cx);
+                    cx.notify();
+                });
+                window.push_notification(
+                    match result {
+                        Ok(()) if host_id.is_some() => {
+                            Notification::success("已跳过失败主机；后续目标须重新确认后继续")
+                        }
+                        Ok(()) if unstarted => {
+                            Notification::success("未启动批次已终止；请人工核对本机残留")
+                        }
+                        Ok(()) => Notification::success("批次已终止；已健康主机保持现状"),
+                        Err(error) => Notification::warning(error),
+                    },
+                    app,
+                );
+            });
+        })
+        .detach();
+    }
+
+    fn batch_history_rows(
+        &self,
+        project_id: Option<i64>,
+        tasks: &[release_store::TaskSnapshot],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let batches = match project_id {
+            Some(id) => self
+                .release_project_batches
+                .get(&id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            None => self.release_batches.as_slice(),
+        };
+        let mut content = div().flex().flex_col().gap_3();
+        if batches.is_empty() {
+            return content.into_any_element();
+        }
+        content = content.child(div().text_color(self.palette().muted).child(format!(
+            "批次记录 {} 条 · 仅已核实失败可跳过；未知结果不得自动重试",
+            batches.len()
+        )));
+        for batch in batches {
+            let healthy = batch
+                .targets
+                .iter()
+                .filter(|target| target.state == "healthy")
+                .count();
+            let unknown = batch
+                .targets
+                .iter()
+                .filter(|target| target.state == "unknown")
+                .count();
+            let waiting = batch
+                .targets
+                .iter()
+                .filter(|target| target.state == "waiting")
+                .count();
+            let (status, color) = match batch.state.as_str() {
+                "complete" if !batch.targets.is_empty() && healthy == batch.targets.len() => {
+                    ("全部完成", self.palette().success)
+                }
+                "complete" => ("部分完成", self.palette().warning),
+                "paused" => ("已暂停", self.palette().warning),
+                "unknown" => ("结果待核实", self.palette().destructive),
+                "terminated" => ("已终止", self.palette().muted),
+                "ready" => ("等待分发", self.palette().foreground),
+                "running" => ("进行中", self.palette().foreground),
+                "prepared" => ("等待构建", self.palette().muted),
+                "building" => ("本机构建中", self.palette().foreground),
+                _ => ("状态待核实", self.palette().warning),
+            };
+            let resolving = self.batch_resolving.contains(&batch.id);
+            let next_host_id = if resolving || self.deploy_run_busy {
+                None
+            } else {
+                next_confirmed_batch_host(batch)
+            };
+            let unresolved = batch.targets.iter().any(|target| {
+                matches!(target.state.as_str(), "running" | "unknown")
+                    || matches!(
+                        target.task_outcome.as_deref(),
+                        Some("running" | "unknown" | "blocked")
+                    )
+            });
+            let all_waiting = batch.targets.iter().all(|target| {
+                target.state == "waiting"
+                    && target.release_task_id.is_none()
+                    && target.task_outcome.is_none()
+            });
+            let can_terminate = !resolving
+                && ((matches!(batch.state.as_str(), "prepared" | "building" | "ready")
+                    && all_waiting)
+                    || (matches!(batch.state.as_str(), "paused" | "running")
+                        && batch
+                            .targets
+                            .iter()
+                            .all(|target| match target.state.as_str() {
+                                "waiting" => {
+                                    target.release_task_id.is_none()
+                                        && target.task_outcome.is_none()
+                                }
+                                "healthy" | "failed" | "skipped" => {
+                                    let expected = if target.state == "healthy" {
+                                        "complete"
+                                    } else {
+                                        "failed"
+                                    };
+                                    target.release_task_id.is_some()
+                                        && target.task_outcome.as_deref() == Some(expected)
+                                }
+                                _ => false,
+                            })));
+            let mut table = div().min_w(px(1280.)).flex().flex_col().child(
+                div()
+                    .h(px(38.))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .bg(self.palette().accent)
+                    .text_color(self.palette().muted)
+                    .child(div().w(px(65.)).flex_shrink_0().child("顺序"))
+                    .child(div().w(px(160.)).flex_shrink_0().child("主机"))
+                    .child(div().w(px(135.)).flex_shrink_0().child("架构"))
+                    .child(div().w(px(145.)).flex_shrink_0().child("阶段"))
+                    .child(div().w(px(105.)).flex_shrink_0().child("健康"))
+                    .child(div().w(px(170.)).flex_shrink_0().child("结果"))
+                    .child(div().w(px(90.)).flex_shrink_0().child("耗时"))
+                    .child(div().w(px(125.)).flex_shrink_0().child("任务 ID"))
+                    .child("操作"),
+            );
+            for target in &batch.targets {
+                let task = target
+                    .release_task_id
+                    .as_deref()
+                    .and_then(|id| tasks.iter().find(|task| task.id == id));
+                let pending_confirmation = task.is_some_and(|task| {
+                    task.phase == "checked"
+                        && task.outcome == "blocked"
+                        && task.health_result.as_deref() == Some("healthy")
+                });
+                let phase = match task {
+                    Some(task) => batch_phase_label(&task.phase),
+                    None if target.release_task_id.is_some() => "任务未加载",
+                    None => "等待",
+                };
+                let health = match task.and_then(|task| task.health_result.as_deref()) {
+                    Some("healthy") => "健康",
+                    Some("running_unverified") => "未验证就绪",
+                    Some("failed") => "不健康",
+                    _ => "—",
+                };
+                let elapsed = task.map_or_else(
+                    || "—".into(),
+                    |task| {
+                        history_duration(&task.started_at, task.execution_finished_at.as_deref())
+                    },
+                );
+                let state = if pending_confirmation {
+                    "待人工确认健康"
+                } else {
+                    match target.state.as_str() {
+                        "healthy" => "健康完成",
+                        "failed" => "失败已确认",
+                        "unknown" => "待核实",
+                        "skipped" => "已跳过",
+                        "running" => "进行中",
+                        _ => "未开始",
+                    }
+                };
+                let can_skip = batch.state == "paused"
+                    && !resolving
+                    && !unresolved
+                    && target.state == "failed"
+                    && target.release_task_id.is_some()
+                    && target.task_outcome.as_deref() == Some("failed");
+                let batch_id = batch.id.clone();
+                let host_id = target.host.id;
+                let task_id = task.map(|task| task.id.clone());
+                table = table.child(
+                    div()
+                        .min_h(px(42.))
+                        .px_4()
+                        .flex()
+                        .items_center()
+                        .border_t_1()
+                        .border_color(self.palette().border)
+                        .child(
+                            div()
+                                .w(px(65.))
+                                .flex_shrink_0()
+                                .child((target.ordinal + 1).to_string()),
+                        )
+                        .child(
+                            div()
+                                .w(px(160.))
+                                .flex_shrink_0()
+                                .child(target.host.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .w(px(135.))
+                                .flex_shrink_0()
+                                .child(target.platform.clone()),
+                        )
+                        .child(div().w(px(145.)).flex_shrink_0().child(phase))
+                        .child(div().w(px(105.)).flex_shrink_0().child(health))
+                        .child(div().w(px(170.)).flex_shrink_0().child(state))
+                        .child(div().w(px(90.)).flex_shrink_0().child(elapsed))
+                        .child(
+                            div()
+                                .w(px(125.))
+                                .flex_shrink_0()
+                                .font_family(mono_font())
+                                .child(
+                                    target
+                                        .release_task_id
+                                        .as_deref()
+                                        .map(|id| id.chars().take(8).collect::<String>())
+                                        .unwrap_or_else(|| "—".into()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .when_some(task_id, |actions, task_id| {
+                                    actions.child(
+                                        Button::new(format!("batch-task-{task_id}"))
+                                            .debug_selector(|| "batch-task-detail-button".into())
+                                            .label("查看任务详情")
+                                            .on_click(cx.listener(move |view, _, _, cx| {
+                                                view.release_history_selected =
+                                                    Some(task_id.clone());
+                                                cx.notify();
+                                            })),
+                                    )
+                                })
+                                .when(can_skip, |actions| {
+                                    actions.child(
+                                        Button::new(format!("batch-skip-{batch_id}-{host_id}"))
+                                            .debug_selector(|| "batch-skip-button".into())
+                                            .label("跳过失败主机")
+                                            .on_click(cx.listener(move |view, _, window, cx| {
+                                                view.confirm_batch_resolution(
+                                                    project_id,
+                                                    batch_id.clone(),
+                                                    Some(host_id),
+                                                    window,
+                                                    cx,
+                                                )
+                                            })),
+                                    )
+                                })
+                                .when(task.is_none(), |actions| actions.child("—")),
+                        ),
+                );
+            }
+            let project_name = self
+                .projects
+                .iter()
+                .find(|item| item.id == batch.project_id)
+                .map_or_else(
+                    || format!("项目 {}", batch.project_id),
+                    |item| item.name.clone(),
+                );
+            content = content.child(div().border_1().border_color(self.palette().border)
+                .debug_selector(|| "batch-history-card".into())
+                .rounded_md().overflow_hidden()
+                .child(div().px_4().py_3().flex().flex_wrap().justify_between().gap_3()
+                    .child(div().flex().flex_col().items_start().gap_1()
+                        .child(div().font_family(mono_font()).child(format!(
+                            "批次 {} · {project_name} · {}",
+                            batch.id.chars().take(8).collect::<String>(), batch.created_at)))
+                        .child(div().text_color(self.palette().muted).child(format!(
+                            "健康 {healthy}/{} · 待核实 {unknown} · 未开始 {waiting} · 共享镜像 {} 份",
+                            batch.targets.len(), batch.images.len())))
+                        .when(next_host_id.is_some(), |el| {
+                            let host_id = next_host_id.unwrap_or_default();
+                            let batch_id = batch.id.clone();
+                            el.child(Button::new(format!("batch-continue-{batch_id}"))
+                                .debug_selector(|| "batch-continue-button".into())
+                                .primary().label("继续下一台")
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    view.confirm_continue_batch(batch_id.clone(), host_id, window, cx)
+                                })))
+                        }))
+                    .child(div().flex().flex_wrap().items_center().gap_3()
+                        .child(div().text_color(color).child(status))
+                        .when(can_terminate, |el| {
+                            let batch_id = batch.id.clone();
+                            el.child(Button::new(format!("batch-terminate-{batch_id}"))
+                                .debug_selector(|| "batch-terminate-button".into())
+                                .danger().label("终止批次")
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    view.confirm_batch_resolution(project_id, batch_id.clone(), None, window, cx)
+                                })))
+                        })))
+                .when_some(self.batch_operation_stage.get(&batch.id), |card, stage| {
+                    card.child(div().px_4().pb_3().text_color(self.palette().warning)
+                        .child(format!("批次操作中：{stage}")))
+                })
+                .child(div().id(format!("batch-history-scroll-{}", batch.id))
+                    .overflow_x_scroll().child(table)));
+        }
+        content.into_any_element()
+    }
+
     fn release_history_panel(&self, project_id: Option<i64>, cx: &mut Context<Self>) -> AnyElement {
         let mut rows = div().px_6().pb_6().flex().flex_col().gap_3();
-        rows = rows.child(
-            div().flex().justify_end().child(
-                Button::new("release-recover-prepared")
-                    .label(if self.release_recovery_busy {
-                        "清理中…"
-                    } else {
-                        "重试构建前中断清理"
-                    })
-                    .disabled(self.release_recovery_busy)
-                    .on_click(
-                        cx.listener(|view, _, window, cx| view.retry_prepared_recovery(window, cx)),
+        if let Some(id) = project_id {
+            rows = rows.child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new(("release-retention", id as u64))
+                            .label(if self.retention_loading.contains(&id) {
+                                "检查中…"
+                            } else {
+                                "检查版本保留"
+                            })
+                            .disabled(self.retention_loading.contains(&id))
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.inspect_release_retention(id, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new(("local-archive-preview", id as u64))
+                            .label(if self.local_archive_preview_loading.contains(&id) {
+                                "核验中…"
+                            } else {
+                                "预览本机旧版归档"
+                            })
+                            .disabled(self.local_archive_preview_loading.contains(&id))
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.inspect_local_archive_preview(id, cx)
+                            })),
                     ),
-            ),
+            );
+            if let Some(result) = self.retention_reports.get(&id) {
+                let text = match result {
+                    Ok(plan) if plan.unresolved => format!(
+                        "存在待核实/阻断的发布或回滚；{} 条历史任务的材料均须保留，不自动清理。",
+                        plan.entries.len()
+                    ),
+                    Ok(plan) => {
+                        let count = |class| {
+                            plan.entries
+                                .iter()
+                                .filter(|entry| entry.class == class)
+                                .count()
+                        };
+                        let latest = plan
+                            .entries
+                            .iter()
+                            .filter(|entry| {
+                                entry.class == release_store::RetentionClass::LatestCompleted
+                            })
+                            .map(|entry| entry.task_id.chars().take(8).collect::<String>())
+                            .collect::<Vec<_>>()
+                            .join("、");
+                        format!(
+                            "保留快照：当前指针版本 {}（{}）、其前驱 {}、其他历史待人工核对 {}、身份/结果不确定 {}。当前容器仍须远端核实；此处不会删除材料。",
+                            count(release_store::RetentionClass::LatestCompleted),
+                            latest,
+                            count(release_store::RetentionClass::PreviousCompleted),
+                            count(release_store::RetentionClass::HistoricalReview),
+                            count(release_store::RetentionClass::UncertainHistory)
+                        )
+                    }
+                    Err(error) => format!("保留策略检查失败：{error}"),
+                };
+                rows = rows.child(div().text_color(self.palette().muted).child(text));
+            }
+            if let Some(result) = self.local_archive_previews.get(&id) {
+                match result {
+                    Err(error) => {
+                        rows = rows.child(
+                            div()
+                                .text_color(self.palette().warning)
+                                .child(format!("本机归档预览失败：{error}")),
+                        )
+                    }
+                    Ok(preview) if preview.blocked => {
+                        rows = rows.child(div().text_color(self.palette().warning).child(format!(
+                            "存在待核实任务；{} 条发布任务的归档全部保留，不计算清理候选。",
+                            preview.total_tasks
+                        )))
+                    }
+                    Ok(preview) => {
+                        rows = rows.child(div().text_color(self.palette().muted)
+                            .child(format!("上次点击时只读核验：{} 条更早历史的本机 tar 齐全；文件可能已变化，清理前须重新核验。仅显示占用，不代表允许删除或远端可释放空间。", preview.candidates.len())));
+                        for candidate in &preview.candidates {
+                            rows = rows.child(div().font_family(mono_font()).child(format!(
+                                "{} · {} 份镜像归档 · {:.1} MiB（{} 字节）",
+                                candidate.task_id.chars().take(8).collect::<String>(),
+                                candidate.services,
+                                candidate.verified_bytes as f64 / (1024. * 1024.),
+                                candidate.verified_bytes,
+                            )));
+                        }
+                        if !preview.unavailable.is_empty() {
+                            rows = rows.child(div().text_color(self.palette().warning).child(
+                                format!(
+                                    "{} 条历史的本机归档缺失或校验失败，不作为清理候选：{}",
+                                    preview.unavailable.len(),
+                                    preview
+                                        .unavailable
+                                        .iter()
+                                        .map(|id| id.chars().take(8).collect::<String>())
+                                        .collect::<Vec<_>>()
+                                        .join("、"),
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        rows = rows.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .justify_end()
+                .gap_2()
+                .child(
+                    Button::new("release-recover-prepared")
+                        .label(if self.release_recovery_busy {
+                            "清理中…"
+                        } else {
+                            "重试构建前中断清理"
+                        })
+                        .disabled(self.release_recovery_busy)
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            view.retry_prepared_recovery(window, cx)
+                        })),
+                )
+                .child(
+                    Button::new("release-recover-batches")
+                        .label(if self.release_recovery_busy {
+                            "核对中…"
+                        } else {
+                            "核对中断批次"
+                        })
+                        .disabled(self.release_recovery_busy)
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            view.inspect_interrupted_batches(window, cx)
+                        })),
+                ),
         );
+        if let Some(error) = &self.release_recovery_error {
+            rows = rows.child(
+                div()
+                    .text_color(self.palette().warning)
+                    .child(format!("中断恢复待处理：{error}")),
+            );
+        }
         let error = match project_id {
             Some(id) => self.release_project_errors.get(&id),
             None => self.release_tasks_error.as_ref(),
@@ -5053,24 +6748,209 @@ impl AppView {
                 .unwrap_or(&[]),
             None => self.release_tasks.as_slice(),
         };
+        rows = rows.child(self.batch_history_rows(project_id, tasks, cx));
         if tasks.is_empty() {
             rows = rows.child(div().text_color(self.palette().muted).child(
                 if project_id.is_some_and(|id| self.release_project_loading.contains(&id))
                     || (project_id.is_none() && self.release_tasks_loading)
                 {
                     "正在读取任务…"
+                } else if error.is_some() {
+                    "历史读取失败，请重试"
+                } else if project_id.map_or(!self.release_batches.is_empty(), |id| {
+                    self.release_project_batches
+                        .get(&id)
+                        .is_some_and(|batches| !batches.is_empty())
+                }) {
+                    "批次尚无逐主机发布任务"
                 } else {
                     "暂无发布任务；版本回滚历史尚未接入"
                 },
             ));
         }
+        if !tasks.is_empty() {
+            let mut table = div().min_w(px(900.)).flex().flex_col();
+            let mut header = div()
+                .h(px(42.))
+                .px_4()
+                .flex()
+                .items_center()
+                .bg(self.palette().accent)
+                .text_color(self.palette().muted)
+                .child(div().w(px(155.)).flex_shrink_0().child("时间"));
+            if project_id.is_none() {
+                header = header.child(div().w(px(135.)).flex_shrink_0().child("项目"));
+            }
+            header = header
+                .child(div().w(px(175.)).flex_shrink_0().child("发布标识"))
+                .child(
+                    div()
+                        .w(px(135.))
+                        .flex_shrink_0()
+                        .child(if project_id.is_some() {
+                            "目标主机数"
+                        } else {
+                            "目标主机"
+                        }),
+                )
+                .child(div().w(px(155.)).flex_shrink_0().child("结果"))
+                .child(div().w(px(90.)).flex_shrink_0().child("耗时"))
+                .child("操作");
+            table = table.child(header);
+            for (index, task) in tasks.iter().enumerate() {
+                let (status, color) = match (task.outcome.as_str(), task.health_result.as_deref()) {
+                    ("complete", Some("healthy")) => ("成功", self.palette().success),
+                    ("blocked", Some("healthy")) => ("待确认", self.palette().warning),
+                    ("blocked", Some("running_unverified")) => {
+                        ("运行中，未验证就绪", self.palette().warning)
+                    }
+                    ("blocked", _) => ("失败待处理", self.palette().destructive),
+                    ("unknown", _) => ("待核实", self.palette().warning),
+                    ("failed", _) => ("失败", self.palette().destructive),
+                    _ => ("进行中", self.palette().muted),
+                };
+                let can_rollback = task.phase == "checked"
+                    && task.docker_daemon_id.is_some()
+                    && matches!(
+                        (task.outcome.as_str(), task.health_result.as_deref()),
+                        ("complete", Some("healthy")) | ("blocked", Some("failed"))
+                    );
+                let mut row = div()
+                    .h(px(54.))
+                    .px_4()
+                    .border_t_1()
+                    .border_color(self.palette().border)
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(155.))
+                            .flex_shrink_0()
+                            .child(task.started_at.clone()),
+                    );
+                if project_id.is_none() {
+                    row = row.child(
+                        div()
+                            .w(px(135.))
+                            .flex_shrink_0()
+                            .truncate()
+                            .child(task.project_name.clone()),
+                    );
+                }
+                let selected = self.release_history_selected.as_deref() == Some(task.id.as_str());
+                row = row
+                    .child(
+                        div()
+                            .w(px(175.))
+                            .flex_shrink_0()
+                            .truncate()
+                            .font_family(mono_font())
+                            .child(history_tag(&task.image_reference)),
+                    )
+                    .child(div().w(px(135.)).flex_shrink_0().child("1 台"))
+                    .child(
+                        div()
+                            .w(px(155.))
+                            .flex_shrink_0()
+                            .text_color(color)
+                            .child(status),
+                    )
+                    .child(div().w(px(90.)).flex_shrink_0().child(history_duration(
+                        &task.started_at,
+                        task.execution_finished_at.as_deref(),
+                    )))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                Button::new(("history-detail", index))
+                                    .debug_selector(|| "history-detail-button".into())
+                                    .label(if selected { "收起" } else { "详情" })
+                                    .on_click(cx.listener({
+                                        let id = task.id.clone();
+                                        move |view, _, _, cx| {
+                                            view.release_history_selected =
+                                                if view.release_history_selected.as_deref()
+                                                    == Some(&id)
+                                                {
+                                                    None
+                                                } else {
+                                                    Some(id.clone())
+                                                };
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .when(can_rollback, |actions| {
+                                actions.child(
+                                    Button::new(("history-rollback", index))
+                                        .debug_selector(|| "release-rollback-button".into())
+                                        .label("回滚")
+                                        .disabled(
+                                            self.deploy_run_busy
+                                                || self.rollback_running.is_some()
+                                                || self.rollback_previewing.contains(&task.id),
+                                        )
+                                        .on_click(cx.listener({
+                                            let id = task.id.clone();
+                                            move |view, _, window, cx| {
+                                                view.preview_rollback(id.clone(), window, cx)
+                                            }
+                                        })),
+                                )
+                            }),
+                    );
+                table = table.child(row);
+            }
+            rows = rows.child(
+                div()
+                    .id("release-history-table-scroll")
+                    .overflow_x_scroll()
+                    .border_1()
+                    .border_color(self.palette().border)
+                    .rounded_md()
+                    .child(table),
+            );
+        }
         for (index, task) in tasks.iter().enumerate() {
+            if self.release_history_selected.as_deref() != Some(task.id.as_str()) {
+                continue;
+            }
             let id = task.id.clone();
             let checking = self.release_checking.contains(&id);
             let resolving = self.release_resolving.contains(&id);
             let material_checking = self.release_material_checking.contains(&id);
             let image_checking = self.release_image_checking.contains(&id);
+            let upload_inspecting = self.release_upload_inspecting.contains(&id);
+            let resume_batch = self
+                .release_batches
+                .iter()
+                .chain(
+                    self.release_project_batches
+                        .values()
+                        .flat_map(|items| items.iter()),
+                )
+                .find(|batch| {
+                    batch.state == "unknown"
+                        && batch.targets.iter().any(|target| {
+                            target.state == "unknown"
+                                && target.release_task_id.as_deref() == Some(id.as_str())
+                        })
+                })
+                .map(|batch| batch.id.as_str());
+            let can_resume = resume_batch.is_some_and(|batch_id| {
+                !self.deploy_run_busy
+                    && !self.batch_resolving.contains(batch_id)
+                    && self
+                        .release_upload_inspections
+                        .get(&id)
+                        .is_some_and(|result| {
+                            result.as_ref().is_ok_and(resumable_upload_inspection)
+                        })
+            });
             let previous_checking = self.previous_version_checking.contains(&id);
+            let current_checking = self.current_version_loading.contains(&id);
             let observation = self.release_observations.get(&id);
             let absent = observation.is_some_and(|result| result.as_ref().is_ok_and(Vec::is_empty));
             let eligible = task.docker_endpoint.is_some()
@@ -5083,6 +6963,10 @@ impl AppView {
             let can_complete = task.phase == "checked"
                 && task.outcome == "blocked"
                 && task.health_result.as_deref() == Some("healthy");
+            let can_reconcile = task.health_result.is_none()
+                && ((task.phase == "checking"
+                    && matches!(task.outcome.as_str(), "unknown" | "running"))
+                    || (task.phase == "deploying" && task.outcome == "unknown"));
             let detail = match observation {
                 Some(Ok(containers)) if containers.is_empty() && eligible => {
                     "远端无该项目容器；可再次核实后关闭任务".into()
@@ -5134,6 +7018,10 @@ impl AppView {
                             row.child(div().text_color(color).child(label))
                         })
                         .child(div().whitespace_normal().child(detail))
+                        .when(self.rollback_running.as_deref() == Some(id.as_str()), |row| {
+                            row.child(div().text_color(self.palette().warning)
+                                .child(format!("回滚执行中：{}", self.rollback_stage)))
+                        })
                         .when_some(self.release_material_checks.get(&id), |row, material| {
                             row.child(div().text_color(self.palette().muted).child(
                                 match material {
@@ -5159,6 +7047,36 @@ impl AppView {
                                 Err(error) => format!("远端镜像核实失败：{error}"),
                             }))
                         })
+                        .when_some(self.release_upload_inspections.get(&id), |row, result| {
+                            let mut details = div().flex().flex_col().gap_1().whitespace_normal();
+                            match result {
+                                Ok(check) => {
+                                    details = details.child(format!(
+                                        "上次只读核实：该项目容器 {} 个；镜像 tag 尚未核实。此结果不授权续传或解除阻断。",
+                                        check.containers.len()
+                                    ));
+                                    if check.archives.is_empty() {
+                                        details = details.child("尚无远端归档预留记录；确认后将重新核对并从首份开始上传。".to_owned());
+                                    }
+                                    for archive in &check.archives {
+                                        let status = match (archive.actual_bytes, archive.digest_matches) {
+                                            (None, _) if archive.state == "reserved" => "预留路径无文件；确认后从零上传".into(),
+                                            (None, _) => "已确认上传的远端文件缺失，禁止续传".into(),
+                                            (Some(actual), Some(true)) if actual == archive.expected_bytes => "完整摘要匹配".into(),
+                                            (Some(actual), Some(false)) if actual == archive.expected_bytes => "完整摘要不符".into(),
+                                            (Some(actual), _) if actual > archive.expected_bytes => "大小超出预期".into(),
+                                            (Some(actual), _) => format!("部分文件 {actual}/{} 字节；前缀尚未核实", archive.expected_bytes),
+                                        };
+                                        details = details.child(format!("{} · {} · {status}", archive.service, archive.directory));
+                                    }
+                                }
+                                Err(error) => details = details.child(format!("远端归档核实失败：{error}")),
+                            }
+                            row.child(div().text_color(self.palette().warning).child(details))
+                        })
+                        .when_some(resume_batch.and_then(|batch_id| self.batch_operation_stage.get(batch_id)), |row, stage| {
+                            row.child(div().text_color(self.palette().warning).child(format!("批次操作中：{stage}")))
+                        })
                         .when_some(self.previous_version_checks.get(&id), |row, result| {
                             row.child(div().text_color(self.palette().muted).child(match result {
                                 Ok(check) => format!(
@@ -5166,6 +7084,21 @@ impl AppView {
                                     check.task_id.chars().take(8).collect::<String>(), check.images
                                 ),
                                 Err(error) => format!("上一版本预检不可用：{error}"),
+                            }))
+                        })
+                        .when_some(self.current_version_checks.get(&id), |row, result| {
+                            row.child(div().text_color(self.palette().muted).child(match result {
+                                Ok(check) if check.containers == 0 => "远端当前无该项目容器；不能判定运行版本。".into(),
+                                Ok(check) if check.running_containers != check.containers =>
+                                    format!("项目有 {} 个容器，其中 {} 个运行；不能确认完整运行版本，全部材料继续保留。",
+                                        check.containers, check.running_containers),
+                                Ok(check) => match &check.matched_task_id {
+                                    Some(version) => format!("检查时容器对应已完成版本 {}；当前{}。外部变化后须重新核实。",
+                                        version.chars().take(8).collect::<String>(),
+                                        if check.all_healthy { "全部健康" } else { "存在未健康服务" }),
+                                    None => "当前容器与任何已完成版本均不完全匹配；可能是部分发布或外部漂移，全部材料继续保留。".into(),
+                                },
+                                Err(error) => format!("当前运行版本核实失败：{error}"),
                             }))
                         })
                         .child(
@@ -5212,6 +7145,26 @@ impl AppView {
                                             move |view, _, _, cx| view.inspect_release_images(id.clone(), cx)
                                         })),
                                 )
+                                .when(task.phase == "uploading" && task.outcome == "unknown", |actions| {
+                                    actions.child(Button::new(("release-upload-inspect", index))
+                                        .debug_selector(|| "release-upload-inspect-button".into())
+                                        .label(if upload_inspecting { "核对中…" } else { "只读核对临时 tar" })
+                                        .disabled(upload_inspecting)
+                                        .on_click(cx.listener({
+                                            let id = id.clone();
+                                            move |view, _, _, cx| view.inspect_release_upload(id.clone(), cx)
+                                        })))
+                                })
+                                .when(task.phase == "uploading" && task.outcome == "unknown" && resume_batch.is_some(), |actions| {
+                                    actions.child(Button::new(("release-upload-resume", index))
+                                        .debug_selector(|| "release-upload-resume-button".into())
+                                        .label("确认断点续传")
+                                        .disabled(!can_resume)
+                                        .on_click(cx.listener({
+                                            let id = id.clone();
+                                            move |view, _, window, cx| view.confirm_resume_unknown_upload(id.clone(), window, cx)
+                                        })))
+                                })
                                 .child(
                                     Button::new(("previous-version", index))
                                         .label(if previous_checking { "预检中…" } else { "检查上一版本" })
@@ -5221,6 +7174,13 @@ impl AppView {
                                             move |view, _, _, cx| view.inspect_previous_version(id.clone(), cx)
                                         })),
                                 )
+                                .child(Button::new(("current-version", index))
+                                    .label(if current_checking { "核实中…" } else { "核实当前运行版本" })
+                                    .disabled(current_checking || task.docker_daemon_id.is_none())
+                                    .on_click(cx.listener({
+                                        let id = id.clone();
+                                        move |view, _, _, cx| view.inspect_current_version(id.clone(), cx)
+                                    })))
                                 .when(absent && eligible, |row| {
                                     row.child(
                                         Button::new(("release-confirm-absence", index))
@@ -5243,21 +7203,125 @@ impl AppView {
                                             })),
                                     )
                                 })
+                                .when(task.phase == "uploading" && task.outcome == "unknown", |row| {
+                                    row.child(Button::new(("release-close-predeploy", index)).outline()
+                                        .label(if resolving { "核实中…" } else { "核实旧版本并关闭上传中断" })
+                                        .disabled(resolving || self.deploy_run_busy || self.rollback_running.is_some())
+                                        .on_click(cx.listener({
+                                            let id = id.clone();
+                                            move |view, _, window, cx| view.confirm_close_predeploy_task(id.clone(), window, cx)
+                                        })))
+                                })
                                 .when(can_complete, |row| {
                                     row.child(Button::new(("release-confirm-healthy", index))
+                                        .debug_selector(|| "release-confirm-healthy-button".into())
                                         .label(if resolving { "处理中…" } else { "确认健康发布完成" })
                                         .disabled(resolving || checking)
                                         .on_click(cx.listener({
                                             let id = id.clone();
                                             move |view, _, window, cx| view.confirm_complete_task(id.clone(), window, cx)
                                         })))
+                                })
+                                .when(can_reconcile, |row| {
+                                    row.child(Button::new(("release-reconcile-health", index))
+                                        .debug_selector(|| "release-reconcile-health-button".into())
+                                         .label(if resolving {
+                                             "核实中…"
+                                         } else if task.phase == "deploying" {
+                                             "核实启动结果并恢复记录"
+                                         } else {
+                                             "恢复中断的健康核实"
+                                         })
+                                        .disabled(resolving || checking)
+                                        .on_click(cx.listener({
+                                            let id = id.clone();
+                                            move |view, _, window, cx| view.confirm_reconcile_health(id.clone(), window, cx)
+                                        })))
                                 }),
                         ),
                 );
         }
+        let rollbacks = match project_id {
+            Some(id) => self
+                .rollback_project_tasks
+                .get(&id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            None => self.rollback_tasks.as_slice(),
+        };
+        for rollback in rollbacks {
+            let reconcilable = matches!(
+                (rollback.phase.as_str(), rollback.outcome.as_str()),
+                ("checking", "unknown" | "running") | ("checked", "blocked")
+            );
+            let resolving = self.release_resolving.contains(&rollback.id);
+            let status = match rollback.outcome.as_str() {
+                "complete" => "已恢复健康版本",
+                "unknown" => "结果待核实，不得重试",
+                "blocked" => "恢复未健康，保持阻断",
+                "failed" => "未执行恢复",
+                _ => "处理中",
+            };
+            rows = rows.child(
+                div()
+                    .border_1()
+                    .border_color(self.palette().border)
+                    .rounded_md()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(div().font_family(mono_font()).child(format!(
+                        "回滚 {} · 项目 {} · {} → {}",
+                        rollback.id.chars().take(8).collect::<String>(),
+                        rollback.project_id,
+                        rollback.source_task_id.chars().take(8).collect::<String>(),
+                        rollback.target_task_id.chars().take(8).collect::<String>()
+                    )))
+                    .child(div().text_color(self.palette().muted).child(format!(
+                            "{} · {} · {} · {}",
+                            rollback.started_at,
+                            rollback.phase,
+                            status,
+                            rollback
+                                .observed_containers
+                                .map_or("服务待核实".into(), |count| format!(
+                                    "已核对 {count} 个服务"
+                                ))
+                        )))
+                    .child(div().whitespace_normal().child(rollback.detail.clone()))
+                    .when_some(
+                        rollback.pending_directories.as_deref(),
+                        |row, directories| {
+                            row.child(
+                                div()
+                                    .text_color(self.palette().warning)
+                                    .child(format!("远端临时镜像归档待人工核对：{directories}")),
+                            )
+                        },
+                    )
+                    .when(reconcilable, |row| {
+                        row.child(
+                            Button::new(format!("rollback-reconcile-{}", rollback.id))
+                                .label(if resolving {
+                                    "核实中…"
+                                } else {
+                                    "只读核实回滚结果"
+                                })
+                                .disabled(resolving)
+                                .on_click(cx.listener({
+                                    let id = rollback.id.clone();
+                                    move |view, _, window, cx| {
+                                        view.confirm_reconcile_rollback(id.clone(), window, cx)
+                                    }
+                                })),
+                        )
+                    }),
+            );
+        }
         self.panel(
             "发布任务",
-            "只读核实远端状态；有容器或执行阶段不明时不能解除锁定。",
+            "回滚前只读预检并二次确认；结果不确定不得自动重试。",
             rows,
         )
         .into_any_element()
@@ -5409,18 +7473,41 @@ impl AppView {
             .child(body)
     }
 
+    pub(super) fn clear_batch_preflight(&mut self) {
+        self.deploy_batch_check_generation = self.deploy_batch_check_generation.wrapping_add(1);
+        if let Some(cancel) = self.deploy_batch_check_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.deploy_batch_check_loading = false;
+        self.deploy_batch_check = None;
+    }
+
     pub(super) fn select_deploy_project(
         &mut self,
         id: i64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.deploy_run_busy && self.deploy_run_project_id != Some(id) {
+            window.push_notification(Notification::warning("发布进行中，暂不能切换项目。"), cx);
+            return;
+        }
         if let Some(project) = self
             .projects
             .iter()
             .find(|project| project.id == id)
             .cloned()
         {
+            self.clear_batch_preflight();
+            if self.deploy_run_project_id != Some(id) {
+                self.deploy_run_project_id = None;
+                self.deploy_run_host_id = None;
+                self.deploy_run_stage.clear();
+                self.deploy_run_log.clear();
+                self.deploy_run_transfer = None;
+                self.deploy_run_started = None;
+                self.deploy_run_elapsed_secs = 0;
+            }
             self.deploy_project_id = Some(id);
             self.deploy_host_ids = project.host_ids.clone();
             self.deploy_parallel = 1;
@@ -5430,6 +7517,7 @@ impl AppView {
             self.deploy_tag_error = None;
             self.deploy_tag_plan_generation = self.deploy_tag_plan_generation.wrapping_add(1);
             self.deploy_tag_plan = None;
+            self.deploy_batch_plan = None;
             self.deploy_tag_plan_loading = false;
             self.deploy_tag
                 .update(cx, |input, cx| input.set_value("", window, cx));
@@ -5490,6 +7578,7 @@ impl AppView {
     }
 
     pub(super) fn refresh_deploy_environment(&mut self, cx: &mut Context<Self>) {
+        self.clear_batch_preflight();
         self.refresh_deploy_config(cx);
         self.refresh_deploy_targets(cx);
         self.deploy_env_generation = self.deploy_env_generation.wrapping_add(1);
@@ -5548,8 +7637,10 @@ impl AppView {
     }
 
     fn refresh_deploy_targets(&mut self, cx: &mut Context<Self>) {
+        self.clear_batch_preflight();
         self.deploy_tag_plan_generation = self.deploy_tag_plan_generation.wrapping_add(1);
         self.deploy_tag_plan = None;
+        self.deploy_batch_plan = None;
         self.deploy_tag_plan_loading = false;
         if let Some(cancel) = self.deploy_target_cancel.take() {
             cancel.store(true, Ordering::Relaxed);
@@ -5603,9 +7694,11 @@ impl AppView {
     }
 
     pub(super) fn schedule_tag_plan(&mut self, cx: &mut Context<Self>) {
+        self.clear_batch_preflight();
         self.deploy_tag_plan_generation = self.deploy_tag_plan_generation.wrapping_add(1);
         let generation = self.deploy_tag_plan_generation;
         self.deploy_tag_plan = None;
+        self.deploy_batch_plan = None;
         self.deploy_tag_plan_loading = false;
         let Some(project) = self
             .deploy_project_id
@@ -5649,14 +7742,81 @@ impl AppView {
             let Some(tag) = tag else {
                 return;
             };
-            let result = cx
+            let (result, batch) = cx
                 .background_executor()
-                .spawn(async move { release::check_image_tags(&project, &tag, &targets) })
+                .spawn(async move {
+                    if project.manifest_mode && targets.len() > 1 {
+                        let batch = stack_release::plan_batch(&project, &tag, &targets);
+                        let result = batch.as_ref().map_err(Clone::clone).and_then(|plan| {
+                            let images = plan
+                                .builds
+                                .iter()
+                                .map(|build| release::PlannedImage {
+                                    platform: build.platform.clone(),
+                                    reference: build.reference.clone(),
+                                })
+                                .collect::<Vec<_>>();
+                            release::check_planned_tags(&images)?;
+                            Ok(images)
+                        });
+                        (result, Some(batch))
+                    } else {
+                        (release::check_image_tags(&project, &tag, &targets), None)
+                    }
+                })
                 .await;
             let _ = view.update(cx, |view, cx| {
                 if view.deploy_tag_plan_generation == generation && view.page == Page::Deploy {
                     view.deploy_tag_plan_loading = false;
                     view.deploy_tag_plan = Some(result);
+                    view.deploy_batch_plan = batch;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn start_batch_preflight(&mut self, cx: &mut Context<Self>) {
+        let Some(project_id) = self.deploy_project_id else {
+            return;
+        };
+        if self.deploy_host_ids.len() < 2
+            || self.deploy_batch_check_loading
+            || self.deploy_run_busy
+            || self.deploy_config_loading
+            || self.deploy_env_loading
+            || self.deploy_target_loading
+            || self.deploy_tag_plan_loading
+            || !matches!(self.deploy_config_result, Some(Ok(())))
+            || !matches!(self.deploy_env_result, Some(Ok(())))
+            || !matches!(self.deploy_batch_plan, Some(Ok(_)))
+            || !matches!(self.deploy_tag_plan, Some(Ok(_)))
+        {
+            return;
+        }
+        self.clear_batch_preflight();
+        let generation = self.deploy_batch_check_generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.deploy_batch_check_cancel = Some(cancel.clone());
+        self.deploy_batch_check_loading = true;
+        let tag = self.deploy_tag.read(cx).value().to_string();
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    stack_release::preflight_batch(project_id, &tag, cancel).map(Arc::new)
+                })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if view.page == Page::Deploy
+                    && view.deploy_project_id == Some(project_id)
+                    && view.deploy_batch_check_generation == generation
+                {
+                    view.deploy_batch_check_loading = false;
+                    view.deploy_batch_check_cancel = None;
+                    view.deploy_batch_check = Some(result);
                     cx.notify();
                 }
             });
@@ -5693,6 +7853,544 @@ impl AppView {
                     cx.notify();
                 }
             });
+        })
+        .detach();
+    }
+
+    pub(super) fn deploy_ready(&self, project: &Project, ids: &[i64]) -> bool {
+        project.manifest_mode
+            && ids.len() == 1
+            && self.deploy_project_id == Some(project.id)
+            && !self.deploy_run_busy
+            && self.batch_resolving.is_empty()
+            && self.rollback_running.is_none()
+            && matches!(self.deploy_config_result, Some(Ok(())))
+            && matches!(self.deploy_env_result, Some(Ok(())))
+            && matches!(self.deploy_tag_plan, Some(Ok(_)))
+            && matches!(&self.deploy_target_result, Some(Ok(targets)) if targets.len() == 1 && targets[0].0 == ids[0])
+            && !self.deploy_config_loading
+            && !self.deploy_env_loading
+            && !self.deploy_target_loading
+            && !self.deploy_tag_plan_loading
+    }
+
+    pub(super) fn batch_start_ready(&self, project: &Project, ids: &[i64]) -> bool {
+        project.manifest_mode
+            && ids.len() > 1
+            && project.host_ids == ids
+            && self.deploy_project_id == Some(project.id)
+            && self.deploy_parallel == 1
+            && !self.deploy_run_busy
+            && self.batch_resolving.is_empty()
+            && self.rollback_running.is_none()
+            && !self.deploy_batch_check_loading
+            && !self.deploy_config_loading
+            && !self.deploy_env_loading
+            && !self.deploy_target_loading
+            && !self.deploy_tag_plan_loading
+            && matches!(self.deploy_config_result, Some(Ok(())))
+            && matches!(self.deploy_env_result, Some(Ok(())))
+            && matches!((&self.deploy_tag_plan, &self.deploy_batch_check), (Some(Ok(images)), Some(Ok(snapshot)))
+                if images.iter().map(|image| image.reference.as_str()).collect::<Vec<_>>()
+                    == snapshot.plan.builds.iter().map(|build| build.reference.as_str()).collect::<Vec<_>>()
+                    && snapshot.targets.iter().map(|target| target.host_id).collect::<Vec<_>>() == ids
+                    && snapshot.env_files.len() == ids.len())
+    }
+
+    pub(super) fn confirm_batch_deploy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self
+            .deploy_project_id
+            .and_then(|id| self.projects.iter().find(|item| item.id == id))
+        else {
+            return;
+        };
+        let ids = self.deploy_host_ids.clone();
+        if !self.batch_start_ready(project, &ids) {
+            window.push_notification(
+                Notification::warning("批次预检已失效，请重新核对目标。"),
+                cx,
+            );
+            return;
+        }
+        let Some(Ok(snapshot)) = &self.deploy_batch_check else {
+            return;
+        };
+        let snapshot = snapshot.clone();
+        let generation = self.deploy_batch_check_generation;
+        let project_id = project.id;
+        let name = project.name.clone();
+        let tag = self.deploy_tag.read(cx).value().to_string();
+        let targets = snapshot
+            .targets
+            .iter()
+            .map(|target| target.host.name.clone())
+            .collect::<Vec<_>>()
+            .join(" → ");
+        let images = snapshot.plan.builds.len();
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm_view = view.clone();
+            let snapshot = snapshot.clone();
+            let tag = tag.clone();
+            dialog.title("确认多主机批次发布").w(px(560.))
+                .child(div().flex().flex_col().gap_3()
+                    .child(format!("项目：{name} · 发布标识：{tag}"))
+                    .child(format!("顺序：{targets} · 共享镜像 {images} 份"))
+                    .child("当前并行度为 1。执行前将重新核对完整预检快照；只构建一次共享镜像，再依次处理目标。")
+                    .child("第一台全部服务健康后会暂停，须到历史页人工核实并确认，才可显式继续下一台。失败或结果未知不会自动重试或回滚。"))
+                .footer(div().flex().justify_end().gap_2()
+                    .child(Button::new("batch-start-cancel").debug_selector(|| "batch-start-cancel".into())
+                        .label("取消").on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("batch-start-confirm").primary()
+                        .debug_selector(|| "batch-start-confirm".into()).label("确认开始批次")
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let _ = confirm_view.update(cx, |view, cx| {
+                                view.start_batch_deploy(project_id, &tag, generation, snapshot.clone(), window, cx)
+                            });
+                        })))
+        });
+    }
+
+    fn start_batch_deploy(
+        &mut self,
+        project_id: i64,
+        tag: &str,
+        generation: u64,
+        snapshot: Arc<stack_release::BatchPreflight>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.projects.iter().find(|item| item.id == project_id) else {
+            return;
+        };
+        if !self.batch_start_ready(project, &self.deploy_host_ids)
+            || self.deploy_batch_check_generation != generation
+            || self.deploy_tag.read(cx).value() != tag
+            || !matches!(&self.deploy_batch_check, Some(Ok(current)) if Arc::ptr_eq(current, &snapshot))
+        {
+            window.push_notification(
+                Notification::warning("批次确认期间配置已变化，请重新预检。"),
+                cx,
+            );
+            return;
+        }
+        self.deploy_run_busy = true;
+        self.deploy_run_project_id = Some(project_id);
+        self.deploy_run_host_id = snapshot.targets.first().map(|target| target.host_id);
+        self.deploy_run_stage = "重新预检批次并准备共享构建".into();
+        self.deploy_run_log.clear();
+        self.deploy_run_log.push(self.deploy_run_stage.clone());
+        self.deploy_run_started = Some(Instant::now());
+        self.deploy_run_elapsed_secs = 0;
+        self.deploy_run_transfer = None;
+        cx.notify();
+        let (tx, rx) = mpsc::channel::<BatchStartEvent>();
+        cx.background_executor()
+            .spawn(async move {
+                let result = stack_release::run_batch_sequential(
+                    project_id,
+                    &snapshot,
+                    Arc::new(AtomicBool::new(false)),
+                    |event| {
+                        if let Some((sent, total)) = transfer_progress(event) {
+                            let _ = tx.send(BatchStartEvent::Transfer { sent, total });
+                            return;
+                        }
+                        if let Some(stage) = safe_deploy_stage(event) {
+                            let _ = tx.send(BatchStartEvent::Stage(stage));
+                        }
+                    },
+                );
+                let _ = tx.send(BatchStartEvent::Finished(result));
+            })
+            .detach();
+        cx.spawn_in(window, async move |view, cx| {
+            loop {
+                match rx.try_recv() {
+                    Ok(BatchStartEvent::Stage(stage)) => {
+                        let _ = view.update(cx, |view, cx| {
+                            view.deploy_run_stage = stage.clone();
+                            view.deploy_run_transfer = None;
+                            if view.deploy_run_log.last() != Some(&stage) {
+                                view.deploy_run_log.push(stage);
+                            }
+                            cx.notify();
+                        });
+                    }
+                    Ok(BatchStartEvent::Transfer { sent, total }) => {
+                        let _ = view.update(cx, |view, cx| {
+                            view.deploy_run_transfer = Some((sent, total));
+                            cx.notify();
+                        });
+                    }
+                    Ok(BatchStartEvent::Finished(result)) => {
+                        let _ = cx.update(|window, app| {
+                            let _ = view.update(app, |view, cx| {
+                                view.deploy_run_busy = false;
+                                view.deploy_run_elapsed_secs = view
+                                    .deploy_run_started
+                                    .map_or(0, |start| start.elapsed().as_secs());
+                                view.deploy_run_transfer = None;
+                                view.deploy_run_stage = if result.is_ok() {
+                                    "当前主机健康，等待人工确认"
+                                } else {
+                                    "批次未完成，请核实历史"
+                                }
+                                .into();
+                                view.deploy_run_log.push(view.deploy_run_stage.clone());
+                                view.refresh_release_tasks(None, cx);
+                                view.refresh_release_tasks(Some(project_id), cx);
+                                cx.notify();
+                            });
+                            window.push_notification(
+                                match result {
+                                    Ok(stack_release::BatchProgress::AwaitingConfirmation {
+                                        batch_id,
+                                        ..
+                                    }) => Notification::success(format!(
+                                        "批次 {} 当前主机已健康；请在历史页人工确认",
+                                        &batch_id[..8]
+                                    )),
+                                    Ok(stack_release::BatchProgress::Complete { batch_id }) => {
+                                        Notification::success(format!(
+                                            "批次 {} 全部完成",
+                                            &batch_id[..8]
+                                        ))
+                                    }
+                                    Err(error) => Notification::warning(format!(
+                                        "批次 {}：{}；请核实历史，勿重复开始。",
+                                        error.batch_id.as_deref().unwrap_or("未创建"),
+                                        error.message
+                                    )),
+                                },
+                                app,
+                            );
+                        });
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        let _ = cx.update(|window, app| {
+                            let _ = view.update(app, |view, cx| {
+                                view.deploy_run_busy = false;
+                                view.deploy_run_transfer = None;
+                                view.deploy_run_stage = "执行进程异常中断；请核实批次历史".into();
+                                view.refresh_release_tasks(None, cx);
+                                view.refresh_release_tasks(Some(project_id), cx);
+                                cx.notify();
+                            });
+                            window.push_notification(
+                                Notification::error("批次执行通道中断；结果待核实，不得重新开始。"),
+                                app,
+                            );
+                        });
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => {
+                        let _ = view.update(cx, |view, cx| {
+                            if let Some(start) = view.deploy_run_started {
+                                let seconds = start.elapsed().as_secs();
+                                if view.deploy_run_elapsed_secs != seconds {
+                                    view.deploy_run_elapsed_secs = seconds;
+                                    cx.notify();
+                                }
+                            }
+                        });
+                        cx.background_executor()
+                            .timer(Duration::from_millis(200))
+                            .await;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn confirm_deploy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self
+            .deploy_project_id
+            .and_then(|id| self.projects.iter().find(|p| p.id == id))
+        else {
+            return;
+        };
+        let ids = self.deploy_host_ids.clone();
+        if ids.len() > 1 && MULTI_HOST_START_ENABLED {
+            self.confirm_batch_deploy(window, cx);
+            return;
+        }
+        if !self.deploy_ready(project, &ids) {
+            window.push_notification(
+                Notification::warning("仅支持预检通过的 YAML v2 单主机发布。"),
+                cx,
+            );
+            return;
+        }
+        let project_id = project.id;
+        let host_id = ids[0];
+        let name = project.name.clone();
+        let Some(confirmed_host) = self.hosts.iter().find(|host| host.id == host_id).cloned()
+        else {
+            window.push_notification(Notification::warning("目标主机资料尚未读取。"), cx);
+            return;
+        };
+        let host_name = confirmed_host.name.clone();
+        let tag = self.deploy_tag.read(cx).value().to_string();
+        let planned = self
+            .deploy_tag_plan
+            .as_ref()
+            .and_then(|plan| plan.as_ref().ok())
+            .map(|images| {
+                images
+                    .iter()
+                    .map(|image| image.reference.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let targets = self
+            .deploy_target_result
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .cloned()
+            .unwrap_or_default();
+        let source_digest = match project_store::effective(project_id).and_then(|fresh| {
+            let current = release::plan_images(&fresh, &tag, &targets)?;
+            if current
+                .iter()
+                .map(|image| &image.reference)
+                .ne(planned.iter())
+            {
+                return Err("镜像计划已变化，请重新检查。".into());
+            }
+            release::source_digest(&fresh)
+        }) {
+            Ok(digest) => digest,
+            Err(error) => {
+                window.push_notification(Notification::warning(error), cx);
+                self.refresh_deploy_environment(cx);
+                return;
+            }
+        };
+        let images = planned.join("、");
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm_view = view.clone();
+            let tag = tag.clone();
+            let source_digest = source_digest.clone();
+            let confirmed_host = confirmed_host.clone();
+            dialog.title("确认发布整个 Compose 项目").w(px(540.))
+                .child(div().flex().flex_col().gap_3()
+                    .child(format!("项目：{name} · 主机：{host_name}"))
+                    .child(format!("本次镜像：{images}"))
+                    .child("将逐个构建并传输自有镜像，在目标主机启动 Compose 中的全部服务。执行前会重新预检项目文件和主机；运行期间请勿关闭程序。")
+                    .child("仅全部服务健康且材料及远端身份再次核实通过，才记录完成；失败或连接不确定会阻断后续发布，不自动重试。"))
+                .footer(div().flex().justify_end().gap_2()
+                    .child(Button::new("deploy-cancel").debug_selector(|| "deploy-cancel-button".into()).label("取消")
+                        .on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("deploy-confirm").primary().debug_selector(|| "deploy-confirm-button".into()).label("确认开始发布")
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let tag = tag.clone();
+                            let digest = source_digest.clone();
+                            let host = confirmed_host.clone();
+                            let _ = confirm_view.update(cx, |view, cx| view.start_deploy(project_id, host, tag, digest, window, cx));
+                        })))
+        });
+    }
+
+    fn start_deploy(
+        &mut self,
+        project_id: i64,
+        confirmed_host: Host,
+        tag: String,
+        confirmed_digest: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let host_id = confirmed_host.id;
+        let Some(project) = self
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+        else {
+            return;
+        };
+        if self.deploy_host_ids != [host_id]
+            || !self.deploy_ready(project, &[host_id])
+            || self.deploy_tag.read(cx).value() != tag
+        {
+            window.push_notification(
+                Notification::warning("发布配置已变化，请重新检查并确认。"),
+                cx,
+            );
+            return;
+        }
+        let current_digest = project_store::effective(project_id)
+            .and_then(|current| release::source_digest(&current));
+        if current_digest.as_deref() != Ok(confirmed_digest.as_str()) {
+            window.push_notification(
+                Notification::warning("项目配置在确认期间变化；请重新检查并确认。"),
+                cx,
+            );
+            self.refresh_deploy_environment(cx);
+            return;
+        }
+        let host_unchanged = host_store::list().is_ok_and(|(hosts, _)| {
+            hosts
+                .iter()
+                .any(|host| same_deploy_host(host, &confirmed_host))
+        });
+        if !host_unchanged {
+            window.push_notification(
+                Notification::warning("目标主机在确认期间变化，请重新检查。"),
+                cx,
+            );
+            self.refresh_deploy_environment(cx);
+            return;
+        }
+        self.deploy_run_busy = true;
+        self.deploy_run_project_id = Some(project_id);
+        self.deploy_run_host_id = Some(host_id);
+        self.deploy_run_stage = "重新预检并准备材料".into();
+        self.deploy_run_log.clear();
+        self.deploy_run_log.push(self.deploy_run_stage.clone());
+        self.deploy_run_transfer = None;
+        self.deploy_run_started = Some(Instant::now());
+        self.deploy_run_elapsed_secs = 0;
+        cx.notify();
+        let (tx, rx) = mpsc::channel::<DeployRunEvent>();
+        cx.background_executor()
+            .spawn(async move {
+                let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let mut last_percent = None;
+                let result = release::run_single_host_confirmed(
+                    project_id,
+                    host_id,
+                    &tag,
+                    &confirmed_digest,
+                    cancel,
+                    |event| {
+                        if event.starts_with("传输镜像：") {
+                            last_percent = None;
+                        }
+                        if let Some((sent, total)) = transfer_progress(event) {
+                            let percent = (u128::from(sent) * 100 / u128::from(total)) as u8;
+                            if last_percent != Some(percent) {
+                                let _ = tx.send(DeployRunEvent::Transfer { sent, total });
+                                last_percent = Some(percent);
+                            }
+                            return;
+                        }
+                        if let Some(stage) = safe_deploy_stage(event) {
+                            let _ = tx.send(DeployRunEvent::Stage(stage));
+                        }
+                    },
+                )
+                .and_then(|id| {
+                    let task = release_store::get_task(&id)?;
+                    if task.health_result.as_deref() != Some("healthy") {
+                        return Err(format!(
+                            "发布任务 {id} 未达到全部服务健康；请在发布历史核实，不会自动重试。"
+                        ));
+                    }
+                    let _ = tx.send(DeployRunEvent::Stage(
+                        "二次核实版本材料、镜像和服务健康".into(),
+                    ));
+                    release::confirm_healthy_and_complete(&id).map(|count| (id, count))
+                });
+                let _ = tx.send(DeployRunEvent::Finished(result));
+            })
+            .detach();
+        cx.spawn_in(window, async move |view, cx| {
+            loop {
+                match rx.try_recv() {
+                    Ok(DeployRunEvent::Stage(stage)) => {
+                        let _ = view.update(cx, |view, cx| {
+                            view.deploy_run_stage = stage.clone();
+                            view.deploy_run_transfer = None;
+                            if view.deploy_run_log.last() != Some(&stage) {
+                                view.deploy_run_log.push(stage);
+                            }
+                            cx.notify();
+                        });
+                    }
+                    Ok(DeployRunEvent::Transfer { sent, total }) => {
+                        let _ = view.update(cx, |view, cx| {
+                            view.deploy_run_transfer = Some((sent, total));
+                            cx.notify();
+                        });
+                    }
+                    Ok(DeployRunEvent::Finished(result)) => {
+                        let _ = cx.update(|window, app| {
+                            let _ = view.update(app, |view, cx| {
+                                view.deploy_run_busy = false;
+                                view.deploy_run_elapsed_secs = view
+                                    .deploy_run_started
+                                    .map_or(0, |started| started.elapsed().as_secs());
+                                view.deploy_run_transfer = None;
+                                view.deploy_run_stage = if result.is_ok() {
+                                    "全部服务健康 · 发布完成".into()
+                                } else {
+                                    "发布未完成 · 请核实历史记录".into()
+                                };
+                                view.deploy_run_log.push(view.deploy_run_stage.clone());
+                                view.refresh_release_tasks(None, cx);
+                                view.refresh_release_tasks(Some(project_id), cx);
+                                view.refresh_deploy_environment(cx);
+                                cx.notify();
+                            });
+                            window.push_notification(
+                                match result {
+                                    Ok((id, count)) => Notification::success(format!(
+                                        "发布 {id} 完成，{count} 个服务健康"
+                                    )),
+                                    Err(error) => Notification::error(format!(
+                                        "{error}；请到发布历史核实，勿重复点击。"
+                                    )),
+                                },
+                                app,
+                            );
+                        });
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        let _ = cx.update(|window, app| {
+                            let _ = view.update(app, |view, cx| {
+                                view.deploy_run_busy = false;
+                                view.deploy_run_elapsed_secs = view
+                                    .deploy_run_started
+                                    .map_or(0, |started| started.elapsed().as_secs());
+                                view.deploy_run_transfer = None;
+                                view.deploy_run_stage =
+                                    "执行进程异常中止；请在历史页人工核实".into();
+                                view.refresh_release_tasks(None, cx);
+                                view.refresh_release_tasks(Some(project_id), cx);
+                                cx.notify();
+                            });
+                            window.push_notification(
+                                Notification::error(
+                                    "发布执行异常中断，请先在历史页核实，不得重试。",
+                                ),
+                                app,
+                            );
+                        });
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => {
+                        let _ = view.update(cx, |view, cx| {
+                            if let Some(started) = view.deploy_run_started {
+                                let seconds = started.elapsed().as_secs();
+                                if view.deploy_run_elapsed_secs != seconds {
+                                    view.deploy_run_elapsed_secs = seconds;
+                                    cx.notify();
+                                }
+                            }
+                        });
+                        cx.background_executor()
+                            .timer(Duration::from_millis(200))
+                            .await
+                    }
+                }
+            }
         })
         .detach();
     }
@@ -6098,6 +8796,7 @@ impl AppView {
                     .h(px(36.))
                     .w_full()
                     .outline()
+                    .disabled(self.deploy_run_busy)
                     .label(format!("{}  ▾", project.name)),
             )
             .content(move |_, _, cx| {
@@ -6122,6 +8821,20 @@ impl AppView {
                 options
             });
         let parallel_view = cx.weak_entity();
+        let can_start = self.deploy_ready(project, &ids)
+            || (MULTI_HOST_START_ENABLED && self.batch_start_ready(project, &ids));
+        let can_batch_check = project.manifest_mode
+            && ids.len() > 1
+            && !self.deploy_batch_check_loading
+            && !self.deploy_run_busy
+            && !self.deploy_config_loading
+            && !self.deploy_env_loading
+            && !self.deploy_target_loading
+            && !self.deploy_tag_plan_loading
+            && matches!(self.deploy_config_result, Some(Ok(())))
+            && matches!(self.deploy_env_result, Some(Ok(())))
+            && matches!(self.deploy_batch_plan, Some(Ok(_)))
+            && matches!(self.deploy_tag_plan, Some(Ok(_)));
         let parallel_options = ids.len().max(1);
         let parallel_selector = Popover::new("deploy-parallel-select")
             .trigger(
@@ -6161,6 +8874,15 @@ impl AppView {
                 .find(|host| host.id == *id)
                 .map(|host| host.name.clone())
                 .unwrap_or_else(|| "主机数据待读取".into());
+            let current = self.deploy_run_project_id == Some(project.id)
+                && self.deploy_run_host_id == Some(*id);
+            let transfer_percent =
+                if current && self.deploy_run_busy && self.deploy_run_stage == "传输镜像" {
+                    self.deploy_run_transfer
+                        .map(|(sent, total)| (u128::from(sent) * 100 / u128::from(total)) as f32)
+                } else {
+                    None
+                };
             host_rows = host_rows.child(
                 div()
                     .min_w(px(770.))
@@ -6182,17 +8904,55 @@ impl AppView {
                             .w(px(115.))
                             .flex_shrink_0()
                             .text_color(self.palette().muted)
-                            .child("等待"),
+                            .child(
+                                if self.deploy_run_project_id == Some(project.id)
+                                    && self.deploy_run_host_id == Some(*id)
+                                {
+                                    if self.deploy_run_busy {
+                                        "发布中"
+                                    } else if self.deploy_run_stage.contains("发布完成") {
+                                        "健康完成"
+                                    } else {
+                                        "待核实"
+                                    }
+                                } else {
+                                    "等待"
+                                },
+                            ),
                     )
                     .child(
                         div()
                             .w(px(130.))
                             .flex_shrink_0()
                             .text_color(self.palette().muted)
-                            .child("—"),
+                            .truncate()
+                            .child(
+                                if self.deploy_run_project_id == Some(project.id)
+                                    && self.deploy_run_host_id == Some(*id)
+                                {
+                                    self.deploy_run_stage.clone()
+                                } else {
+                                    "—".into()
+                                },
+                            ),
                     )
-                    .child(div().w(px(90.)).flex_shrink_0().child("—"))
-                    .child(div().w(px(85.)).flex_shrink_0().child("—"))
+                    .child(
+                        div()
+                            .w(px(90.))
+                            .flex_shrink_0()
+                            .flex()
+                            .flex_col()
+                            .when_some(transfer_percent, |el, percent| {
+                                el.child(Progress::new(("deploy-transfer", index)).value(percent))
+                                    .child(format!("{percent:.0}%"))
+                            })
+                            .when(transfer_percent.is_none(), |el| el.child("—")),
+                    )
+                    .child(div().w(px(85.)).flex_shrink_0().child(if current {
+                        format!("{}s", self.deploy_run_elapsed_secs)
+                    } else {
+                        "—".into()
+                    }))
                     .child("—"),
             );
         }
@@ -6214,7 +8974,7 @@ impl AppView {
                     .child(div().w(px(180.)).child(Self::form_field("项目", project_selector)))
                     .child(div().w(px(200.)).flex().flex_col().gap_2()
                         .child("发布标识")
-                        .child(Input::new(&self.deploy_tag).w_full().disabled(self.deploy_tag_loading))
+                        .child(Input::new(&self.deploy_tag).w_full().disabled(self.deploy_tag_loading || self.deploy_run_busy))
                         .when_some(self.deploy_tag_error.as_ref(), |el, error| el.child(
                             div().text_size(px(12.)).text_color(self.palette().warning).child(error.clone())
                         )))
@@ -6224,10 +8984,21 @@ impl AppView {
                             .child(format!("已选 {} 台", ids.len()))
                             .when(project.manifest_mode, |el| el.child("YAML 预设"))
                             .when(!project.manifest_mode, |el| el.child(Button::new("deploy-targets-change").label("更改")
-                                .disabled(project.host_ids.is_empty())
+                                .disabled(project.host_ids.is_empty() || self.deploy_run_busy)
                                 .on_click(cx.listener(|view, _, window, cx| view.open_deploy_targets_dialog(window, cx)))))))
                     .child(div().w(px(75.)).child(Self::form_field("并行度", parallel_selector)))
-                    .child(Button::new("start-deploy").primary().label("开始发布").tooltip("SSH 发布链路与执行尚未接入").disabled(true)),
+                    .child(Button::new("start-deploy").primary()
+                        .debug_selector(|| "start-deploy-button".into())
+                        .label(if self.deploy_run_busy { "发布中…" } else { "开始发布" })
+                        .tooltip(if project.manifest_mode && ids.len() > 1 && !MULTI_HOST_START_ENABLED {
+                            "批次发布仍在隔离验收，开始按钮保持禁用；不会只发布第一台"
+                        } else if project.manifest_mode && ids.len() > 1 {
+                            "将按 YAML 目标顺序逐台发布；每台健康后都须人工确认"
+                        } else {
+                            "当前支持 YAML v2 单主机整栈发布；开始前将再次预检"
+                        })
+                        .disabled(!can_start)
+                        .on_click(cx.listener(|view, _, window, cx| view.confirm_deploy(window, cx)))),
             )
             .child(self.panel(
                 "发布进度总览",
@@ -6242,8 +9013,52 @@ impl AppView {
                     .child(div().text_color(config_color).child(config_status))
                     .child(div().text_color(target_color).child(target_status))
                     .child(div().text_color(tag_color).child(tag_status))
+                    .when_some(self.deploy_batch_plan.as_ref(), |el, batch| el.child(
+                        div().whitespace_normal().text_color(self.palette().muted).child(match batch {
+                            Ok(plan) => format!(
+                                "只读批次矩阵 · {} 份唯一服务/架构镜像 → {} 台目标：{}。初始执行入口仍待隔离验收。",
+                                plan.builds.len(), plan.hosts.len(),
+                                plan.hosts.iter().map(|target| {
+                                    let name = self.hosts.iter().find(|host| host.id == target.host_id)
+                                        .map_or_else(|| target.host_id.to_string(), |host| host.name.clone());
+                                    format!("{name} {} / {} 份镜像", target.platform, target.images.len())
+                                }).collect::<Vec<_>>().join(" · "),
+                            ),
+                            Err(error) => format!("批次镜像矩阵不可用：{error}"),
+                        })
+                    ))
                     .child(div().text_color(env_color).child(env_status))
-                    .child(div().text_color(self.palette().muted).child("构建前将检查 Compose、目标主机架构及本地能力；构建后检查 HEALTHCHECK 与目标镜像。发布执行尚未接入。")),
+                    .when(project.manifest_mode && ids.len() > 1, |el| el.child(
+                        div().flex().flex_col().items_start().gap_2()
+                            .child(Button::new("batch-preflight-check")
+                                .debug_selector(|| "batch-preflight-check-button".into())
+                                .label(if self.deploy_batch_check_loading { "正在核对批次目标…" } else { "核对批次目标" })
+                                .disabled(!can_batch_check)
+                                .on_click(cx.listener(|view, _, _, cx| view.start_batch_preflight(cx))))
+                            .child(div().whitespace_normal().text_color(match &self.deploy_batch_check {
+                                Some(Ok(_)) => self.palette().success,
+                                Some(Err(_)) => self.palette().warning,
+                                None => self.palette().muted,
+                            }).child(match &self.deploy_batch_check {
+                                Some(Ok(snapshot)) => format!(
+                                    "批次目标/材料预检通过 · {} 台可信目标 / {} 份共享镜像；尚未构建，HEALTHCHECK 将在构建后核对。仅核实，不创建任务或部署。",
+                                    snapshot.targets.len(), snapshot.plan.builds.len(),
+                                ),
+                                Some(Err(error)) => format!("批次预检未通过：{error}"),
+                                None => "批次目标尚未完整预检；当前仍不能开始多主机发布。".into(),
+                            }))
+                    ))
+                    .when(project.manifest_mode && ids.len() > 1, |el| el.child(
+                        div().debug_selector(|| "multi-host-unavailable".into())
+                            .border_1().border_color(self.palette().warning).rounded_md().p_3()
+                            .text_color(self.palette().warning)
+                            .child(format!("YAML 预设 {} 台目标主机；批次初始执行仍在隔离验收。开始发布保持禁用，不会仅部署第一台。", ids.len()))
+                    ))
+                    .child(div().text_color(self.palette().muted).child(if self.deploy_run_busy && self.deploy_run_project_id == Some(project.id) {
+                        format!("正在执行：{}；传输百分比按当前镜像计算，多镜像时会重置。离开页面不会取消任务，请勿关闭程序。", self.deploy_run_stage)
+                    } else {
+                        "当前仅支持 YAML v2 单主机整栈发布；传输百分比按当前镜像计算，多镜像时会重置。全部服务健康后再次核实材料与远端状态。".into()
+                    })),
             ))
             .child(self.panel(
                 "各主机进度",
@@ -6267,7 +9082,10 @@ impl AppView {
             .child(self.panel(
                 "构建日志",
                 "",
-                div().px_6().pb_6().text_color(self.palette().muted).child("等待开始发布…"),
+                div().px_6().pb_6().flex().flex_col().gap_2().text_color(self.palette().muted)
+                    .children(if self.deploy_run_project_id != Some(project.id) || self.deploy_run_log.is_empty() {
+                        vec!["等待开始发布…".to_owned()]
+                    } else { self.deploy_run_log.clone() }),
             ))
     }
 
@@ -6455,7 +9273,6 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let view = cx.weak_entity();
         let palette = self.palette();
         window.open_dialog(cx, move |dialog, _, _| {
             let mut rows = div().flex().flex_col().gap_2();
@@ -6481,10 +9298,8 @@ impl AppView {
                     .child("未使用网络")
                     .child(format!("{} 个 · 空间未知", preview.unused_networks)),
             );
-            let host = host.clone();
-            let view = view.clone();
             dialog
-                .title("清理磁盘 · 预检")
+                .title("Docker 磁盘占用 · 只读")
                 .w(px(520.))
                 .child(
                     div()
@@ -6493,99 +9308,18 @@ impl AppView {
                         .gap_4()
                         .child(format!("目标主机：{} ({}:{})", host.name, host.address, host.port))
                         .child(rows)
-                        .child(div().text_color(palette.muted).child("悬空镜像大小合计可能因共享层而高于实际释放量；其他估值也不等于本次实际释放量，且资源可能属于其他项目。不清理数据卷。")),
+                        .child(div().text_color(palette.muted).child("悬空镜像大小因共享层可能高于实际可释放量。为保护发布历史，全局 Docker 清理暂不可用；此处只读，不删除镜像、容器、网络或数据卷。")),
                 )
                 .footer(
                     div()
                         .flex()
                         .justify_end()
                         .gap_2()
-                        .child(Button::new("disk-preview-cancel").label("取消").on_click(
+                        .child(Button::new("disk-preview-close").label("关闭").on_click(
                             |_, window, cx| window.close_dialog(cx),
-                        ))
-                        .child(Button::new("disk-preview-next").danger().label("继续").on_click(
-                            move |_, window, cx| {
-                                window.close_dialog(cx);
-                                let _ = view.update(cx, |view, cx| {
-                                    if view.container_host_id == Some(host.id) {
-                                        view.confirm_disk_prune(host.clone(), window, cx);
-                                    }
-                                });
-                            },
                         )),
                 )
         });
-    }
-
-    fn confirm_disk_prune(&mut self, host: Host, window: &mut Window, cx: &mut Context<Self>) {
-        let view = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let host = host.clone();
-            let view = view.clone();
-            dialog
-                .title("确认全局 Docker 清理")
-                .w(px(480.))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .child(format!("目标主机：{} ({}:{})", host.name, host.address, host.port))
-                        .child("这是全局 Docker 清理，可能影响其他项目：将删除停止容器、未使用网络、悬空镜像及构建缓存。未被容器引用的无标签回滚镜像也可能被删；不会删除数据卷。这不是受保护的发布历史清理。"),
-                )
-                .footer(
-                    div()
-                        .flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(Button::new("disk-confirm-cancel").label("取消").on_click(
-                            |_, window, cx| window.close_dialog(cx),
-                        ))
-                        .child(Button::new("disk-confirm-run").danger().label("确认清理").on_click(
-                            move |_, window, cx| {
-                                let _ = view.update(cx, |view, cx| {
-                                    view.run_disk_prune(host.clone(), window, cx);
-                                });
-                                window.close_dialog(cx);
-                            },
-                        )),
-                )
-        });
-    }
-
-    fn run_disk_prune(&mut self, host: Host, window: &mut Window, cx: &mut Context<Self>) {
-        if self.prune_busy || self.container_host_id != Some(host.id) {
-            return;
-        }
-        self.prune_busy = true;
-        cx.notify();
-        cx.spawn_in(window, async move |view, cx| {
-            let host_id = host.id;
-            let result = cx
-                .background_executor()
-                .spawn(async move { ssh::disk_prune(host) })
-                .await;
-            let _ = cx.update(|window, app| {
-                let _ = view.update(app, |view, cx| {
-                    view.prune_busy = false;
-                    if view.page == Page::Containers && view.container_host_id == Some(host_id) {
-                        view.select_container_host(host_id, cx);
-                    }
-                    cx.notify();
-                });
-                window.push_notification(
-                    match result {
-                        Ok(Some(actual)) => {
-                            Notification::success(format!("清理完成，实际释放 {actual}"))
-                        }
-                        Ok(None) => Notification::success("清理完成；远端未报告实际释放量"),
-                        Err(error) => Notification::error(error),
-                    },
-                    app,
-                );
-            });
-        })
-        .detach();
     }
 
     fn confirm_container_action(
@@ -7358,9 +10092,9 @@ impl AppView {
                     Button::new("disk-prune")
                         .outline()
                         .label(if self.prune_busy {
-                            "正在清理/预检…"
+                            "正在读取…"
                         } else {
-                            "清理磁盘"
+                            "磁盘占用"
                         })
                         .disabled(self.prune_busy || self.container_host_id.is_none())
                         .on_click(cx.listener(|view, _, window, cx| {
@@ -7486,7 +10220,7 @@ impl AppView {
                         .flex_col()
                         .items_start()
                         .gap_4()
-                        .child("已完成版本保留数")
+                        .child("已完成版本保留数（尚未启用自动清理）")
                         .child(
                             div()
                                 .w_full()
@@ -7499,17 +10233,17 @@ impl AppView {
                                 .items_center()
                                 .justify_between()
                                 .text_color(self.palette().muted)
-                                .child("3")
+                                .child("尚未生效")
                                 .child("⌄"),
                         )
-                        .child("自动清理  客户端在线时每日检查")
+                        .child("自动清理未启用")
                         .child(
                             div()
                                 .w_full()
                                 .min_w_0()
                                 .whitespace_normal()
                                 .text_color(self.palette().muted)
-                                .child("离线期间将在下次启动 / 重连时补查，不安装 VPS 定时任务。"),
+                                .child("可在项目发布历史只读预览本机旧版 tar 占用；当前不会删除本机归档、远端镜像或数据卷。"),
                         )
                         .child(
                             Button::new("cleanup-now")
@@ -8205,9 +10939,106 @@ impl AppView {
 
 #[cfg(test)]
 mod release_tag_tests {
-    use super::{display_path, generate_release_tag};
+    use super::{
+        batch_phase_label, display_path, generate_release_tag, history_duration, history_tag,
+        resumable_upload_inspection, safe_deploy_stage, same_deploy_host, transfer_progress,
+    };
+    use crate::host_store::Host;
     use crate::project_store::Project;
+    use crate::release::UnknownUploadInspection;
+    use crate::ssh::RemoteArchiveObservation;
     use std::path::Path;
+
+    #[test]
+    fn history_table_uses_base_tag_and_recorded_elapsed_time() {
+        assert_eq!(history_tag("registry.example/app:v1-amd64"), "v1");
+        assert_eq!(history_tag("app:release-arm64"), "release");
+        assert_eq!(
+            history_duration("2026-10-27 10:00:00", Some("2026-10-27 10:01:30")),
+            "1分30秒"
+        );
+        assert_eq!(history_duration("2026-10-27 10:00:00", None), "—");
+        assert_eq!(batch_phase_label("loading"), "镜像加载");
+        assert_eq!(batch_phase_label("checking"), "健康检查");
+        assert_eq!(batch_phase_label("other"), "阶段待核实");
+    }
+
+    #[test]
+    fn resume_action_requires_a_present_safe_length_and_matching_full_digest() {
+        let mut check = UnknownUploadInspection {
+            containers: vec![],
+            archives: vec![RemoteArchiveObservation {
+                service: "web".into(),
+                directory: "/tmp/devingpanel.test".into(),
+                state: "reserved".into(),
+                expected_bytes: 100,
+                actual_bytes: Some(40),
+                digest_matches: None,
+            }],
+        };
+        assert!(resumable_upload_inspection(&check));
+        let empty = UnknownUploadInspection {
+            containers: vec![],
+            archives: vec![],
+        };
+        assert!(resumable_upload_inspection(&empty));
+        check.archives[0].actual_bytes = Some(100);
+        assert!(!resumable_upload_inspection(&check));
+        check.archives[0].digest_matches = Some(true);
+        assert!(resumable_upload_inspection(&check));
+        check.archives[0].actual_bytes = Some(101);
+        assert!(!resumable_upload_inspection(&check));
+        check.archives[0].actual_bytes = None;
+        assert!(resumable_upload_inspection(&check));
+        check.archives[0].state = "uploaded".into();
+        assert!(!resumable_upload_inspection(&check));
+        check.archives[0].actual_bytes = Some(40);
+        assert!(!resumable_upload_inspection(&check));
+    }
+
+    #[test]
+    fn deploy_log_only_shows_coordinator_stage_not_build_output() {
+        assert_eq!(safe_deploy_stage("构建镜像：web"), Some("构建镜像".into()));
+        assert_eq!(
+            safe_deploy_stage("启动全部 Compose 服务"),
+            Some("启动全部 Compose 服务".into())
+        );
+        assert_eq!(safe_deploy_stage("RUN echo secret-token"), None);
+        assert_eq!(
+            safe_deploy_stage("构建镜像：secret-token"),
+            Some("构建镜像".into())
+        );
+    }
+
+    #[test]
+    fn transfer_progress_accepts_only_bounded_coordinator_counts() {
+        assert_eq!(transfer_progress("镜像传输 50/100 字节"), Some((50, 100)));
+        assert_eq!(transfer_progress("镜像传输 0/100 字节"), Some((0, 100)));
+        assert_eq!(transfer_progress("镜像传输 101/100 字节"), None);
+        assert_eq!(transfer_progress("镜像传输 1/0 字节"), None);
+        assert_eq!(transfer_progress("secret 镜像传输 1/2 字节"), None);
+    }
+
+    #[test]
+    fn deploy_confirmation_rejects_changed_host_identity() {
+        let host = Host {
+            id: 1,
+            name: "test".into(),
+            address: "127.0.0.1".into(),
+            port: 22,
+            username: "user".into(),
+            group: "test".into(),
+            auth: "key".into(),
+            trusted_fingerprint: Some("fingerprint".into()),
+        };
+        let mut changed = host.clone();
+        assert!(same_deploy_host(&host, &changed));
+        changed.port = 2222;
+        assert!(!same_deploy_host(&host, &changed));
+        changed = host.clone();
+        changed.trusted_fingerprint = None;
+        assert!(!same_deploy_host(&host, &changed));
+    }
 
     #[test]
     fn narrow_paths_wrap_at_directory_boundaries() {

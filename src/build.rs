@@ -217,7 +217,11 @@ fn inspect_built_image(
     Ok((image_id.to_owned(), has_healthcheck))
 }
 
-fn archive_image_ids(path: &Path, reference: &str, platform: &str) -> Result<Vec<String>, String> {
+pub(crate) fn archive_image_ids(
+    path: &Path,
+    reference: &str,
+    platform: &str,
+) -> Result<Vec<String>, String> {
     let file = File::open(path).map_err(|_| "无法读取镜像归档元数据。")?;
     let mut archive = tar::Archive::new(file);
     let mut index = None;

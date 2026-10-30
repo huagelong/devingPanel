@@ -1,0 +1,42 @@
+services:
+  web:
+    image: ${DEVINGPANEL_IMAGE_WEB}
+    networks: [isolated]
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+  worker:
+    image: ${DEVINGPANEL_IMAGE_WORKER}
+    healthcheck:
+      test: ["CMD-SHELL", "${WORKER_HEALTH_COMMAND}"]
+      interval: 2s
+      timeout: 2s
+      retries: 3
+    networks: [isolated]
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: smoke
+      POSTGRES_USER: smoke
+      POSTGRES_PASSWORD: isolated-test-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smoke -d smoke"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+    networks: [isolated]
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+    networks: [isolated]
+networks:
+  isolated:
+    internal: true
