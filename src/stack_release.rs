@@ -4158,10 +4158,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "one-shot parallel release to two trusted LAN VPS hosts; requires a fresh parallel-lan APPDATA and test password"]
+    #[ignore = "one-shot parallel success, health failure or upload cut on two trusted LAN VPS hosts; requires fresh parallel-lan APPDATA and test password"]
     fn isolated_lan_parallel_wave_confirms_both_hosts() {
         let fail_second =
             std::env::var("DEVINGPANEL_TEST_PARALLEL_FAIL_SECOND").as_deref() == Ok("1");
+        let cut_second =
+            std::env::var("DEVINGPANEL_TEST_PARALLEL_CUT_SECOND").as_deref() == Ok("1");
+        assert!(!(fail_second && cut_second));
+        let proxy = cut_second.then(|| CutOnceSshProxy::new("192.168.63.130:22"));
         let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
             .canonicalize()
             .unwrap();
@@ -4185,21 +4189,30 @@ mod tests {
             .expect("isolated LAN test password is required");
         let fingerprint = "SHA256:+YD+qOVvzV7TP3DUXlFSIXadVdH8aNaUoeYLfEGcKE4";
         let mut host_ids = Vec::new();
-        for (name, address) in [
-            ("vps-smoke", "192.168.63.129"),
-            ("vps-second", "192.168.63.130"),
+        for (name, address, port) in [
+            ("vps-smoke", "192.168.63.129", 22),
+            (
+                "vps-second",
+                if cut_second {
+                    "127.0.0.1"
+                } else {
+                    "192.168.63.130"
+                },
+                proxy.as_ref().map_or(22, |proxy| proxy.port),
+            ),
         ] {
             let host = crate::host_store::create(crate::host_store::NewHost {
                 name: name.into(),
                 address: address.into(),
-                port: "22".into(),
+                port: port.to_string(),
                 username: "root".into(),
                 group: "test".into(),
                 auth: "password".into(),
                 credential: password.clone(),
             })
             .unwrap();
-            crate::host_store::trust_fingerprint(host.id, address, 22, None, fingerprint).unwrap();
+            crate::host_store::trust_fingerprint(host.id, address, port, None, fingerprint)
+                .unwrap();
             host_ids.push(host.id);
         }
         drop(password);
@@ -4308,7 +4321,74 @@ mod tests {
             ids.sort();
             baselines.push(ids);
         }
+        if let Some(proxy) = &proxy {
+            proxy
+                .enabled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let result = super::run_batch_parallel(project.id, &plan, 2, cancel, |_| {});
+        if let Some(proxy) = &proxy {
+            let error = result
+                .err()
+                .expect("second host upload must become unknown");
+            let batch_id = error.batch_id.unwrap();
+            assert!(proxy.cut.load(std::sync::atomic::Ordering::Relaxed));
+            let batch = crate::batch_store::get(&batch_id).unwrap();
+            assert_eq!(batch.state, "unknown");
+            assert_eq!(batch.parallelism, 2);
+            assert_eq!(batch.targets[0].state, "running");
+            assert_eq!(batch.targets[1].state, "unknown");
+            let first =
+                crate::release_store::get_task(batch.targets[0].release_task_id.as_ref().unwrap())
+                    .unwrap();
+            let second =
+                crate::release_store::get_task(batch.targets[1].release_task_id.as_ref().unwrap())
+                    .unwrap();
+            assert_eq!(
+                (
+                    first.phase.as_str(),
+                    first.outcome.as_str(),
+                    first.health_result.as_deref()
+                ),
+                ("checked", "blocked", Some("healthy"))
+            );
+            assert_eq!(
+                (second.phase.as_str(), second.outcome.as_str()),
+                ("uploading", "unknown")
+            );
+            let conn = crate::database::connect().unwrap();
+            let pointers: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM project_current_version WHERE project_id = ?1",
+                    [project.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(pointers, 0);
+            assert!(proxy.offline.load(std::sync::atomic::Ordering::Relaxed));
+            proxy
+                .offline
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            for (index, target) in batch.targets.iter().enumerate() {
+                let mut ids = crate::ssh::inventory(target.host.id)
+                    .unwrap()
+                    .containers
+                    .iter()
+                    .map(|item| item.id.clone())
+                    .collect::<Vec<_>>();
+                ids.sort();
+                assert_eq!(
+                    ids.len(),
+                    baselines[index].len() + if index == 0 { 4 } else { 0 }
+                );
+                assert!(baselines[index].iter().all(|id| ids.contains(id)));
+            }
+            eprintln!(
+                "parallel LAN upload cut retained healthy sibling: project={}, batch={}",
+                project.id, batch_id
+            );
+            return;
+        }
         let batch_id = if fail_second {
             result
                 .err()
