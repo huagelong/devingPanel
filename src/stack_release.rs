@@ -4502,6 +4502,224 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "one-shot amd64 plus QEMU arm64 release; requires fresh mixed-qemu APPDATA, LAN password and ARM64 private key path"]
+    fn isolated_mixed_qemu_parallel_release() {
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        let root = appdata.parent().unwrap();
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("mixed-qemu-")
+        );
+        assert_eq!(
+            root.parent().unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .join("target/isolated-tests")
+                .canonicalize()
+                .unwrap()
+        );
+        assert!(std::fs::read_dir(&appdata).unwrap().next().is_none());
+        let password = std::env::var("DEVINGPANEL_TEST_LAN_PASSWORD").unwrap();
+        let key_path = std::env::var("DEVINGPANEL_TEST_ARM64_KEY_PATH").unwrap();
+        let private_key = std::fs::read_to_string(key_path).unwrap();
+        let hosts = [
+            (
+                "vps-smoke",
+                "192.168.63.129",
+                22,
+                "root",
+                "password",
+                password.as_str(),
+                "SHA256:+YD+qOVvzV7TP3DUXlFSIXadVdH8aNaUoeYLfEGcKE4",
+            ),
+            (
+                "qemu-arm64",
+                "192.168.63.131",
+                2223,
+                "tester",
+                "key",
+                private_key.as_str(),
+                "SHA256:12rUdY5YJc15z7yk6La4DsIhHx57foGiQZo6+i8I/Ns",
+            ),
+        ];
+        let mut host_ids = Vec::new();
+        for (name, address, port, username, auth, credential, fingerprint) in hosts {
+            let host = crate::host_store::create(crate::host_store::NewHost {
+                name: name.into(),
+                address: address.into(),
+                port: port.to_string(),
+                username: username.into(),
+                group: "test".into(),
+                auth: auth.into(),
+                credential: credential.into(),
+            })
+            .unwrap();
+            crate::host_store::trust_fingerprint(host.id, address, port, None, fingerprint)
+                .unwrap();
+            host_ids.push(host.id);
+        }
+        drop(password);
+        drop(private_key);
+
+        let source = std::env::current_dir()
+            .unwrap()
+            .join("tests/fixtures/stack-v2-success");
+        let project_dir = root.join("project");
+        std::fs::create_dir(&project_dir).unwrap();
+        for file in [
+            "compose.yaml",
+            "Dockerfile.web",
+            "Dockerfile.worker",
+            "probe-web.txt",
+            "probe-worker.txt",
+        ] {
+            std::fs::copy(source.join(file), project_dir.join(file)).unwrap();
+        }
+        let yaml = std::fs::read_to_string(source.join("devingpanel.yaml")).unwrap();
+        let yaml = yaml
+            .replace("platform: linux/amd64", "platform: auto")
+            .replace("name: stack-v2-success", &format!("name: stack-v2-mixed-{}", uuid::Uuid::new_v4().simple()))
+            .replace("    - group: test\n      host: vps-smoke", "    - group: test\n      host: vps-smoke\n    - group: test\n      host: qemu-arm64");
+        std::fs::write(project_dir.join("devingpanel.yaml"), yaml).unwrap();
+        let reservation_id = chrono::Utc::now().timestamp_millis();
+        crate::database::connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO projects (id, name, path, dockerfile, image) VALUES (?1, 'mixed-id-reservation', '.', 'Dockerfile', 'reservation')",
+                [reservation_id],
+            )
+            .unwrap();
+        let project = crate::project_store::create_from_manifest(&project_dir).unwrap();
+        assert!(project.id > 1_000_000_000);
+        assert_eq!(project.host_ids, host_ids);
+        let tag = format!("mixed{}", uuid::Uuid::new_v4().simple());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let plan = preflight_batch(project.id, &tag, cancel.clone()).unwrap();
+        assert_eq!(plan.plan.builds.len(), 4);
+        assert_eq!(
+            plan.targets
+                .iter()
+                .map(|target| target.platform.as_str())
+                .collect::<Vec<_>>(),
+            ["linux/amd64", "linux/arm64"]
+        );
+        assert_ne!(
+            plan.targets[0].docker_daemon_id,
+            plan.targets[1].docker_daemon_id
+        );
+        let mut baselines = Vec::new();
+        for target in &plan.targets {
+            let probe = crate::release_store::TaskSnapshot {
+                id: "namespace-probe".into(),
+                project_id: project.id,
+                project_name: project.name.clone(),
+                host: target.host.clone(),
+                docker_endpoint: Some(target.docker_endpoint.clone()),
+                docker_daemon_id: Some(target.docker_daemon_id.clone()),
+                phase: "prepared".into(),
+                outcome: "running".into(),
+                health_result: None,
+                detail: String::new(),
+                started_at: String::new(),
+                execution_finished_at: None,
+                image_reference: plan.plan.builds[0].reference.clone(),
+            };
+            crate::ssh::assert_empty_project_namespace(&probe).unwrap();
+            let inventory = crate::ssh::inventory(target.host.id).unwrap();
+            assert!(
+                ["redis:7-alpine", "postgres:16-alpine"]
+                    .iter()
+                    .all(|image| inventory.images.iter().any(|item| item.reference == *image))
+            );
+            baselines.push(
+                inventory
+                    .containers
+                    .iter()
+                    .map(|item| item.id.clone())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let progress = super::run_batch_parallel(project.id, &plan, 2, cancel, |_| {})
+            .unwrap_or_else(|error| panic!("mixed batch {:?}: {}", error.batch_id, error.message));
+        let batch_id = match progress {
+            super::BatchProgress::AwaitingConfirmation { batch_id, .. } => batch_id,
+            super::BatchProgress::Complete { .. } => panic!("health confirmation was skipped"),
+        };
+        let batch = crate::batch_store::get(&batch_id).unwrap();
+        assert_eq!(batch.images.len(), 4);
+        assert!(batch.images.iter().all(|image| {
+            image.archive_bytes.unwrap() > 0
+                && image
+                    .archive_sha256
+                    .as_ref()
+                    .is_some_and(|hash| hash.len() == 64)
+                && image.image_ids.as_ref().is_some_and(|ids| !ids.is_empty())
+        }));
+        let conn = crate::database::connect().unwrap();
+        let pointers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_current_version WHERE project_id = ?1",
+                [project.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pointers, 0);
+        for (index, target) in batch.targets.iter().enumerate() {
+            let task =
+                crate::release_store::get_task(target.release_task_id.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                (
+                    task.phase.as_str(),
+                    task.outcome.as_str(),
+                    task.health_result.as_deref()
+                ),
+                ("checked", "blocked", Some("healthy"))
+            );
+            let observed = crate::ssh::observe_release_project(&task).unwrap();
+            assert_eq!(observed.containers.len(), 4);
+            assert!(
+                observed
+                    .containers
+                    .iter()
+                    .all(|item| item.status == "running"
+                        && item.health.as_deref() == Some("healthy"))
+            );
+            let inventory = crate::ssh::inventory(target.host.id).unwrap();
+            let after = inventory
+                .containers
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(after.len(), baselines[index].len() + 4);
+            assert!(
+                baselines[index]
+                    .iter()
+                    .all(|id| after.contains(&id.as_str()))
+            );
+            assert_eq!(
+                crate::release::confirm_healthy_and_complete(&task.id).unwrap(),
+                4
+            );
+        }
+        let finished = crate::batch_store::get(&batch_id).unwrap();
+        assert_eq!(finished.state, "complete");
+        assert!(
+            finished
+                .targets
+                .iter()
+                .all(|target| target.state == "healthy")
+        );
+        eprintln!(
+            "QEMU mixed batch complete: project={}, batch={}",
+            project.id, batch_id
+        );
+    }
+
+    #[test]
     #[ignore = "one-shot three-host LAN release; requires fresh parallel-lan APPDATA and test password"]
     fn isolated_lan_parallel_three_host_waves() {
         let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
