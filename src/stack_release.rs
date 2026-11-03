@@ -2064,6 +2064,40 @@ fn retry_failed_batch_parallel(
     })
 }
 
+fn resumable_unknown_target_index(
+    batch: &crate::batch_store::BatchRecord,
+    expected_task_id: &str,
+) -> Result<usize, String> {
+    let index = batch
+        .targets
+        .iter()
+        .position(|target| target.release_task_id.as_deref() == Some(expected_task_id))
+        .ok_or("人工确认的目标任务已变化，禁止续传。")?;
+    if batch.targets[index].state != "unknown" || batch.parallelism == 0 {
+        return Err("批次没有对应的待核实上传目标。".into());
+    }
+    let wave = index / batch.parallelism;
+    for (ordinal, target) in batch.targets.iter().enumerate() {
+        let target_wave = ordinal / batch.parallelism;
+        if (target_wave < wave && !matches!(target.state.as_str(), "healthy" | "skipped"))
+            || (target_wave > wave
+                && (target.state != "waiting" || target.release_task_id.is_some()))
+            || (target_wave == wave
+                && ordinal != index
+                && !matches!(
+                    target.state.as_str(),
+                    "unknown" | "healthy" | "skipped" | "failed"
+                )
+                && !(target.state == "waiting" && target.release_task_id.is_none())
+                && !(target.state == "running"
+                    && target.task_outcome.as_deref() == Some("blocked")))
+        {
+            return Err("批次顺序存在其他未核实目标，不能续传。".into());
+        }
+    }
+    Ok(index)
+}
+
 pub fn resume_unknown_batch_upload(
     batch_id: &str,
     expected_task_id: &str,
@@ -2076,20 +2110,7 @@ pub fn resume_unknown_batch_upload(
         if batch.state != "unknown" {
             return Err("仅结果不明的批次可人工续传。".into());
         }
-        let index = batch
-            .targets
-            .iter()
-            .position(|target| target.state == "unknown")
-            .ok_or("批次没有待核实的上传目标。")?;
-        if batch.targets[..index]
-            .iter()
-            .any(|target| !matches!(target.state.as_str(), "healthy" | "skipped"))
-            || batch.targets[index + 1..]
-                .iter()
-                .any(|target| target.state != "waiting" || target.release_task_id.is_some())
-        {
-            return Err("批次顺序存在其他未核实目标，不能续传。".into());
-        }
+        let index = resumable_unknown_target_index(&batch, expected_task_id)?;
         let target = &confirmed.targets[index];
         let saved = &batch.targets[index];
         let task_id = saved
@@ -2284,13 +2305,16 @@ pub fn resume_unknown_batch_upload(
     })();
     result.map_err(|message| {
         let recovery = crate::batch_store::get(batch_id).ok().and_then(|batch| {
-            if batch.state != "running" {
+            if !matches!(batch.state.as_str(), "running" | "unknown") {
                 return None;
             }
             batch
                 .targets
                 .iter()
-                .find(|target| target.state == "running")
+                .find(|target| {
+                    target.state == "running"
+                        && target.release_task_id.as_deref() == Some(expected_task_id)
+                })
                 .and_then(|target| target.release_task_id.as_deref())
                 .and_then(|id| {
                     release_store::get_task(id)
@@ -2771,7 +2795,7 @@ mod tests {
         preflight_batch, same_batch_hosts, spec_for_batch_build, verify_batch_stack_config,
         verify_resolved_batch_images,
     };
-    use crate::batch_store::BatchTargetRecord;
+    use crate::batch_store::{BatchRecord, BatchTargetRecord};
     use crate::host_store::Host;
     use crate::project_config::{self, BuildSpec};
     use crate::project_store::Project;
@@ -5535,10 +5559,75 @@ mod tests {
             ids.sort();
             assert_eq!(ids, baselines[index]);
         }
-        eprintln!(
-            "parallel LAN crash recovered unknown: project={}, batch={}",
-            project.id, batch.id
-        );
+        if std::env::var("DEVINGPANEL_TEST_PARALLEL_RESUME_AFTER_CRASH").as_deref() == Ok("1") {
+            for ordinal in (0..recovered.targets.len()).rev() {
+                let task_id = recovered.targets[ordinal].release_task_id.as_ref().unwrap();
+                let progress = super::resume_unknown_batch_upload(
+                    &batch.id,
+                    task_id,
+                    Arc::new(AtomicBool::new(false)),
+                    |_| {},
+                )
+                .unwrap_or_else(|error| {
+                    panic!("parallel resume {:?}: {}", error.batch_id, error.message)
+                });
+                assert!(matches!(
+                    progress,
+                    super::BatchProgress::AwaitingConfirmation { task_id: resumed, .. }
+                        if resumed == *task_id
+                ));
+                let current = crate::batch_store::get(&batch.id).unwrap();
+                assert_eq!(
+                    current.state,
+                    if ordinal == 0 { "running" } else { "unknown" }
+                );
+                assert_eq!(current.targets[ordinal].state, "running");
+                assert_eq!(
+                    crate::release::confirm_healthy_and_complete(task_id).unwrap(),
+                    4
+                );
+                let current = crate::batch_store::get(&batch.id).unwrap();
+                assert_eq!(
+                    current.state,
+                    if ordinal == 0 { "complete" } else { "unknown" }
+                );
+            }
+            let complete = crate::batch_store::get(&batch.id).unwrap();
+            assert!(
+                complete
+                    .targets
+                    .iter()
+                    .all(|target| target.state == "healthy")
+            );
+            let pointers: i64 = crate::database::connect()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM project_current_version WHERE project_id = ?1",
+                    [project.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(pointers, 2);
+            for (target, before) in complete.targets.iter().zip(&baselines) {
+                let inventory = crate::ssh::inventory(target.host.id).unwrap();
+                let ids = inventory
+                    .containers
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(ids.len(), before.len() + 4);
+                assert!(before.iter().all(|id| ids.contains(&id.as_str())));
+            }
+            eprintln!(
+                "parallel LAN crash and independent resumes complete: project={}, batch={}",
+                project.id, batch.id
+            );
+        } else {
+            eprintln!(
+                "parallel LAN crash recovered unknown: project={}, batch={}",
+                project.id, batch.id
+            );
+        }
     }
 
     fn audit_completed_lan_batch(batch_id: &str, previous_id: &str) {
@@ -9281,6 +9370,71 @@ mod tests {
             next_batch_target(&rows, |_| panic!("confirmed task need not be read")).unwrap(),
             BatchNext::Waiting(1)
         ));
+    }
+
+    #[test]
+    fn parallel_unknown_upload_targets_can_resume_independently() {
+        let target = |ordinal, state: &str, outcome: Option<&str>| BatchTargetRecord {
+            ordinal,
+            host: Host {
+                id: ordinal as i64 + 1,
+                name: format!("host-{ordinal}"),
+                address: "127.0.0.1".into(),
+                port: 22,
+                username: "root".into(),
+                group: "test".into(),
+                auth: "password".into(),
+                trusted_fingerprint: None,
+            },
+            platform: "linux/amd64".into(),
+            docker_endpoint: "unix:///var/run/docker.sock".into(),
+            docker_daemon_id: format!("DAEMON:{ordinal}"),
+            env_sha256: None,
+            state: state.into(),
+            release_task_id: (state != "waiting").then(|| format!("task-{ordinal}")),
+            task_outcome: outcome.map(str::to_owned),
+            attempt_task_ids: vec![],
+        };
+        let mut batch = BatchRecord {
+            id: "batch".into(),
+            project_id: 1,
+            config_sha256: "digest".into(),
+            parallelism: 2,
+            state: "unknown".into(),
+            created_at: String::new(),
+            images: vec![],
+            targets: vec![
+                target(0, "unknown", Some("unknown")),
+                target(1, "unknown", Some("unknown")),
+                target(2, "waiting", None),
+            ],
+        };
+        assert_eq!(
+            super::resumable_unknown_target_index(&batch, "task-0"),
+            Ok(0)
+        );
+        assert_eq!(
+            super::resumable_unknown_target_index(&batch, "task-1"),
+            Ok(1)
+        );
+        assert!(super::resumable_unknown_target_index(&batch, "other").is_err());
+        batch.targets[0] = target(0, "running", Some("blocked"));
+        assert_eq!(
+            super::resumable_unknown_target_index(&batch, "task-1"),
+            Ok(1)
+        );
+        batch.targets[0] = target(0, "running", Some("running"));
+        assert!(super::resumable_unknown_target_index(&batch, "task-1").is_err());
+        batch.targets[0] = target(0, "healthy", Some("complete"));
+        batch.targets[2] = target(2, "unknown", Some("unknown"));
+        assert!(super::resumable_unknown_target_index(&batch, "task-1").is_err());
+        batch.targets[1] = target(1, "skipped", Some("failed"));
+        assert_eq!(
+            super::resumable_unknown_target_index(&batch, "task-2"),
+            Ok(2)
+        );
+        batch.targets[1] = target(1, "unknown", Some("unknown"));
+        assert!(super::resumable_unknown_target_index(&batch, "task-2").is_err());
     }
 
     #[test]

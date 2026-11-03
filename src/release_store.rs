@@ -2048,21 +2048,29 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
         initialize(&conn).unwrap();
         seed(&conn);
-        conn.execute_batch("INSERT INTO release_batches (id, project_id, config_sha256, state)
-            VALUES ('batch-resume', 1, 'digest', 'unknown');
+        conn.execute_batch("INSERT INTO hosts (id, name, address, port, username, auth, group_name, credential_id, trusted_fingerprint)
+            VALUES (3, 'worker', '203.0.113.11', 22, 'deploy', 'password', 'prod', 'credential-ref-2', 'SHA256:verified');
+            INSERT INTO release_batches (id, project_id, config_sha256, parallelism, state)
+            VALUES ('batch-resume', 1, 'digest', 2, 'unknown');
             INSERT INTO release_tasks (id, project_id, host_id, project_name, host_name,
                 host_address, host_port, host_username, host_auth, host_fingerprint,
                 docker_endpoint, docker_daemon_id, image_reference, platform, config_sha256,
                 phase, outcome)
             VALUES ('task-resume', 1, 2, 'test', 'web', '203.0.113.10', 22,
                 'deploy', 'password', 'SHA256:verified', 'unix:///var/run/docker.sock',
-                'ABC:123', 'test:v1-amd64', 'linux/amd64', 'digest', 'uploading', 'unknown');
+                'ABC:123', 'test:v1-amd64', 'linux/amd64', 'digest', 'uploading', 'unknown'),
+                ('task-sibling', 1, 3, 'test', 'worker', '203.0.113.11', 22,
+                'deploy', 'password', 'SHA256:verified', 'unix:///var/run/docker.sock',
+                'ABC:456', 'test:v1-amd64', 'linux/amd64', 'digest', 'uploading', 'unknown');
             INSERT INTO release_batch_targets (batch_id, ordinal, host_id, host_name,
                 host_group, host_address, host_port, host_username, host_auth, host_fingerprint,
                 platform, docker_endpoint, docker_daemon_id, state, release_task_id)
             VALUES ('batch-resume', 0, 2, 'web', 'prod', '203.0.113.10', 22,
                 'deploy', 'password', 'SHA256:verified', 'linux/amd64',
-                'unix:///var/run/docker.sock', 'ABC:123', 'unknown', 'task-resume');
+                'unix:///var/run/docker.sock', 'ABC:123', 'unknown', 'task-resume'),
+                ('batch-resume', 1, 3, 'worker', 'prod', '203.0.113.11', 22,
+                'deploy', 'password', 'SHA256:verified', 'linux/amd64',
+                'unix:///var/run/docker.sock', 'ABC:456', 'unknown', 'task-sibling');
             INSERT INTO release_task_images (task_id, ordinal, service, reference, platform,
                 archive_bytes, archive_sha256) VALUES
                 ('task-resume', 0, 'web', 'test:v1-amd64', 'linux/amd64', 123,
@@ -2105,9 +2113,19 @@ mod tests {
                 "uploaded".into(),
                 "running".into(),
                 "running".into(),
-                "running".into()
+                "unknown".into()
             )
         );
+        let sibling: (String, String) = conn
+            .query_row(
+                "SELECT t.outcome, bt.state FROM release_tasks t
+                 JOIN release_batch_targets bt ON bt.release_task_id = t.id
+                 WHERE t.id = 'task-sibling'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(sibling, ("unknown".into(), "unknown".into()));
         assert!(finish_unknown_upload_in(&conn, "task-resume").is_err());
     }
 
