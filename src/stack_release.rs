@@ -212,7 +212,11 @@ pub fn plan_batch(
 #[allow(dead_code)] // Requires a new human confirmation after restart; never resumes automatically.
 pub fn reconfirm_batch(batch_id: &str, cancel: Arc<AtomicBool>) -> Result<BatchPreflight, String> {
     let batch = crate::batch_store::get(batch_id)?;
-    if !matches!(batch.state.as_str(), "ready" | "running" | "unknown") || batch.targets.len() < 2 {
+    if !matches!(
+        batch.state.as_str(),
+        "ready" | "running" | "paused" | "unknown"
+    ) || batch.targets.len() < 2
+    {
         return Err("批次不处于可重新确认的状态。".into());
     }
     let project = project_store::effective(batch.project_id)?;
@@ -684,7 +688,7 @@ fn build_shared_images_local(
 #[allow(dead_code)] // The guard stays held when the coordinator proceeds to transfer.
 pub struct PreparedBatchHost {
     pub task_id: String,
-    _guard: release_materials::ReleaseGuard,
+    _guard: Arc<release_materials::ReleaseGuard>,
 }
 
 #[allow(dead_code)] // Local-only preparation; no SSH upload or Compose start occurs here.
@@ -693,7 +697,7 @@ pub fn prepare_batch_host(
     batch_id: &str,
     preflight: &BatchPreflight,
     host_index: usize,
-    guard: release_materials::ReleaseGuard,
+    guard: Arc<release_materials::ReleaseGuard>,
     cancel: Arc<AtomicBool>,
 ) -> Result<PreparedBatchHost, String> {
     revalidate_batch_inputs(
@@ -732,6 +736,19 @@ pub fn prepare_batch_host(
         || planned.host_id != identity.host_id
     {
         return Err("批次目标或身份快照已变化。".into());
+    }
+    if let Some(previous_id) = snapshot.targets[host_index].attempt_task_ids.last() {
+        let previous = release_store::get_task(previous_id)?;
+        if previous.outcome != "failed"
+            || previous.project_id != project_id
+            || previous.host.id != identity.host.id
+            || previous.docker_daemon_id.as_deref() != Some(identity.docker_daemon_id.as_str())
+            || !ssh::observe_release_project(&previous)?
+                .containers
+                .is_empty()
+        {
+            return Err("重试前未能确认失败任务已关闭且远端项目无容器。".into());
+        }
     }
     let materials = release_materials::prepare(&preflight.compose_files, env_file)?;
     let project = project_store::effective(project_id)?;
@@ -824,7 +841,7 @@ pub fn upload_batch_host_archives(
         row.release_task_id.as_deref() != Some(&prepared.task_id)
             || row.state != "running"
             || row.host != target.host
-    }) || !matches!(batch.state.as_str(), "running")
+    }) || !matches!(batch.state.as_str(), "running" | "paused" | "unknown")
         || task.phase != "built"
         || task.outcome != "running"
         || task.host.id != target.host.id
@@ -923,7 +940,7 @@ pub fn load_batch_host_archives(
     let batch = crate::batch_store::get(batch_id)?;
     if task.phase != "uploaded"
         || task.outcome != "running"
-        || batch.state != "running"
+        || !matches!(batch.state.as_str(), "running" | "paused" | "unknown")
         || task.host.id != target.host_id
         || task.docker_daemon_id.as_deref() != Some(target.docker_daemon_id.as_str())
         || batch.targets.get(host_index).is_none_or(|host| {
@@ -1059,7 +1076,7 @@ pub fn stage_batch_host_stack(
     let batch = crate::batch_store::get(batch_id)?;
     if task.phase != "awaiting_deployment"
         || task.outcome != "running"
-        || batch.state != "running"
+        || !matches!(batch.state.as_str(), "running" | "paused" | "unknown")
         || task.host.id != target.host_id
         || task.docker_daemon_id.as_deref() != Some(target.docker_daemon_id.as_str())
         || batch.targets.get(host_index).is_none_or(|host| {
@@ -1197,7 +1214,7 @@ pub fn deploy_batch_host_stack(
     let task = release_store::get_task(&prepared.task_id)?;
     if task.phase != "validated"
         || task.outcome != "running"
-        || batch.state != "running"
+        || !matches!(batch.state.as_str(), "running" | "paused" | "unknown")
         || staged.task_id != prepared.task_id
         || staged.batch_id != batch_id
         || staged.host_id != target.host_id
@@ -1392,6 +1409,290 @@ pub fn run_batch_sequential(
     continue_batch_sequential(&batch_id, None, confirmed, cancel, on_event)
 }
 
+pub fn run_batch_parallel(
+    project_id: i64,
+    confirmed: &BatchPreflight,
+    parallelism: usize,
+    cancel: Arc<AtomicBool>,
+    mut on_event: impl FnMut(&str),
+) -> Result<BatchProgress, BatchRunError> {
+    revalidate_batch(project_id, confirmed, cancel.clone()).map_err(|message| BatchRunError {
+        batch_id: None,
+        message,
+    })?;
+    let batch_id = crate::batch_store::create_with_parallel(project_id, confirmed, parallelism)
+        .map_err(|message| BatchRunError {
+            batch_id: None,
+            message,
+        })?;
+    crate::batch_store::begin_build(&batch_id).map_err(|message| BatchRunError {
+        batch_id: Some(batch_id.clone()),
+        message,
+    })?;
+    if let Err(message) = build_shared_images(
+        project_id,
+        &batch_id,
+        confirmed,
+        cancel.clone(),
+        &mut on_event,
+    ) {
+        let detail = match crate::batch_store::terminate_unstarted(&batch_id) {
+            Ok(()) => message,
+            Err(reason) => format!("{message}；批次终止待核实：{reason}"),
+        };
+        return Err(BatchRunError {
+            batch_id: Some(batch_id),
+            message: detail,
+        });
+    }
+    continue_batch_parallel(&batch_id, None, confirmed, cancel, on_event)
+}
+
+pub fn continue_batch_parallel(
+    batch_id: &str,
+    expected_host_id: Option<i64>,
+    confirmed: &BatchPreflight,
+    cancel: Arc<AtomicBool>,
+    mut on_event: impl FnMut(&str),
+) -> Result<BatchProgress, BatchRunError> {
+    let result = (|| -> Result<BatchProgress, String> {
+        let batch = crate::batch_store::get(batch_id)?;
+        if batch.parallelism <= 1
+            || batch.parallelism > batch.targets.len()
+            || batch.config_sha256 != confirmed.config_sha256
+            || batch.targets.len() != confirmed.targets.len()
+            || batch.targets.len() != confirmed.env_files.len()
+            || batch.images.len() != confirmed.plan.builds.len()
+            || batch
+                .targets
+                .iter()
+                .zip(&confirmed.targets)
+                .zip(&confirmed.env_files)
+                .any(|((saved, target), env)| {
+                    saved.host != target.host
+                        || saved.platform != target.platform
+                        || saved.docker_endpoint != target.docker_endpoint
+                        || saved.docker_daemon_id != target.docker_daemon_id
+                        || saved.env_sha256.as_deref() != Some(env_digest(env).as_str())
+                })
+            || confirmed.plan.builds.iter().any(|expected| {
+                !batch.images.iter().any(|saved| {
+                    saved.service == expected.service
+                        && saved.platform == expected.platform
+                        && saved.reference == expected.reference
+                })
+            })
+        {
+            return Err("批次并行度或目标/镜像快照已变化。".into());
+        }
+        if batch.state == "complete" {
+            return Ok(BatchProgress::Complete {
+                batch_id: batch_id.into(),
+            });
+        }
+        if !matches!(batch.state.as_str(), "ready" | "running") {
+            return Err("批次已暂停或待核实，不会自动继续。".into());
+        }
+        let index = batch
+            .targets
+            .iter()
+            .position(|target| target.state == "waiting");
+        let Some(index) = index else {
+            if let Some(task_id) = batch
+                .targets
+                .iter()
+                .filter_map(|target| target.release_task_id.as_deref())
+                .find(|id| {
+                    release_store::get_task(id).is_ok_and(|task| {
+                        task.phase == "checked"
+                            && task.outcome == "blocked"
+                            && task.health_result.as_deref() == Some("healthy")
+                    })
+                })
+            {
+                return Ok(BatchProgress::AwaitingConfirmation {
+                    batch_id: batch_id.into(),
+                    task_id: task_id.into(),
+                });
+            }
+            return Err("批次没有可开始的等待目标；请核对已开始任务。".into());
+        };
+        let wave_start = index / batch.parallelism * batch.parallelism;
+        let wave_end = (wave_start + batch.parallelism).min(batch.targets.len());
+        if batch.targets[index..wave_end]
+            .iter()
+            .any(|target| target.state != "waiting" || target.release_task_id.is_some())
+        {
+            return Err("当前波次仍有已开始目标，禁止启动新目标。".into());
+        }
+        if expected_host_id.is_some_and(|id| batch.targets[index].host.id != id) {
+            return Err("人工确认的下一波主机已变化。".into());
+        }
+        for prior in &batch.targets[..index] {
+            let task_id = prior
+                .release_task_id
+                .as_deref()
+                .ok_or("上一波目标缺少任务记录。")?;
+            let task = release_store::get_task(task_id)?;
+            let resolved = match prior.state.as_str() {
+                "healthy" => {
+                    task.phase == "checked"
+                        && task.outcome == "complete"
+                        && task.health_result.as_deref() == Some("healthy")
+                }
+                "skipped" => task.outcome == "failed",
+                "running"
+                    if task.phase == "checked"
+                        && task.outcome == "blocked"
+                        && task.health_result.as_deref() == Some("healthy") =>
+                {
+                    return Ok(BatchProgress::AwaitingConfirmation {
+                        batch_id: batch_id.into(),
+                        task_id: task_id.into(),
+                    });
+                }
+                _ => false,
+            };
+            if !resolved
+                || task.project_id != batch.project_id
+                || task.host.id != prior.host.id
+                || task.docker_daemon_id.as_deref() != Some(prior.docker_daemon_id.as_str())
+            {
+                return Err("上一波目标尚未全部健康并确认，禁止继续。".into());
+            }
+        }
+        let guard = Arc::new(release_materials::acquire_guard(batch.project_id)?);
+        let current = crate::batch_store::get(batch_id)?;
+        if current.state != batch.state
+            || current.parallelism != batch.parallelism
+            || current
+                .targets
+                .iter()
+                .zip(&batch.targets)
+                .any(|(now, before)| {
+                    now.state != before.state || now.release_task_id != before.release_task_id
+                })
+        {
+            return Err("批次状态在取得项目锁期间已变化。".into());
+        }
+        let mut prepared = Vec::new();
+        for host_index in index..wave_end {
+            match prepare_batch_host(
+                batch.project_id,
+                batch_id,
+                confirmed,
+                host_index,
+                guard.clone(),
+                cancel.clone(),
+            ) {
+                Ok(host) => prepared.push((host_index, host)),
+                Err(error) => {
+                    for (_, host) in &prepared {
+                        let _ = release_store::settle(
+                            &host.task_id,
+                            Phase::Built,
+                            Outcome::Failed,
+                            "同波次本地准备未完成，未开始远端传输",
+                        );
+                    }
+                    let _ = crate::batch_store::pause_waiting(batch_id, host_index);
+                    return Err(error);
+                }
+            }
+        }
+        let (events, receiver) = std::sync::mpsc::channel::<String>();
+        let results = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (host_index, host) in prepared {
+                let events = events.clone();
+                let cancel = cancel.clone();
+                handles.push(scope.spawn(move || {
+                    let mut report = |event: &str| {
+                        let _ = events.send(event.to_owned());
+                    };
+                    let result = (|| {
+                        upload_batch_host_archives(
+                            &host,
+                            batch_id,
+                            confirmed,
+                            host_index,
+                            cancel.clone(),
+                            &mut report,
+                        )?;
+                        load_batch_host_archives(
+                            &host,
+                            batch_id,
+                            confirmed,
+                            host_index,
+                            cancel.clone(),
+                            &mut report,
+                        )?;
+                        let staged = stage_batch_host_stack(
+                            &host,
+                            batch_id,
+                            confirmed,
+                            host_index,
+                            cancel.clone(),
+                            &mut report,
+                        )?;
+                        deploy_batch_host_stack(
+                            &host,
+                            batch_id,
+                            confirmed,
+                            host_index,
+                            &staged,
+                            cancel,
+                            &mut report,
+                        )
+                    })();
+                    (host_index, result)
+                }));
+            }
+            drop(events);
+            for event in receiver {
+                on_event(&event);
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join())
+                .collect::<Vec<_>>()
+        });
+        let mut awaiting = None;
+        let mut failures = Vec::new();
+        for result in results {
+            let (index, result) = result.map_err(|_| "批次工作线程意外退出；请重启后核实任务。")?;
+            match result {
+                Ok(task_id) => {
+                    let task = release_store::get_task(&task_id)?;
+                    if task.phase == "checked"
+                        && task.outcome == "blocked"
+                        && task.health_result.as_deref() == Some("healthy")
+                    {
+                        awaiting.get_or_insert(task_id);
+                    } else {
+                        failures.push(format!("{}: 结果待核实", batch.targets[index].host.name));
+                    }
+                }
+                Err(error) => failures.push(format!("{}: {error}", batch.targets[index].host.name)),
+            }
+        }
+        if !failures.is_empty() {
+            return Err(format!(
+                "当前波次已启动目标均已停止执行；{}",
+                failures.join("；")
+            ));
+        }
+        Ok(BatchProgress::AwaitingConfirmation {
+            batch_id: batch_id.into(),
+            task_id: awaiting.ok_or("当前波次没有可确认的健康目标。")?,
+        })
+    })();
+    result.map_err(|message| BatchRunError {
+        batch_id: Some(batch_id.into()),
+        message,
+    })
+}
+
 #[allow(dead_code)] // Must be called only after human confirmation moves prior task to complete.
 pub fn continue_batch_sequential(
     batch_id: &str,
@@ -1456,7 +1757,7 @@ pub fn continue_batch_sequential(
         if expected_host_id.is_some_and(|id| batch.targets[index].host.id != id) {
             return Err("人工确认的下一台主机已变化。".into());
         }
-        let guard = release_materials::acquire_guard(batch.project_id)?;
+        let guard = Arc::new(release_materials::acquire_guard(batch.project_id)?);
         let current = crate::batch_store::get(batch_id)?;
         if current.state != batch.state
             || current.targets.len() != batch.targets.len()
@@ -1555,6 +1856,202 @@ pub fn continue_batch_sequential(
             || task.health_result.as_deref() != Some("healthy")
         {
             return Err("批次目标未确认全部健康；已暂停后续目标。".into());
+        }
+        Ok(BatchProgress::AwaitingConfirmation {
+            batch_id: batch_id.into(),
+            task_id,
+        })
+    })();
+    result.map_err(|message| BatchRunError {
+        batch_id: Some(batch_id.into()),
+        message,
+    })
+}
+
+pub fn retry_failed_batch_sequential(
+    batch_id: &str,
+    expected_host_id: i64,
+    expected_task_id: &str,
+    cancel: Arc<AtomicBool>,
+    on_event: impl FnMut(&str),
+) -> Result<BatchProgress, BatchRunError> {
+    let parallelism = crate::batch_store::get(batch_id)
+        .map_err(|message| BatchRunError {
+            batch_id: Some(batch_id.into()),
+            message,
+        })?
+        .parallelism;
+    if parallelism > 1 {
+        return retry_failed_batch_parallel(
+            batch_id,
+            expected_host_id,
+            expected_task_id,
+            cancel,
+            on_event,
+        );
+    }
+    let prepared = (|| -> Result<BatchPreflight, String> {
+        let batch = crate::batch_store::get(batch_id)?;
+        let index = batch
+            .targets
+            .iter()
+            .position(|target| target.host.id == expected_host_id)
+            .ok_or("失败目标已不在批次中。")?;
+        let target = &batch.targets[index];
+        if batch.state != "paused"
+            || target.state != "failed"
+            || target.release_task_id.as_deref() != Some(expected_task_id)
+            || batch.targets[..index]
+                .iter()
+                .any(|prior| !matches!(prior.state.as_str(), "healthy" | "skipped"))
+            || batch.targets[index + 1..]
+                .iter()
+                .any(|later| later.state != "waiting" || later.release_task_id.is_some())
+        {
+            return Err("批次失败目标或执行顺序已变化。".into());
+        }
+        let confirmed = reconfirm_batch(batch_id, cancel.clone())?;
+        let _guard = release_materials::acquire_guard(batch.project_id)?;
+        revalidate_batch_inputs(
+            batch.project_id,
+            &confirmed,
+            cancel.clone(),
+            false,
+            Some(index),
+        )?;
+        let task = release_store::get_task(expected_task_id)?;
+        if task.outcome != "failed"
+            || task.project_id != batch.project_id
+            || task.host.id != target.host.id
+            || task.docker_daemon_id.as_deref() != Some(target.docker_daemon_id.as_str())
+            || !ssh::observe_release_project(&task)?.containers.is_empty()
+        {
+            return Err("失败任务尚未关闭，或远端项目仍有容器。".into());
+        }
+        crate::batch_store::retry_failed(batch_id, expected_host_id, expected_task_id)?;
+        Ok(confirmed)
+    })()
+    .map_err(|message| BatchRunError {
+        batch_id: Some(batch_id.into()),
+        message,
+    })?;
+    continue_batch_sequential(
+        batch_id,
+        Some(expected_host_id),
+        &prepared,
+        cancel,
+        on_event,
+    )
+}
+
+fn retry_failed_batch_parallel(
+    batch_id: &str,
+    expected_host_id: i64,
+    expected_task_id: &str,
+    cancel: Arc<AtomicBool>,
+    mut on_event: impl FnMut(&str),
+) -> Result<BatchProgress, BatchRunError> {
+    let result = (|| -> Result<BatchProgress, String> {
+        let batch = crate::batch_store::get(batch_id)?;
+        let index = batch
+            .targets
+            .iter()
+            .position(|target| target.host.id == expected_host_id)
+            .ok_or("失败目标已不在批次中。")?;
+        let wave_start = index / batch.parallelism * batch.parallelism;
+        let wave_end = (wave_start + batch.parallelism).min(batch.targets.len());
+        let target = &batch.targets[index];
+        if batch.state != "paused"
+            || target.state != "failed"
+            || target.release_task_id.as_deref() != Some(expected_task_id)
+            || batch.targets[..wave_start]
+                .iter()
+                .any(|prior| !matches!(prior.state.as_str(), "healthy" | "skipped"))
+            || batch.targets[wave_start..wave_end]
+                .iter()
+                .enumerate()
+                .any(|(offset, other)| {
+                    offset + wave_start != index
+                        && matches!(other.state.as_str(), "running" | "unknown")
+                })
+            || batch.targets[wave_end..]
+                .iter()
+                .any(|later| later.state != "waiting" || later.release_task_id.is_some())
+        {
+            return Err("批次失败目标或波次状态已变化。".into());
+        }
+        let confirmed = reconfirm_batch(batch_id, cancel.clone())?;
+        let guard = Arc::new(release_materials::acquire_guard(batch.project_id)?);
+        revalidate_batch_inputs(
+            batch.project_id,
+            &confirmed,
+            cancel.clone(),
+            false,
+            Some(index),
+        )?;
+        let task = release_store::get_task(expected_task_id)?;
+        if task.outcome != "failed"
+            || task.project_id != batch.project_id
+            || task.host.id != target.host.id
+            || task.docker_daemon_id.as_deref() != Some(target.docker_daemon_id.as_str())
+            || !ssh::observe_release_project(&task)?.containers.is_empty()
+        {
+            return Err("失败任务尚未关闭，或远端项目仍有容器。".into());
+        }
+        crate::batch_store::retry_failed(batch_id, expected_host_id, expected_task_id)?;
+        let prepared = match prepare_batch_host(
+            batch.project_id,
+            batch_id,
+            &confirmed,
+            index,
+            guard,
+            cancel.clone(),
+        ) {
+            Ok(host) => host,
+            Err(error) => {
+                let _ = crate::batch_store::pause_waiting(batch_id, index);
+                return Err(error);
+            }
+        };
+        upload_batch_host_archives(
+            &prepared,
+            batch_id,
+            &confirmed,
+            index,
+            cancel.clone(),
+            &mut on_event,
+        )?;
+        load_batch_host_archives(
+            &prepared,
+            batch_id,
+            &confirmed,
+            index,
+            cancel.clone(),
+            &mut on_event,
+        )?;
+        let staged = stage_batch_host_stack(
+            &prepared,
+            batch_id,
+            &confirmed,
+            index,
+            cancel.clone(),
+            &mut on_event,
+        )?;
+        let task_id = deploy_batch_host_stack(
+            &prepared,
+            batch_id,
+            &confirmed,
+            index,
+            &staged,
+            cancel,
+            &mut on_event,
+        )?;
+        let task = release_store::get_task(&task_id)?;
+        if task.phase != "checked"
+            || task.outcome != "blocked"
+            || task.health_result.as_deref() != Some("healthy")
+        {
+            return Err("重试目标未确认全部健康；批次已暂停。".into());
         }
         Ok(BatchProgress::AwaitingConfirmation {
             batch_id: batch_id.into(),
@@ -1745,7 +2242,7 @@ pub fn resume_unknown_batch_upload(
         release_store::finish_unknown_upload(task_id)?;
         let prepared = PreparedBatchHost {
             task_id: task_id.into(),
-            _guard: guard,
+            _guard: Arc::new(guard),
         };
         let services = load_batch_host_archives(
             &prepared,
@@ -2281,6 +2778,113 @@ mod tests {
     use crate::release::PlannedImage;
     use std::sync::{Arc, atomic::AtomicBool};
 
+    struct CutOnceSshProxy {
+        port: u16,
+        enabled: Arc<AtomicBool>,
+        cut: Arc<AtomicBool>,
+        offline: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl CutOnceSshProxy {
+        fn new(target: &'static str) -> Self {
+            use std::io::{Read, Write};
+            use std::net::{Shutdown, TcpListener, TcpStream};
+            use std::sync::atomic::Ordering;
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let enabled = Arc::new(AtomicBool::new(false));
+            let cut = Arc::new(AtomicBool::new(false));
+            let offline = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let running = stop.clone();
+            let fault = enabled.clone();
+            let fired = cut.clone();
+            let unavailable = offline.clone();
+            let worker = std::thread::spawn(move || {
+                while !running.load(Ordering::Relaxed) {
+                    let (client, _) = match listener.accept() {
+                        Ok(pair) => pair,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    if client.set_nonblocking(false).is_err() {
+                        continue;
+                    }
+                    if unavailable.load(Ordering::Relaxed) {
+                        let _ = client.shutdown(Shutdown::Both);
+                        continue;
+                    }
+                    let fault = fault.clone();
+                    let fired = fired.clone();
+                    let unavailable = unavailable.clone();
+                    std::thread::spawn(move || {
+                        let Ok(server) = TcpStream::connect(target) else {
+                            return;
+                        };
+                        let mut from_client = client.try_clone().unwrap();
+                        let mut to_server = server.try_clone().unwrap();
+                        let mut from_server = server.try_clone().unwrap();
+                        let mut to_client = client.try_clone().unwrap();
+                        let downstream = std::thread::spawn(move || {
+                            let _ = std::io::copy(&mut from_server, &mut to_client);
+                        });
+                        let mut buffer = [0u8; 8192];
+                        let mut sent = 0usize;
+                        loop {
+                            match from_client.read(&mut buffer) {
+                                Ok(0) => break,
+                                Ok(size) => {
+                                    if to_server.write_all(&buffer[..size]).is_err() {
+                                        break;
+                                    }
+                                    sent += size;
+                                    if sent >= 256 * 1024
+                                        && fault.load(Ordering::Relaxed)
+                                        && !fired.swap(true, Ordering::Relaxed)
+                                    {
+                                        unavailable.store(true, Ordering::Relaxed);
+                                        let _ = client.shutdown(Shutdown::Both);
+                                        let _ = server.shutdown(Shutdown::Both);
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        let _ = client.shutdown(Shutdown::Both);
+                        let _ = server.shutdown(Shutdown::Both);
+                        let _ = downstream.join();
+                    });
+                }
+            });
+            Self {
+                port,
+                enabled,
+                cut,
+                offline,
+                stop,
+                worker: Some(worker),
+            }
+        }
+    }
+
+    impl Drop for CutOnceSshProxy {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
     #[test]
     #[ignore = "requires a fresh isolated APPDATA under target/isolated-tests and local Compose CLI"]
     fn isolated_batch_preflight_missing_environment_has_no_release_intent() {
@@ -2532,6 +3136,262 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 0, "{table} acquired a remote intent");
         }
+    }
+
+    #[test]
+    #[ignore = "one-shot full coordinator build failure against two trusted LAN VPS hosts; requires an isolated copied APPDATA"]
+    fn isolated_lan_batch_build_failure_stops_before_transfer() {
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        let root = appdata.parent().unwrap();
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("batch-vps-build-failure-")
+        );
+        assert_eq!(
+            root.parent().unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .join("target/isolated-tests")
+                .canonicalize()
+                .unwrap()
+        );
+        let project_dir = root.join("project");
+        std::fs::create_dir(&project_dir).unwrap();
+        let source = std::env::current_dir()
+            .unwrap()
+            .join("tests/fixtures/stack-v2-success");
+        for file in [
+            "compose.yaml",
+            "Dockerfile.web",
+            "probe-web.txt",
+            "probe-worker.txt",
+        ] {
+            std::fs::copy(source.join(file), project_dir.join(file)).unwrap();
+        }
+        std::fs::write(
+            project_dir.join("Dockerfile.worker"),
+            "FROM scratch\nUNKNOWN_INSTRUCTION fail\n",
+        )
+        .unwrap();
+        let yaml = std::fs::read_to_string(source.join("devingpanel.yaml")).unwrap();
+        std::fs::write(
+            project_dir.join("devingpanel.yaml"),
+            yaml.replace(
+                "name: stack-v2-success",
+                &format!("name: stack-v2-build-fail-{}", uuid::Uuid::new_v4().simple()),
+            )
+            .replace(
+                "    - group: test\n      host: vps-smoke",
+                "    - group: test\n      host: vps-smoke\n    - group: test\n      host: vps-second",
+            ),
+        )
+        .unwrap();
+        let project = crate::project_store::create_from_manifest(&project_dir).unwrap();
+        assert_eq!(project.host_ids, [1, 2]);
+        let hosts = crate::host_store::list().unwrap().0;
+        let remote = || {
+            project
+                .host_ids
+                .iter()
+                .map(|id| {
+                    let inventory = crate::ssh::inventory(*id).unwrap();
+                    let mut containers = inventory
+                        .containers
+                        .iter()
+                        .map(|item| item.id.clone())
+                        .collect::<Vec<_>>();
+                    let mut images = inventory
+                        .images
+                        .iter()
+                        .map(|item| item.reference.clone())
+                        .collect::<Vec<_>>();
+                    containers.sort();
+                    images.sort();
+                    (containers, images)
+                })
+                .collect::<Vec<_>>()
+        };
+        for (id, address, daemon) in [
+            (1, "192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
+            (2, "192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
+        ] {
+            let host = hosts.iter().find(|host| host.id == id).unwrap();
+            assert_eq!(host.address, address);
+            assert_eq!(
+                crate::ssh::docker_identity_for_host(host.clone())
+                    .unwrap()
+                    .1,
+                daemon
+            );
+        }
+        let before_remote = remote();
+        let conn = crate::database::connect().unwrap();
+        let count = |table: &str| {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+        let before_db = [count("release_tasks"), count("release_uploaded_archives")];
+        let tag = format!("lanbuildfail{}", uuid::Uuid::new_v4().simple());
+        let preflight =
+            preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(preflight.targets.len(), 2);
+        assert_ne!(
+            preflight.targets[0].docker_daemon_id,
+            preflight.targets[1].docker_daemon_id
+        );
+        let error = super::run_batch_sequential(
+            project.id,
+            &preflight,
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .err()
+        .expect("invalid worker Dockerfile must stop the batch");
+        assert!(
+            error.message.contains("本地 Docker 构建失败"),
+            "{}",
+            error.message
+        );
+        let batch_id = error
+            .batch_id
+            .expect("batch intent must exist before build");
+        let batch = crate::batch_store::get(&batch_id).unwrap();
+        assert_eq!(batch.state, "terminated");
+        assert!(
+            batch
+                .targets
+                .iter()
+                .all(|target| { target.state == "waiting" && target.release_task_id.is_none() })
+        );
+        assert_eq!(
+            [count("release_tasks"), count("release_uploaded_archives")],
+            before_db
+        );
+        assert!(
+            !appdata
+                .join("devingPanel")
+                .join("batch-archives")
+                .join(&batch_id)
+                .exists()
+        );
+        assert_eq!(remote(), before_remote);
+        for build in &preflight.plan.builds {
+            let status = std::process::Command::new("docker")
+                .args(["image", "inspect", &build.reference])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            if build.service == "web" {
+                assert!(status.success());
+                assert!(
+                    std::process::Command::new("docker")
+                        .args(["image", "rm", &build.reference])
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            } else {
+                assert!(!status.success());
+            }
+        }
+
+        let health_dir = root.join("health-project");
+        std::fs::create_dir(&health_dir).unwrap();
+        for file in [
+            "compose.yaml",
+            "Dockerfile.web",
+            "probe-web.txt",
+            "probe-worker.txt",
+        ] {
+            std::fs::copy(source.join(file), health_dir.join(file)).unwrap();
+        }
+        let worker = std::fs::read_to_string(source.join("Dockerfile.worker")).unwrap();
+        std::fs::write(
+            health_dir.join("Dockerfile.worker"),
+            worker
+                .lines()
+                .filter(|line| !line.starts_with("HEALTHCHECK "))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        std::fs::write(
+            health_dir.join("devingpanel.yaml"),
+            yaml.replace(
+                "name: stack-v2-success",
+                &format!("name: stack-v2-health-fail-{}", uuid::Uuid::new_v4().simple()),
+            )
+            .replace(
+                "    - group: test\n      host: vps-smoke",
+                "    - group: test\n      host: vps-smoke\n    - group: test\n      host: vps-second",
+            ),
+        )
+        .unwrap();
+        let health_project = crate::project_store::create_from_manifest(&health_dir).unwrap();
+        assert_eq!(health_project.host_ids, [1, 2]);
+        let health_tag = format!("lanhealthfail{}", uuid::Uuid::new_v4().simple());
+        let health_preflight = preflight_batch(
+            health_project.id,
+            &health_tag,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let health_error = super::run_batch_sequential(
+            health_project.id,
+            &health_preflight,
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .err()
+        .expect("missing worker healthcheck must stop the batch");
+        assert!(
+            health_error.message.contains("缺少有效 HEALTHCHECK"),
+            "{}",
+            health_error.message
+        );
+        let health_batch_id = health_error.batch_id.expect("batch intent must exist");
+        let health_batch = crate::batch_store::get(&health_batch_id).unwrap();
+        assert_eq!(health_batch.state, "terminated");
+        assert!(
+            health_batch
+                .targets
+                .iter()
+                .all(|target| { target.state == "waiting" && target.release_task_id.is_none() })
+        );
+        assert_eq!(
+            [count("release_tasks"), count("release_uploaded_archives")],
+            before_db
+        );
+        assert!(
+            !appdata
+                .join("devingPanel")
+                .join("batch-archives")
+                .join(&health_batch_id)
+                .exists()
+        );
+        assert_eq!(remote(), before_remote);
+        for build in &health_preflight.plan.builds {
+            assert!(
+                std::process::Command::new("docker")
+                    .args(["image", "rm", &build.reference])
+                    .status()
+                    .unwrap()
+                    .success(),
+                "could not remove isolated health-failure image"
+            );
+        }
+        eprintln!(
+            "LAN local failures stopped before upload: build={}/{} health={}/{}",
+            project.id, batch_id, health_project.id, health_batch_id
+        );
     }
 
     #[test]
@@ -2869,7 +3729,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "read-only preflight against two LAN VPS hosts; requires fresh isolated APPDATA and DEVINGPANEL_TEST_LAN_PASSWORD"]
+    #[ignore = "read-only environment, source, and platform checks against two LAN VPS hosts; requires fresh isolated APPDATA and DEVINGPANEL_TEST_LAN_PASSWORD"]
     fn isolated_lan_batch_preflight_rejects_drift_without_side_effects() {
         let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
             .canonicalize()
@@ -3000,23 +3860,90 @@ mod tests {
                 .iter()
                 .map(|id| {
                     let inventory = crate::ssh::inventory(*id).unwrap();
-                    (inventory.containers.len(), inventory.images.len())
+                    let mut containers = inventory
+                        .containers
+                        .iter()
+                        .map(|container| container.id.clone())
+                        .collect::<Vec<_>>();
+                    let mut images = inventory
+                        .images
+                        .iter()
+                        .map(|image| image.reference.clone())
+                        .collect::<Vec<_>>();
+                    containers.sort();
+                    images.sort();
+                    (containers, images)
                 })
                 .collect::<Vec<_>>()
         };
         let before_db = counts();
         let before_local = local_images();
         let before_remote = remote();
-        assert_eq!(before_remote, [(0, 0), (0, 0)]);
+        let daemons = project
+            .host_ids
+            .iter()
+            .map(|id| {
+                let host = crate::host_store::list()
+                    .unwrap()
+                    .0
+                    .into_iter()
+                    .find(|host| host.id == *id)
+                    .unwrap();
+                crate::ssh::docker_identity_for_host(host).unwrap().1
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(daemons[0], daemons[1]);
 
         let tag = format!("lanpreflight{}", uuid::Uuid::new_v4().simple());
-        let preflight =
+        let mut preflight =
             preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
         assert_eq!(preflight.targets.len(), 2);
         assert_ne!(
             preflight.targets[0].docker_daemon_id,
             preflight.targets[1].docker_daemon_id
         );
+        assert_eq!(
+            preflight
+                .targets
+                .iter()
+                .map(|target| target.docker_daemon_id.as_str())
+                .collect::<Vec<_>>(),
+            daemons.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        let frozen_platform =
+            std::mem::replace(&mut preflight.targets[1].platform, "linux/arm64".into());
+        let error =
+            super::revalidate_batch(project.id, &preflight, Arc::new(AtomicBool::new(false)))
+                .unwrap_err();
+        assert!(
+            error.contains("目标架构或 Docker daemon 身份已变化"),
+            "{error}"
+        );
+        preflight.targets[1].platform = frozen_platform;
+        assert_eq!(counts(), before_db);
+        assert_eq!(local_images(), before_local);
+        assert_eq!(remote(), before_remote);
+        let second = project.host_ids[1];
+        crate::env_store::save(
+            project.id,
+            Some(second),
+            vec![crate::env_store::EnvInput {
+                name: "PREFLIGHT_DRIFT".into(),
+                value: Some("changed".into()),
+                credential_id: None,
+                sensitive: false,
+            }],
+        )
+        .unwrap();
+        let error =
+            super::revalidate_batch(project.id, &preflight, Arc::new(AtomicBool::new(false)))
+                .unwrap_err();
+        assert!(error.contains("环境变量在预检后变化"), "{error}");
+        assert_eq!(counts(), before_db);
+        assert_eq!(local_images(), before_local);
+        assert_eq!(remote(), before_remote);
+        crate::env_store::save(project.id, Some(second), vec![]).unwrap();
+        super::revalidate_batch(project.id, &preflight, Arc::new(AtomicBool::new(false))).unwrap();
         let dockerfile = project_dir.join("Dockerfile.worker");
         let mut bytes = std::fs::read(&dockerfile).unwrap();
         bytes.extend_from_slice(b"\n# isolated drift injection\n");
@@ -3028,6 +3955,23 @@ mod tests {
         assert_eq!(counts(), before_db);
         assert_eq!(local_images(), before_local);
         assert_eq!(remote(), before_remote);
+        std::fs::copy(source.join("Dockerfile.worker"), &dockerfile).unwrap();
+        let manifest_path = project_dir.join("devingpanel.yaml");
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        assert_eq!(manifest.matches("platform: linux/amd64").count(), 2);
+        std::fs::write(
+            &manifest_path,
+            manifest.replace("platform: linux/amd64", "platform: linux/arm64"),
+        )
+        .unwrap();
+        let error = preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false)))
+            .err()
+            .expect("target architecture mismatch must stop preflight");
+        assert!(error.contains("与项目目标平台"), "{error}");
+        assert_eq!(counts(), before_db);
+        assert_eq!(local_images(), before_local);
+        assert_eq!(remote(), before_remote);
+        std::fs::write(manifest_path, manifest).unwrap();
         assert!(!appdata.join("devingPanel").join("batch-archives").exists());
         cleanup.finish().unwrap();
     }
@@ -3055,7 +3999,7 @@ mod tests {
         );
         let id = std::env::var("DEVINGPANEL_TEST_LAN_BATCH_ID").expect("audited batch ID required");
         let batch = crate::batch_store::get(&id).unwrap();
-        assert!(batch.project_id > 1_000_000_000);
+        assert_eq!(batch.project_id, 1856624456);
         assert_eq!(batch.state, "running");
         assert_eq!(batch.targets.len(), 2);
         assert_eq!(batch.targets[0].state, "running");
@@ -3071,6 +4015,14 @@ mod tests {
             batch.targets[1].docker_daemon_id,
             "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"
         );
+        for target in &batch.targets {
+            assert_eq!(
+                crate::ssh::docker_identity_for_host(target.host.clone())
+                    .unwrap()
+                    .1,
+                target.docker_daemon_id
+            );
+        }
         let project = crate::project_store::effective(batch.project_id).unwrap();
         assert!(
             std::path::Path::new(&project.path)
@@ -3088,6 +4040,11 @@ mod tests {
             ),
             ("checked", "blocked", Some("healthy"))
         );
+        let observed = crate::ssh::observe_release_project(&first).unwrap();
+        assert_eq!(observed.containers.len(), 4);
+        assert!(observed.containers.iter().all(|container| {
+            container.status == "running" && container.health.as_deref() == Some("healthy")
+        }));
         let mut first_before = crate::ssh::inventory(batch.targets[0].host.id)
             .unwrap()
             .containers
@@ -3095,13 +4052,15 @@ mod tests {
             .map(|container| container.id.clone())
             .collect::<Vec<_>>();
         first_before.sort();
-        assert_eq!(first_before.len(), 4);
-        assert!(
-            crate::ssh::inventory(batch.targets[1].host.id)
-                .unwrap()
-                .containers
-                .is_empty()
-        );
+        assert_eq!(first_before.len(), 40);
+        let mut second_before = crate::ssh::inventory(batch.targets[1].host.id)
+            .unwrap()
+            .containers
+            .iter()
+            .map(|container| container.id.clone())
+            .collect::<Vec<_>>();
+        second_before.sort();
+        assert_eq!(second_before.len(), 28);
         let mut second_probe = first.clone();
         second_probe.host = batch.targets[1].host.clone();
         second_probe.docker_daemon_id = Some(batch.targets[1].docker_daemon_id.clone());
@@ -3167,13 +4126,14 @@ mod tests {
             .collect::<Vec<_>>();
         first_after.sort();
         assert_eq!(first_after, first_before);
-        assert_eq!(
-            crate::ssh::inventory(batch.targets[1].host.id)
-                .unwrap()
-                .containers
-                .len(),
-            4
-        );
+        let second_after = crate::ssh::inventory(batch.targets[1].host.id)
+            .unwrap()
+            .containers
+            .iter()
+            .map(|container| container.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(second_after.len(), second_before.len() + 4);
+        assert!(second_before.iter().all(|id| second_after.contains(id)));
         assert_eq!(pointers().len(), 1);
         assert_eq!(
             crate::release::confirm_healthy_and_complete(&second_id).unwrap(),
@@ -3194,6 +4154,361 @@ mod tests {
         eprintln!(
             "LAN batch complete: project={}, batch={}, tasks={},{}",
             project.id, id, first_id, second_id
+        );
+    }
+
+    #[test]
+    #[ignore = "one-shot parallel release to two trusted LAN VPS hosts; requires a fresh parallel-lan APPDATA and test password"]
+    fn isolated_lan_parallel_wave_confirms_both_hosts() {
+        let fail_second =
+            std::env::var("DEVINGPANEL_TEST_PARALLEL_FAIL_SECOND").as_deref() == Ok("1");
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        let root = appdata.parent().unwrap();
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("parallel-lan-")
+        );
+        assert_eq!(
+            root.parent().unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .join("target/isolated-tests")
+                .canonicalize()
+                .unwrap()
+        );
+        assert!(std::fs::read_dir(&appdata).unwrap().next().is_none());
+        let password = std::env::var("DEVINGPANEL_TEST_LAN_PASSWORD")
+            .expect("isolated LAN test password is required");
+        let fingerprint = "SHA256:+YD+qOVvzV7TP3DUXlFSIXadVdH8aNaUoeYLfEGcKE4";
+        let mut host_ids = Vec::new();
+        for (name, address) in [
+            ("vps-smoke", "192.168.63.129"),
+            ("vps-second", "192.168.63.130"),
+        ] {
+            let host = crate::host_store::create(crate::host_store::NewHost {
+                name: name.into(),
+                address: address.into(),
+                port: "22".into(),
+                username: "root".into(),
+                group: "test".into(),
+                auth: "password".into(),
+                credential: password.clone(),
+            })
+            .unwrap();
+            crate::host_store::trust_fingerprint(host.id, address, 22, None, fingerprint).unwrap();
+            host_ids.push(host.id);
+        }
+        drop(password);
+        let source = std::env::current_dir()
+            .unwrap()
+            .join("tests/fixtures/stack-v2-success");
+        let project_dir = root.join("project");
+        std::fs::create_dir(&project_dir).unwrap();
+        for file in [
+            "compose.yaml",
+            "Dockerfile.web",
+            "Dockerfile.worker",
+            "probe-web.txt",
+            "probe-worker.txt",
+        ] {
+            let source_file = if fail_second && file == "compose.yaml" {
+                std::env::current_dir()
+                    .unwrap()
+                    .join("tests/fixtures/stack-v2-host-health/compose.yaml")
+            } else {
+                source.join(file)
+            };
+            std::fs::copy(source_file, project_dir.join(file)).unwrap();
+        }
+        let yaml = std::fs::read_to_string(source.join("devingpanel.yaml")).unwrap();
+        std::fs::write(project_dir.join("devingpanel.yaml"), yaml
+            .replace("name: stack-v2-success",
+                &format!("name: stack-v2-parallel-{}", uuid::Uuid::new_v4().simple()))
+            .replace("    - group: test\n      host: vps-smoke",
+                "    - group: test\n      host: vps-smoke\n    - group: test\n      host: vps-second"),
+        ).unwrap();
+        let reservation_id = chrono::Utc::now().timestamp_millis();
+        crate::database::connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO projects (id, name, path, dockerfile, image)
+             VALUES (?1, 'parallel-id-reservation', '.', 'Dockerfile', 'reservation')",
+                [reservation_id],
+            )
+            .unwrap();
+        let project = crate::project_store::create_from_manifest(&project_dir).unwrap();
+        assert!(project.id > 1_000_000_000);
+        assert_eq!(project.host_ids, host_ids);
+        if fail_second {
+            for (host_id, command) in [
+                (host_ids[0], "test -s /probe-worker.txt"),
+                (host_ids[1], "false"),
+            ] {
+                let (_, warning) = crate::env_store::save(
+                    project.id,
+                    Some(host_id),
+                    vec![crate::env_store::EnvInput {
+                        name: "WORKER_HEALTH_COMMAND".into(),
+                        value: Some(command.into()),
+                        credential_id: None,
+                        sensitive: false,
+                    }],
+                )
+                .unwrap();
+                assert!(warning.is_none());
+            }
+        }
+        let tag = format!("parallel{}", uuid::Uuid::new_v4().simple());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let plan = preflight_batch(project.id, &tag, cancel.clone()).unwrap();
+        assert_eq!(plan.targets.len(), 2);
+        assert_ne!(
+            plan.targets[0].docker_daemon_id,
+            plan.targets[1].docker_daemon_id
+        );
+        assert_eq!(
+            plan.targets[0].docker_daemon_id,
+            "882622c2-a12a-4ac3-99d4-c3ab389f2641"
+        );
+        assert_eq!(
+            plan.targets[1].docker_daemon_id,
+            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"
+        );
+        let mut baselines = Vec::new();
+        for target in &plan.targets {
+            let probe = crate::release_store::TaskSnapshot {
+                id: "namespace-probe".into(),
+                project_id: project.id,
+                project_name: project.name.clone(),
+                host: target.host.clone(),
+                docker_endpoint: Some(target.docker_endpoint.clone()),
+                docker_daemon_id: Some(target.docker_daemon_id.clone()),
+                phase: "prepared".into(),
+                outcome: "running".into(),
+                health_result: None,
+                detail: String::new(),
+                started_at: String::new(),
+                execution_finished_at: None,
+                image_reference: plan.plan.builds[0].reference.clone(),
+            };
+            crate::ssh::assert_empty_project_namespace(&probe).unwrap();
+            let inventory = crate::ssh::inventory(target.host.id).unwrap();
+            for image in ["redis:7-alpine", "postgres:16-alpine"] {
+                assert!(inventory.images.iter().any(|item| item.reference == image));
+            }
+            let mut ids = inventory
+                .containers
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            baselines.push(ids);
+        }
+        let result = super::run_batch_parallel(project.id, &plan, 2, cancel, |_| {});
+        let batch_id = if fail_second {
+            result
+                .err()
+                .expect("second host must fail health")
+                .batch_id
+                .unwrap()
+        } else {
+            match result.unwrap_or_else(|error| {
+                panic!("parallel batch {:?}: {}", error.batch_id, error.message)
+            }) {
+                super::BatchProgress::AwaitingConfirmation { batch_id, .. } => batch_id,
+                super::BatchProgress::Complete { .. } => panic!("wave skipped health confirmation"),
+            }
+        };
+        let batch = crate::batch_store::get(&batch_id).unwrap();
+        assert_eq!(batch.parallelism, 2);
+        assert_eq!(batch.state, if fail_second { "paused" } else { "running" });
+        for (index, target) in batch.targets.iter().enumerate() {
+            assert_eq!(
+                target.state,
+                if fail_second && index == 1 {
+                    "failed"
+                } else {
+                    "running"
+                }
+            );
+            let task_id = target.release_task_id.as_ref().unwrap();
+            let task = crate::release_store::get_task(task_id).unwrap();
+            assert_eq!(
+                (
+                    task.phase.as_str(),
+                    task.outcome.as_str(),
+                    task.health_result.as_deref()
+                ),
+                (
+                    "checked",
+                    "blocked",
+                    Some(if fail_second && index == 1 {
+                        "failed"
+                    } else {
+                        "healthy"
+                    })
+                )
+            );
+            let mut after = crate::ssh::inventory(target.host.id)
+                .unwrap()
+                .containers
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+            after.sort();
+            assert_eq!(after.len(), baselines[index].len() + 4);
+            assert!(baselines[index].iter().all(|id| after.contains(id)));
+        }
+        let conn = crate::database::connect().unwrap();
+        let pointers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_current_version WHERE project_id = ?1",
+                [project.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pointers, 0);
+        if fail_second {
+            assert_eq!(
+                crate::release::confirm_healthy_and_complete(
+                    batch.targets[0].release_task_id.as_ref().unwrap()
+                )
+                .unwrap(),
+                4
+            );
+            let paused = crate::batch_store::get(&batch_id).unwrap();
+            assert_eq!(paused.state, "paused");
+            assert_eq!(paused.targets[0].state, "healthy");
+            assert_eq!(paused.targets[1].state, "failed");
+            let pointers: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM project_current_version WHERE project_id = ?1",
+                    [project.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(pointers, 1);
+            eprintln!(
+                "parallel LAN health failure retained: project={}, batch={}",
+                project.id, batch_id
+            );
+            return;
+        }
+        for target in &batch.targets {
+            assert_eq!(
+                crate::release::confirm_healthy_and_complete(
+                    target.release_task_id.as_ref().unwrap()
+                )
+                .unwrap(),
+                4
+            );
+        }
+        let finished = crate::batch_store::get(&batch_id).unwrap();
+        assert_eq!(finished.state, "complete");
+        assert!(
+            finished
+                .targets
+                .iter()
+                .all(|target| target.state == "healthy")
+        );
+        eprintln!(
+            "parallel LAN batch complete: project={}, batch={}",
+            project.id, batch_id
+        );
+    }
+
+    #[test]
+    #[ignore = "confirm an explicitly identified already-healthy isolated parallel LAN batch; no deploy"]
+    fn isolated_lan_parallel_confirm_existing_healthy() {
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        let root = appdata.parent().unwrap();
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("parallel-lan-")
+        );
+        assert_eq!(
+            root.parent().unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .join("target/isolated-tests")
+                .canonicalize()
+                .unwrap()
+        );
+        let batches = crate::batch_store::recent(None).unwrap();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        let batch_id = batch.id.clone();
+        assert_eq!(batch.parallelism, 2);
+        assert_eq!(batch.state, "running");
+        assert_eq!(batch.targets.len(), 2);
+        let conn = crate::database::connect().unwrap();
+        let pointers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_current_version WHERE project_id = ?1",
+                [batch.project_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pointers, 0);
+        let addresses = ["192.168.63.129", "192.168.63.130"];
+        let daemons = [
+            "882622c2-a12a-4ac3-99d4-c3ab389f2641",
+            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+        ];
+        for (index, target) in batch.targets.iter().enumerate() {
+            assert_eq!(target.host.address, addresses[index]);
+            assert_eq!(target.docker_daemon_id, daemons[index]);
+            assert_eq!(
+                crate::ssh::docker_identity_for_host(target.host.clone())
+                    .unwrap()
+                    .1,
+                daemons[index]
+            );
+            assert_eq!(target.state, "running");
+            let task =
+                crate::release_store::get_task(target.release_task_id.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                (
+                    task.phase.as_str(),
+                    task.outcome.as_str(),
+                    task.health_result.as_deref()
+                ),
+                ("checked", "blocked", Some("healthy"))
+            );
+            let observed = crate::ssh::observe_release_project(&task).unwrap();
+            assert_eq!(observed.containers.len(), 4);
+            assert!(observed.containers.iter().all(|item| {
+                item.status == "running" && item.health.as_deref() == Some("healthy")
+            }));
+        }
+        for target in &batch.targets {
+            assert_eq!(
+                crate::release::confirm_healthy_and_complete(
+                    target.release_task_id.as_ref().unwrap()
+                )
+                .unwrap(),
+                4
+            );
+        }
+        let complete = crate::batch_store::get(&batch_id).unwrap();
+        assert_eq!(complete.state, "complete");
+        assert!(
+            complete
+                .targets
+                .iter()
+                .all(|target| target.state == "healthy")
+        );
+        eprintln!(
+            "confirmed existing parallel LAN batch: project={}, batch={}",
+            batch.project_id, batch_id
         );
     }
 
@@ -3545,41 +4860,55 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "child process intentionally terminated during isolated LAN SFTP upload"]
-    fn isolated_lan_crash_upload_child() {
+    #[ignore = "child process intentionally terminated during isolated LAN remote execution"]
+    fn isolated_lan_crash_remote_child() {
         use std::io::Write as _;
         let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
             .canonicalize()
             .unwrap();
-        assert!(appdata
-            .parent()
-            .unwrap()
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("ui-lan-crash-"));
+        assert!(
+            appdata
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ui-lan-crash-")
+        );
         let project_id: i64 = std::env::var("DEVINGPANEL_TEST_LAN_CRASH_PROJECT")
             .unwrap()
             .parse()
             .unwrap();
-        assert_eq!(project_id, 1856624455);
+        assert!(project_id > 1_000_000_000);
         let project = crate::project_store::effective(project_id).unwrap();
-        assert!(std::path::Path::new(&project.path)
-            .canonicalize()
-            .unwrap()
-            .starts_with(appdata.parent().unwrap()));
+        assert!(
+            std::path::Path::new(&project.path)
+                .canonicalize()
+                .unwrap()
+                .starts_with(appdata.parent().unwrap())
+        );
         let tag = std::env::var("DEVINGPANEL_TEST_LAN_CRASH_TAG").unwrap();
+        let crash_phase =
+            std::env::var("DEVINGPANEL_TEST_LAN_CRASH_PHASE").unwrap_or_else(|_| "upload".into());
+        assert!(matches!(crash_phase.as_str(), "upload" | "deploying"));
         let snapshot = preflight_batch(project_id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
         let _ = super::run_batch_sequential(
             project_id,
             &snapshot,
             Arc::new(AtomicBool::new(false)),
             |event| {
+                if crash_phase == "deploying" && event == "启动全部 Compose 服务" {
+                    println!("START_INFLIGHT");
+                    std::io::stdout().flush().unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                }
                 let sent = event
                     .strip_prefix("镜像传输 ")
                     .and_then(|value| value.split_once('/'))
                     .and_then(|(sent, _)| sent.parse::<u64>().ok());
-                if sent.is_some_and(|sent| sent >= 512 * 1024) {
+                if crash_phase == "upload" && sent.is_some_and(|sent| sent >= 512 * 1024) {
                     println!("UPLOAD_INFLIGHT");
                     std::io::stdout().flush().unwrap();
                     loop {
@@ -3592,6 +4921,33 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "second process checks the live isolated LAN project lock"]
+    fn isolated_lan_crash_lock_probe_child() {
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        assert!(
+            appdata
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ui-lan-crash-")
+        );
+        let project_id: i64 = std::env::var("DEVINGPANEL_TEST_LAN_CRASH_PROJECT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(project_id > 1_000_000_000);
+        let should_be_locked = std::env::var("DEVINGPANEL_TEST_EXPECT_LOCKED").unwrap() == "yes";
+        assert_eq!(
+            crate::release_materials::acquire_guard(project_id).is_err(),
+            should_be_locked
+        );
+    }
+
+    #[test]
     #[ignore = "one-shot actual process crash during isolated LAN batch upload"]
     fn isolated_lan_batch_crash_during_upload_recovers_unknown() {
         use std::io::BufRead as _;
@@ -3599,11 +4955,12 @@ mod tests {
             .canonicalize()
             .unwrap();
         let root = appdata.parent().unwrap();
-        assert!(root
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("ui-lan-crash-"));
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ui-lan-crash-")
+        );
         assert_eq!(
             root.parent().unwrap(),
             std::env::current_dir()
@@ -3640,12 +4997,12 @@ mod tests {
         )
         .unwrap();
         let project = crate::project_store::create_from_manifest(&project_dir).unwrap();
-        assert_eq!(project.id, 1856624455);
+        assert!(project.id > 1_000_000_000);
         assert_eq!(project.host_ids, [1, 2]);
         let mut baseline = Vec::new();
-        for (host_id, address, daemon, count) in [
-            (1, "192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641", 36),
-            (2, "192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6", 28),
+        for (host_id, address, daemon) in [
+            (1, "192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
+            (2, "192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
         ] {
             let host = crate::host_store::list()
                 .unwrap()
@@ -3654,7 +5011,10 @@ mod tests {
                 .find(|host| host.id == host_id)
                 .unwrap();
             assert_eq!(host.address, address);
-            assert_eq!(crate::ssh::docker_identity_for_host(host).unwrap().1, daemon);
+            assert_eq!(
+                crate::ssh::docker_identity_for_host(host).unwrap().1,
+                daemon
+            );
             let mut ids = crate::ssh::inventory(host_id)
                 .unwrap()
                 .containers
@@ -3662,7 +5022,6 @@ mod tests {
                 .map(|container| container.id.clone())
                 .collect::<Vec<_>>();
             ids.sort();
-            assert_eq!(ids.len(), count);
             baseline.push(ids);
         }
         let tag = format!("lancrash{}", uuid::Uuid::new_v4().simple());
@@ -3702,7 +5061,7 @@ mod tests {
             .args([
                 "--ignored",
                 "--exact",
-                "stack_release::tests::isolated_lan_crash_upload_child",
+                "stack_release::tests::isolated_lan_crash_remote_child",
                 "--nocapture",
             ])
             .env("APPDATA", &appdata)
@@ -3731,6 +5090,33 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1800))
             .expect("child did not reach an active SFTP write; inspect isolated database");
         assert!(child.0.try_wait().unwrap().is_none());
+        let probe = |locked: bool| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "stack_release::tests::isolated_lan_crash_lock_probe_child",
+                ])
+                .env("APPDATA", &appdata)
+                .env("DEVINGPANEL_TEST_LAN_CRASH_PROJECT", project.id.to_string())
+                .env(
+                    "DEVINGPANEL_TEST_EXPECT_LOCKED",
+                    if locked { "yes" } else { "no" },
+                )
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt as _;
+                command.creation_flags(0x0800_0000);
+            }
+            assert!(
+                command.status().unwrap().success(),
+                "second client lock probe failed"
+            );
+        };
+        probe(true);
         let batches = crate::batch_store::recent(Some(project.id)).unwrap();
         assert_eq!(batches.len(), 1);
         let batch = &batches[0];
@@ -3740,7 +5126,10 @@ mod tests {
         assert!(batch.targets[1].release_task_id.is_none());
         let task_id = batch.targets[0].release_task_id.as_ref().unwrap();
         let task = crate::release_store::get_task(task_id).unwrap();
-        assert_eq!((task.phase.as_str(), task.outcome.as_str()), ("uploading", "running"));
+        assert_eq!(
+            (task.phase.as_str(), task.outcome.as_str()),
+            ("uploading", "running")
+        );
         let records = crate::release_store::uploaded_archives(task_id).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].state, "reserved");
@@ -3749,19 +5138,32 @@ mod tests {
         assert_eq!(observed[0].directory, records[0].directory);
         let before_kill = observed[0].actual_bytes.unwrap();
         assert!(before_kill > 0 && before_kill < records[0].bytes);
-        assert_eq!(crate::release_materials::recover_interrupted_batches().unwrap(), 0);
+        assert_eq!(
+            crate::release_materials::recover_interrupted_batches().unwrap(),
+            0
+        );
         assert!(child.0.try_wait().unwrap().is_none());
         child.0.kill().unwrap();
         assert!(!child.0.wait().unwrap().success());
-        assert_eq!(crate::release_materials::recover_interrupted_batches().unwrap(), 1);
-        assert_eq!(crate::release_materials::recover_interrupted_batches().unwrap(), 0);
+        probe(false);
+        assert_eq!(
+            crate::release_materials::recover_interrupted_batches().unwrap(),
+            1
+        );
+        assert_eq!(
+            crate::release_materials::recover_interrupted_batches().unwrap(),
+            0
+        );
         let batch = crate::batch_store::get(&batch.id).unwrap();
         assert_eq!(batch.state, "unknown");
         assert_eq!(batch.targets[0].state, "unknown");
         assert_eq!(batch.targets[1].state, "waiting");
         assert!(batch.targets[1].release_task_id.is_none());
         let task = crate::release_store::get_task(task_id).unwrap();
-        assert_eq!((task.phase.as_str(), task.outcome.as_str()), ("uploading", "unknown"));
+        assert_eq!(
+            (task.phase.as_str(), task.outcome.as_str()),
+            ("uploading", "unknown")
+        );
         let inspection = crate::release::inspect_unknown_upload(task_id).unwrap();
         assert!(inspection.containers.is_empty());
         assert_eq!(inspection.archives.len(), 1);
@@ -3783,6 +5185,211 @@ mod tests {
         eprintln!(
             "LAN upload process crash recovered unknown: project={}, batch={}, task={}, remote={}/{}",
             project.id, batch.id, task_id, after_kill, records[0].bytes
+        );
+    }
+
+    #[test]
+    #[ignore = "one-shot LAN client crash after remote materials are ready and before Compose starts"]
+    fn isolated_lan_batch_crash_at_stack_start_recovers_unknown() {
+        use std::io::BufRead as _;
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        let root = appdata.parent().unwrap();
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ui-lan-crash-start-")
+        );
+        assert_eq!(
+            root.parent().unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .join("target/isolated-tests")
+                .canonicalize()
+                .unwrap()
+        );
+        let project_dir = root.join(format!("project-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&project_dir).unwrap();
+        let source = std::env::current_dir()
+            .unwrap()
+            .join("tests/fixtures/stack-v2-success");
+        for file in [
+            "compose.yaml",
+            "Dockerfile.web",
+            "Dockerfile.worker",
+            "probe-web.txt",
+            "probe-worker.txt",
+        ] {
+            std::fs::copy(source.join(file), project_dir.join(file)).unwrap();
+        }
+        let yaml = std::fs::read_to_string(source.join("devingpanel.yaml")).unwrap();
+        std::fs::write(
+            project_dir.join("devingpanel.yaml"),
+            yaml.replace(
+                "name: stack-v2-success",
+                &format!("name: stack-v2-crash-start-{}", uuid::Uuid::new_v4().simple()),
+            )
+            .replace(
+                "    - group: test\n      host: vps-smoke",
+                "    - group: test\n      host: vps-smoke\n    - group: test\n      host: vps-second",
+            ),
+        )
+        .unwrap();
+        let project = crate::project_store::create_from_manifest(&project_dir).unwrap();
+        assert!(project.id > 1_000_000_000);
+        assert_eq!(project.host_ids, [1, 2]);
+        let tag = format!("lancrashstart{}", uuid::Uuid::new_v4().simple());
+        let snapshot = preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
+        let mut baselines = Vec::new();
+        for (target, (address, daemon)) in snapshot.targets.iter().zip([
+            ("192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
+            ("192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
+        ]) {
+            assert_eq!(target.host.address, address);
+            assert_eq!(target.docker_daemon_id, daemon);
+            let probe = crate::release_store::TaskSnapshot {
+                id: "namespace-probe".into(),
+                project_id: project.id,
+                project_name: project.name.clone(),
+                host: target.host.clone(),
+                docker_endpoint: Some(target.docker_endpoint.clone()),
+                docker_daemon_id: Some(target.docker_daemon_id.clone()),
+                phase: "prepared".into(),
+                outcome: "running".into(),
+                health_result: None,
+                detail: String::new(),
+                started_at: String::new(),
+                execution_finished_at: None,
+                image_reference: snapshot.plan.builds[0].reference.clone(),
+            };
+            crate::ssh::assert_empty_project_namespace(&probe).unwrap();
+            let inventory = crate::ssh::inventory(target.host.id).unwrap();
+            assert!(
+                inventory
+                    .images
+                    .iter()
+                    .any(|image| image.reference == "redis:7-alpine")
+            );
+            assert!(
+                inventory
+                    .images
+                    .iter()
+                    .any(|image| image.reference == "postgres:16-alpine")
+            );
+            let mut ids = inventory
+                .containers
+                .iter()
+                .map(|container| container.id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            baselines.push(ids);
+        }
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "stack_release::tests::isolated_lan_crash_remote_child",
+                "--nocapture",
+            ])
+            .env("APPDATA", &appdata)
+            .env("DEVINGPANEL_TEST_LAN_CRASH_PROJECT", project.id.to_string())
+            .env("DEVINGPANEL_TEST_LAN_CRASH_TAG", &tag)
+            .env("DEVINGPANEL_TEST_LAN_CRASH_PHASE", "deploying")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            command.creation_flags(0x0800_0000);
+        }
+        let mut child = ChildGuard(command.spawn().unwrap());
+        let stdout = child.0.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if line.contains("START_INFLIGHT") {
+                    let _ = sender.send(());
+                    break;
+                }
+            }
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(1800))
+            .expect("child did not reach the Compose start boundary");
+        assert!(child.0.try_wait().unwrap().is_none());
+        let batch = crate::batch_store::recent(Some(project.id))
+            .unwrap()
+            .remove(0);
+        assert_eq!(batch.state, "running");
+        assert_eq!(batch.targets[0].state, "running");
+        assert_eq!(batch.targets[1].state, "waiting");
+        assert!(batch.targets[1].release_task_id.is_none());
+        let task_id = batch.targets[0].release_task_id.as_ref().unwrap();
+        let task = crate::release_store::get_task(task_id).unwrap();
+        assert_eq!(
+            (task.phase.as_str(), task.outcome.as_str()),
+            ("deploying", "running")
+        );
+        assert_eq!(
+            crate::release_materials::recover_interrupted_batches().unwrap(),
+            0
+        );
+        child.0.kill().unwrap();
+        assert!(!child.0.wait().unwrap().success());
+        assert_eq!(
+            crate::release_materials::recover_interrupted_batches().unwrap(),
+            1
+        );
+        assert_eq!(
+            crate::release_materials::recover_interrupted_batches().unwrap(),
+            0
+        );
+        let batch = crate::batch_store::get(&batch.id).unwrap();
+        assert_eq!(batch.state, "unknown");
+        assert_eq!(batch.targets[0].state, "unknown");
+        assert_eq!(batch.targets[1].state, "waiting");
+        let task = crate::release_store::get_task(task_id).unwrap();
+        assert_eq!(
+            (task.phase.as_str(), task.outcome.as_str()),
+            ("deploying", "unknown")
+        );
+        assert!(crate::ssh::verify_start_completed(&task).is_err());
+        assert!(crate::release::reconcile_interrupted_health(task_id).is_err());
+        assert!(crate::batch_store::terminate_resolved(&batch.id).is_err());
+        assert!(crate::batch_store::skip_failed(&batch.id, 1).is_err());
+        for (target, before) in batch.targets.iter().zip(&baselines) {
+            let mut after = crate::ssh::inventory(target.host.id)
+                .unwrap()
+                .containers
+                .iter()
+                .map(|container| container.id.clone())
+                .collect::<Vec<_>>();
+            after.sort();
+            assert_eq!(&after, before);
+        }
+        let conn = crate::database::connect().unwrap();
+        let pointers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_current_version WHERE project_id = ?1",
+                [project.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pointers, 0);
+        eprintln!(
+            "LAN Compose start-boundary crash stayed unknown: project={}, batch={}, task={}",
+            project.id, batch.id, task_id
         );
     }
 
@@ -3835,10 +5442,23 @@ mod tests {
         )
         .unwrap();
         let project = crate::project_store::create_from_manifest(&project_dir).unwrap();
-        assert!(project.id > 1_000_000_000);
+        assert_eq!(project.id, 1856624456);
         assert_eq!(project.host_ids, [1, 2]);
         let mut before = Vec::new();
-        for (id, address) in [(1, "192.168.63.129"), (2, "192.168.63.130")] {
+        for (id, address, daemon, count) in [
+            (
+                1,
+                "192.168.63.129",
+                "882622c2-a12a-4ac3-99d4-c3ab389f2641",
+                36,
+            ),
+            (
+                2,
+                "192.168.63.130",
+                "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+                28,
+            ),
+        ] {
             let host = crate::host_store::list()
                 .unwrap()
                 .0
@@ -3846,6 +5466,10 @@ mod tests {
                 .find(|host| host.id == id)
                 .unwrap();
             assert_eq!(host.address, address);
+            assert_eq!(
+                crate::ssh::docker_identity_for_host(host).unwrap().1,
+                daemon
+            );
             let inventory = crate::ssh::inventory(id).unwrap();
             let mut containers = inventory
                 .containers
@@ -3859,7 +5483,9 @@ mod tests {
                 .collect::<Vec<_>>();
             containers.sort();
             images.sort();
-            assert_eq!(containers.len(), 8);
+            assert_eq!(containers.len(), count);
+            assert!(images.contains(&"redis:7-alpine".to_owned()));
+            assert!(images.contains(&"postgres:16-alpine".to_owned()));
             before.push((containers, images));
         }
         let local_containers = || {
@@ -4782,6 +6408,725 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "one-shot LAN transport cut through a local SSH proxy and explicit batch resume"]
+    fn isolated_lan_proxy_disconnects_upload_then_resumes() {
+        use std::sync::atomic::Ordering;
+
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        let root = appdata.parent().unwrap();
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ui-lan-netcut-")
+        );
+        assert_eq!(
+            root.parent().unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .join("target/isolated-tests")
+                .canonicalize()
+                .unwrap()
+        );
+        let proxy = CutOnceSshProxy::new("192.168.63.130:22");
+        let conn = crate::database::connect().unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE hosts SET address = '127.0.0.1', port = ?1
+                 WHERE id = 2 AND address = '192.168.63.130' AND port = 22",
+                [proxy.port],
+            )
+            .unwrap(),
+            1
+        );
+        let source = std::env::current_dir()
+            .unwrap()
+            .join("tests/fixtures/stack-v2-success");
+        let project_dir = root.join("netcut-project");
+        std::fs::create_dir(&project_dir).unwrap();
+        for file in [
+            "compose.yaml",
+            "Dockerfile.web",
+            "Dockerfile.worker",
+            "probe-web.txt",
+            "probe-worker.txt",
+        ] {
+            std::fs::copy(source.join(file), project_dir.join(file)).unwrap();
+        }
+        let yaml = std::fs::read_to_string(source.join("devingpanel.yaml")).unwrap();
+        std::fs::write(
+            project_dir.join("devingpanel.yaml"),
+            yaml.replace(
+                "name: stack-v2-success",
+                &format!("name: stack-v2-netcut-{}", uuid::Uuid::new_v4().simple()),
+            )
+            .replace(
+                "    - group: test\n      host: vps-smoke",
+                "    - group: test\n      host: vps-smoke\n    - group: test\n      host: vps-second",
+            ),
+        )
+        .unwrap();
+        let project = crate::project_store::create_from_manifest(&project_dir).unwrap();
+        assert!(project.id > 1_000_000_000);
+        assert_eq!(project.host_ids, [1, 2]);
+        let tag = format!("lannetcut{}", uuid::Uuid::new_v4().simple());
+        let plan = preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(plan.targets[0].host.address, "192.168.63.129");
+        assert_eq!(plan.targets[1].host.address, "127.0.0.1");
+        assert_eq!(plan.targets[1].host.port, proxy.port);
+        assert_eq!(
+            plan.targets[0].docker_daemon_id,
+            "882622c2-a12a-4ac3-99d4-c3ab389f2641"
+        );
+        assert_eq!(
+            plan.targets[1].docker_daemon_id,
+            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"
+        );
+        let mut baselines = Vec::new();
+        for target in &plan.targets {
+            let probe = crate::release_store::TaskSnapshot {
+                id: "namespace-probe".into(),
+                project_id: project.id,
+                project_name: project.name.clone(),
+                host: target.host.clone(),
+                docker_endpoint: Some(target.docker_endpoint.clone()),
+                docker_daemon_id: Some(target.docker_daemon_id.clone()),
+                phase: "prepared".into(),
+                outcome: "running".into(),
+                health_result: None,
+                detail: String::new(),
+                started_at: String::new(),
+                execution_finished_at: None,
+                image_reference: plan.plan.builds[0].reference.clone(),
+            };
+            crate::ssh::assert_empty_project_namespace(&probe).unwrap();
+            assert!(
+                crate::ssh::observe_release_project(&probe)
+                    .unwrap()
+                    .containers
+                    .is_empty()
+            );
+            let inventory = crate::ssh::inventory(target.host.id).unwrap();
+            assert!(
+                inventory
+                    .images
+                    .iter()
+                    .any(|image| image.reference == "redis:7-alpine")
+            );
+            assert!(
+                inventory
+                    .images
+                    .iter()
+                    .any(|image| image.reference == "postgres:16-alpine")
+            );
+            let mut ids = inventory
+                .containers
+                .iter()
+                .map(|container| container.id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            baselines.push(ids);
+        }
+        let first = super::run_batch_sequential(
+            project.id,
+            &plan,
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap_or_else(|error| panic!("first host: {}", error.message));
+        let (batch_id, first_task) = match first {
+            super::BatchProgress::AwaitingConfirmation { batch_id, task_id } => (batch_id, task_id),
+            super::BatchProgress::Complete { .. } => panic!("first host skipped confirmation"),
+        };
+        assert_eq!(
+            crate::release::confirm_healthy_and_complete(&first_task).unwrap(),
+            4
+        );
+        let confirmed =
+            super::reconfirm_batch(&batch_id, Arc::new(AtomicBool::new(false))).unwrap();
+        proxy.enabled.store(true, Ordering::Relaxed);
+        let error = super::continue_batch_sequential(
+            &batch_id,
+            Some(2),
+            &confirmed,
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .err()
+        .expect("the proxy must interrupt one upload connection");
+        assert_eq!(error.batch_id.as_deref(), Some(batch_id.as_str()));
+        assert!(proxy.cut.load(Ordering::Relaxed));
+        let interrupted = crate::batch_store::get(&batch_id).unwrap();
+        assert_eq!(interrupted.state, "unknown");
+        assert_eq!(interrupted.targets[0].state, "healthy");
+        assert_eq!(interrupted.targets[1].state, "unknown");
+        let second_task = interrupted.targets[1].release_task_id.as_ref().unwrap();
+        let task = crate::release_store::get_task(second_task).unwrap();
+        assert_eq!(
+            (task.phase.as_str(), task.outcome.as_str()),
+            ("uploading", "unknown")
+        );
+        assert!(proxy.offline.load(Ordering::Relaxed));
+        assert!(crate::release::inspect_unknown_upload(second_task).is_err());
+        let still_unknown = crate::batch_store::get(&batch_id).unwrap();
+        assert_eq!(still_unknown.state, "unknown");
+        assert_eq!(still_unknown.targets[0].state, "healthy");
+        assert_eq!(
+            still_unknown.targets[1].release_task_id.as_deref(),
+            Some(second_task.as_str())
+        );
+        proxy.offline.store(false, Ordering::Relaxed);
+        let inspection = crate::release::inspect_unknown_upload(second_task).unwrap();
+        assert!(inspection.containers.is_empty());
+        assert_eq!(inspection.archives.len(), 1);
+        let offset = inspection.archives[0]
+            .actual_bytes
+            .expect("partial remote tar must be retained");
+        assert!(offset > 0 && offset < inspection.archives[0].expected_bytes);
+        let resumed = super::resume_unknown_batch_upload(
+            &batch_id,
+            second_task,
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap_or_else(|error| panic!("resume batch {batch_id}: {}", error.message));
+        assert!(matches!(
+            resumed,
+            super::BatchProgress::AwaitingConfirmation { task_id, .. } if task_id == *second_task
+        ));
+        assert_eq!(
+            crate::release::confirm_healthy_and_complete(second_task).unwrap(),
+            4
+        );
+        let complete = crate::batch_store::get(&batch_id).unwrap();
+        assert_eq!(complete.state, "complete");
+        assert!(
+            complete
+                .targets
+                .iter()
+                .all(|target| target.state == "healthy")
+        );
+        let pointers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_current_version WHERE project_id = ?1",
+                [project.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pointers, 2);
+        for (target, before) in complete.targets.iter().zip(&baselines) {
+            let mut after = crate::ssh::inventory(target.host.id)
+                .unwrap()
+                .containers
+                .iter()
+                .map(|container| container.id.clone())
+                .collect::<Vec<_>>();
+            after.sort();
+            assert_eq!(after.len(), before.len() + 4);
+            assert!(before.iter().all(|id| after.contains(id)));
+        }
+        eprintln!(
+            "LAN proxy cut/resume complete: project={}, batch={}, task={}, offset={}",
+            project.id, batch_id, second_task, offset
+        );
+    }
+
+    #[test]
+    #[ignore = "read-only LAN residue refusal using an isolated copy of a completed retry batch"]
+    fn isolated_lan_retry_rejects_existing_project_containers() {
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        let root = appdata.parent().unwrap();
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ui-lan-retry-residue-")
+        );
+        assert_eq!(
+            root.parent().unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .join("target/isolated-tests")
+                .canonicalize()
+                .unwrap()
+        );
+        let batch_id = "2104580a-6470-4c36-9643-8e1415822f64";
+        let before = crate::batch_store::get(batch_id).unwrap();
+        assert_eq!(before.project_id, 1856624458);
+        assert_eq!(before.state, "complete");
+        assert!(
+            before
+                .targets
+                .iter()
+                .all(|target| target.state == "healthy")
+        );
+        assert_eq!(before.targets[1].host.address, "192.168.63.130");
+        assert_eq!(
+            before.targets[1].docker_daemon_id,
+            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"
+        );
+        let current_id = before.targets[1].release_task_id.as_ref().unwrap();
+        let current = crate::release_store::get_task(current_id).unwrap();
+        assert_eq!(current.outcome, "complete");
+        let observed = crate::ssh::observe_release_project(&current).unwrap();
+        assert_eq!(observed.containers.len(), 4);
+        let mut baseline = crate::ssh::inventory(current.host.id)
+            .unwrap()
+            .containers
+            .iter()
+            .map(|container| container.id.clone())
+            .collect::<Vec<_>>();
+        baseline.sort();
+        let conn = crate::database::connect().unwrap();
+        conn.execute(
+            "UPDATE release_tasks SET outcome = 'failed', health_result = 'failed'
+             WHERE id = ?1 AND phase = 'checked' AND outcome = 'complete'",
+            [current_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE release_batch_targets SET state = 'failed'
+             WHERE batch_id = ?1 AND ordinal = 1 AND state = 'healthy'",
+            [batch_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE release_batches SET state = 'paused'
+             WHERE id = ?1 AND state = 'complete'",
+            [batch_id],
+        )
+        .unwrap();
+        let tasks_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM release_tasks WHERE project_id = ?1",
+                [before.project_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let attempts_before = before.targets[1].attempt_task_ids.len();
+        let error = super::retry_failed_batch_sequential(
+            batch_id,
+            current.host.id,
+            current_id,
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .err()
+        .expect("remote project containers must block retry");
+        assert!(error.message.contains("容器"));
+        let after = crate::batch_store::get(batch_id).unwrap();
+        assert_eq!(after.state, "paused");
+        assert_eq!(after.targets[1].state, "failed");
+        assert_eq!(
+            after.targets[1].release_task_id.as_deref(),
+            Some(current_id.as_str())
+        );
+        assert_eq!(after.targets[1].attempt_task_ids.len(), attempts_before);
+        let tasks_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM release_tasks WHERE project_id = ?1",
+                [before.project_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tasks_after, tasks_before);
+        let mut remote_after = crate::ssh::inventory(current.host.id)
+            .unwrap()
+            .containers
+            .iter()
+            .map(|container| container.id.clone())
+            .collect::<Vec<_>>();
+        remote_after.sort();
+        assert_eq!(remote_after, baseline);
+    }
+
+    #[test]
+    #[ignore = "one-shot LAN batch retry; requires an isolated copy of the audited LAN APPDATA"]
+    fn isolated_lan_batch_retries_closed_pretransfer_attempt() {
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        let root = appdata.parent().unwrap();
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ui-lan-retry-")
+        );
+        assert_eq!(
+            root.parent().unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .join("target/isolated-tests")
+                .canonicalize()
+                .unwrap()
+        );
+        let source = std::env::current_dir()
+            .unwrap()
+            .join("tests/fixtures/stack-v2-success");
+        let project_dir = root.join("retry-project");
+        std::fs::create_dir(&project_dir).unwrap();
+        for file in [
+            "compose.yaml",
+            "Dockerfile.web",
+            "Dockerfile.worker",
+            "probe-web.txt",
+            "probe-worker.txt",
+        ] {
+            std::fs::copy(source.join(file), project_dir.join(file)).unwrap();
+        }
+        let yaml = std::fs::read_to_string(source.join("devingpanel.yaml")).unwrap();
+        std::fs::write(
+            project_dir.join("devingpanel.yaml"),
+            yaml.replace(
+                "name: stack-v2-success",
+                &format!("name: stack-v2-retry-{}", uuid::Uuid::new_v4().simple()),
+            )
+            .replace(
+                "    - group: test\n      host: vps-smoke",
+                "    - group: test\n      host: vps-smoke\n    - group: test\n      host: vps-second",
+            ),
+        )
+        .unwrap();
+        let project = crate::project_store::create_from_manifest(&project_dir).unwrap();
+        assert!(project.id > 1_000_000_000);
+        assert_eq!(project.host_ids, [1, 2]);
+        let tag = format!("lanretry{}", uuid::Uuid::new_v4().simple());
+        let plan = preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
+        let mut baselines = Vec::new();
+        for (target, (address, daemon)) in plan.targets.iter().zip([
+            ("192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
+            ("192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
+        ]) {
+            assert_eq!(target.host.address, address);
+            assert_eq!(target.docker_daemon_id, daemon);
+            let probe = crate::release_store::TaskSnapshot {
+                id: "namespace-probe".into(),
+                project_id: project.id,
+                project_name: project.name.clone(),
+                host: target.host.clone(),
+                docker_endpoint: Some(target.docker_endpoint.clone()),
+                docker_daemon_id: Some(target.docker_daemon_id.clone()),
+                phase: "prepared".into(),
+                outcome: "running".into(),
+                health_result: None,
+                detail: String::new(),
+                started_at: String::new(),
+                execution_finished_at: None,
+                image_reference: plan.plan.builds[0].reference.clone(),
+            };
+            crate::ssh::assert_empty_project_namespace(&probe).unwrap();
+            assert!(
+                crate::ssh::observe_release_project(&probe)
+                    .unwrap()
+                    .containers
+                    .is_empty()
+            );
+            let inventory = crate::ssh::inventory(target.host.id).unwrap();
+            assert!(
+                inventory
+                    .images
+                    .iter()
+                    .any(|image| image.reference == "redis:7-alpine")
+            );
+            assert!(
+                inventory
+                    .images
+                    .iter()
+                    .any(|image| image.reference == "postgres:16-alpine")
+            );
+            let mut ids = inventory
+                .containers
+                .iter()
+                .map(|container| container.id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            baselines.push(ids);
+        }
+        let first = super::run_batch_sequential(
+            project.id,
+            &plan,
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap_or_else(|error| panic!("first host: {}", error.message));
+        let (batch_id, first_task) = match first {
+            super::BatchProgress::AwaitingConfirmation { batch_id, task_id } => (batch_id, task_id),
+            super::BatchProgress::Complete { .. } => panic!("first host skipped confirmation"),
+        };
+        assert_eq!(
+            crate::release::confirm_healthy_and_complete(&first_task).unwrap(),
+            4
+        );
+        let confirmed =
+            super::reconfirm_batch(&batch_id, Arc::new(AtomicBool::new(false))).unwrap();
+        let guard = Arc::new(crate::release_materials::acquire_guard(project.id).unwrap());
+        let prepared = super::prepare_batch_host(
+            project.id,
+            &batch_id,
+            &confirmed,
+            1,
+            guard,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let failed_task = prepared.task_id.clone();
+        drop(prepared);
+        crate::batch_store::close_pretransfer(&failed_task).unwrap();
+        let paused = crate::batch_store::get(&batch_id).unwrap();
+        assert_eq!(paused.state, "paused");
+        assert_eq!(paused.targets[1].state, "failed");
+        assert_eq!(
+            paused.targets[1].attempt_task_ids.as_slice(),
+            std::slice::from_ref(&failed_task)
+        );
+        assert!(
+            crate::ssh::observe_release_project(
+                &crate::release_store::get_task(&failed_task).unwrap()
+            )
+            .unwrap()
+            .containers
+            .is_empty()
+        );
+        let retried = super::retry_failed_batch_sequential(
+            &batch_id,
+            2,
+            &failed_task,
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap_or_else(|error| panic!("retry batch {batch_id}: {}", error.message));
+        let new_task = match retried {
+            super::BatchProgress::AwaitingConfirmation { task_id, .. } => task_id,
+            super::BatchProgress::Complete { .. } => panic!("retry skipped confirmation"),
+        };
+        assert_ne!(new_task, failed_task);
+        assert_eq!(
+            crate::release::confirm_healthy_and_complete(&new_task).unwrap(),
+            4
+        );
+        let completed = crate::batch_store::get(&batch_id).unwrap();
+        assert_eq!(completed.state, "complete");
+        assert!(
+            completed
+                .targets
+                .iter()
+                .all(|target| target.state == "healthy")
+        );
+        assert_eq!(
+            completed.targets[1].attempt_task_ids,
+            [failed_task.clone(), new_task.clone()]
+        );
+        assert_eq!(
+            completed.targets[1].release_task_id.as_deref(),
+            Some(new_task.as_str())
+        );
+        assert_eq!(
+            crate::release_store::get_task(&failed_task)
+                .unwrap()
+                .outcome,
+            "failed"
+        );
+        let conn = crate::database::connect().unwrap();
+        let pointers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_current_version WHERE project_id = ?1",
+                [project.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pointers, 2);
+        for (target, before) in completed.targets.iter().zip(&baselines) {
+            let mut after = crate::ssh::inventory(target.host.id)
+                .unwrap()
+                .containers
+                .iter()
+                .map(|container| container.id.clone())
+                .collect::<Vec<_>>();
+            after.sort();
+            assert_eq!(after.len(), before.len() + 4);
+            assert!(before.iter().all(|id| after.contains(id)));
+        }
+        eprintln!(
+            "LAN retry complete: project={}, batch={}, old={}, new={}",
+            project.id, batch_id, failed_task, new_task
+        );
+    }
+
+    #[test]
+    #[ignore = "one-shot LAN first-host success followed by second-host environment drift"]
+    fn isolated_lan_batch_second_host_drift_after_first_success() {
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        let root = appdata.parent().unwrap();
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ui-lan-drift-after-first-")
+        );
+        assert_eq!(
+            root.parent().unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .join("target/isolated-tests")
+                .canonicalize()
+                .unwrap()
+        );
+        let source = std::env::current_dir()
+            .unwrap()
+            .join("tests/fixtures/stack-v2-success");
+        let project_dir = root.join("drift-project");
+        std::fs::create_dir(&project_dir).unwrap();
+        for file in [
+            "compose.yaml",
+            "Dockerfile.web",
+            "Dockerfile.worker",
+            "probe-web.txt",
+            "probe-worker.txt",
+        ] {
+            std::fs::copy(source.join(file), project_dir.join(file)).unwrap();
+        }
+        let yaml = std::fs::read_to_string(source.join("devingpanel.yaml")).unwrap();
+        std::fs::write(
+            project_dir.join("devingpanel.yaml"),
+            yaml.replace(
+                "name: stack-v2-success",
+                &format!("name: stack-v2-drift-{}", uuid::Uuid::new_v4().simple()),
+            )
+            .replace(
+                "    - group: test\n      host: vps-smoke",
+                "    - group: test\n      host: vps-smoke\n    - group: test\n      host: vps-second",
+            ),
+        )
+        .unwrap();
+        let project = crate::project_store::create_from_manifest(&project_dir).unwrap();
+        assert!(project.id > 1_000_000_000);
+        assert_eq!(project.host_ids, [1, 2]);
+        let tag = format!("landrift{}", uuid::Uuid::new_v4().simple());
+        let plan = preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
+        let mut baselines = Vec::new();
+        for (target, (address, daemon)) in plan.targets.iter().zip([
+            ("192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
+            ("192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
+        ]) {
+            assert_eq!(target.host.address, address);
+            assert_eq!(target.docker_daemon_id, daemon);
+            let probe = crate::release_store::TaskSnapshot {
+                id: "namespace-probe".into(),
+                project_id: project.id,
+                project_name: project.name.clone(),
+                host: target.host.clone(),
+                docker_endpoint: Some(target.docker_endpoint.clone()),
+                docker_daemon_id: Some(target.docker_daemon_id.clone()),
+                phase: "prepared".into(),
+                outcome: "running".into(),
+                health_result: None,
+                detail: String::new(),
+                started_at: String::new(),
+                execution_finished_at: None,
+                image_reference: plan.plan.builds[0].reference.clone(),
+            };
+            crate::ssh::assert_empty_project_namespace(&probe).unwrap();
+            let inventory = crate::ssh::inventory(target.host.id).unwrap();
+            assert!(
+                inventory
+                    .images
+                    .iter()
+                    .any(|image| image.reference == "redis:7-alpine")
+            );
+            assert!(
+                inventory
+                    .images
+                    .iter()
+                    .any(|image| image.reference == "postgres:16-alpine")
+            );
+            let mut ids = inventory
+                .containers
+                .iter()
+                .map(|container| container.id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            baselines.push(ids);
+        }
+        let first = super::run_batch_sequential(
+            project.id,
+            &plan,
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap_or_else(|error| panic!("first host: {}", error.message));
+        let (batch_id, first_task) = match first {
+            super::BatchProgress::AwaitingConfirmation { batch_id, task_id } => (batch_id, task_id),
+            super::BatchProgress::Complete { .. } => panic!("first host skipped confirmation"),
+        };
+        assert_eq!(
+            crate::release::confirm_healthy_and_complete(&first_task).unwrap(),
+            4
+        );
+        let (_, warning) = crate::env_store::save(
+            project.id,
+            Some(2),
+            vec![crate::env_store::EnvInput {
+                name: "DRIFT_PROBE".into(),
+                value: Some("changed-after-first".into()),
+                credential_id: None,
+                sensitive: false,
+            }],
+        )
+        .unwrap();
+        assert!(warning.is_none());
+        assert!(
+            super::reconfirm_batch(&batch_id, Arc::new(AtomicBool::new(false)))
+                .err()
+                .expect("environment drift must block reconfirmation")
+                .contains("冻结环境已变化")
+        );
+        let batch = crate::batch_store::get(&batch_id).unwrap();
+        assert_eq!(batch.state, "running");
+        assert_eq!(batch.targets[0].state, "healthy");
+        assert_eq!(batch.targets[1].state, "waiting");
+        assert!(batch.targets[1].release_task_id.is_none());
+        let conn = crate::database::connect().unwrap();
+        let pointer: String = conn
+            .query_row(
+                "SELECT task_id FROM project_current_version WHERE project_id = ?1",
+                [project.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pointer, first_task);
+        for (target, before) in batch.targets.iter().zip(&baselines) {
+            let mut after = crate::ssh::inventory(target.host.id)
+                .unwrap()
+                .containers
+                .iter()
+                .map(|container| container.id.clone())
+                .collect::<Vec<_>>();
+            after.sort();
+            assert_eq!(
+                after.len(),
+                before.len() + if target.host.id == 1 { 4 } else { 0 }
+            );
+            assert!(before.iter().all(|id| after.contains(id)));
+        }
+        crate::batch_store::terminate_resolved(&batch_id).unwrap();
+        assert_eq!(
+            crate::batch_store::get(&batch_id).unwrap().state,
+            "terminated"
+        );
+        eprintln!(
+            "LAN second-host drift blocked: project={}, batch={}, first={}",
+            project.id, batch_id, first_task
+        );
+    }
+
+    #[test]
     #[ignore = "one-shot LAN batch; first host healthy, second host worker becomes unhealthy and pauses without rollback"]
     fn isolated_lan_batch_second_host_health_failure_pauses() {
         let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
@@ -4850,7 +7195,7 @@ mod tests {
             assert!(warning.is_none());
         }
         let mut baseline = Vec::new();
-        for (id, address, count) in [(1, "192.168.63.129", 24), (2, "192.168.63.130", 20)] {
+        for (id, address) in [(1, "192.168.63.129"), (2, "192.168.63.130")] {
             let host = crate::host_store::list()
                 .unwrap()
                 .0
@@ -4865,7 +7210,6 @@ mod tests {
                 .map(|container| container.id.clone())
                 .collect::<Vec<_>>();
             ids.sort();
-            assert_eq!(ids.len(), count);
             baseline.push(ids);
         }
         let local_containers = || {
@@ -5034,6 +7378,193 @@ mod tests {
         eprintln!(
             "LAN health failure paused: project={}, batch={}, tasks={},{}",
             project.id, batch_id, first_id, second_id
+        );
+    }
+
+    #[test]
+    #[ignore = "one-shot LAN first-host health failure for GUI resolution; requires fresh isolated APPDATA"]
+    fn isolated_lan_batch_first_host_health_failure_for_gui() {
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        let root = appdata.parent().unwrap();
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ui-lan-first-fail-")
+        );
+        assert_eq!(
+            root.parent().unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .join("target/isolated-tests")
+                .canonicalize()
+                .unwrap()
+        );
+        let source = std::env::current_dir()
+            .unwrap()
+            .join("tests/fixtures/stack-v2-success");
+        let project_dir = root.join("first-failure-project");
+        std::fs::create_dir(&project_dir).unwrap();
+        std::fs::copy(
+            "tests/fixtures/stack-v2-host-health/compose.yaml",
+            project_dir.join("compose.yaml"),
+        )
+        .unwrap();
+        for file in [
+            "Dockerfile.web",
+            "Dockerfile.worker",
+            "probe-web.txt",
+            "probe-worker.txt",
+        ] {
+            std::fs::copy(source.join(file), project_dir.join(file)).unwrap();
+        }
+        let yaml = std::fs::read_to_string(source.join("devingpanel.yaml")).unwrap();
+        std::fs::write(
+            project_dir.join("devingpanel.yaml"),
+            yaml.replace(
+                "name: stack-v2-success",
+                &format!("name: stack-v2-first-fail-{}", uuid::Uuid::new_v4().simple()),
+            )
+            .replace(
+                "    - group: test\n      host: vps-smoke",
+                "    - group: test\n      host: vps-second\n    - group: test\n      host: vps-smoke",
+            ),
+        )
+        .unwrap();
+        let project = crate::project_store::create_from_manifest(&project_dir).unwrap();
+        assert!(project.id > 1_000_000_000);
+        assert_eq!(project.host_ids, [2, 1]);
+        for (host_id, command) in [(2, "false"), (1, "test -s /probe-worker.txt")] {
+            let (_, warning) = crate::env_store::save(
+                project.id,
+                Some(host_id),
+                vec![crate::env_store::EnvInput {
+                    name: "WORKER_HEALTH_COMMAND".into(),
+                    value: Some(command.into()),
+                    credential_id: None,
+                    sensitive: false,
+                }],
+            )
+            .unwrap();
+            assert!(warning.is_none());
+        }
+        let tag = format!("lanfirstfail{}", uuid::Uuid::new_v4().simple());
+        let plan = preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(
+            plan.targets
+                .iter()
+                .map(|target| target.host.id)
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
+        let mut baseline = Vec::new();
+        for (target, (address, daemon)) in plan.targets.iter().zip([
+            ("192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
+            ("192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
+        ]) {
+            assert_eq!(target.host.address, address);
+            assert_eq!(target.docker_daemon_id, daemon);
+            let probe = crate::release_store::TaskSnapshot {
+                id: "namespace-probe".into(),
+                project_id: project.id,
+                project_name: project.name.clone(),
+                host: target.host.clone(),
+                docker_endpoint: Some(target.docker_endpoint.clone()),
+                docker_daemon_id: Some(target.docker_daemon_id.clone()),
+                phase: "prepared".into(),
+                outcome: "running".into(),
+                health_result: None,
+                detail: String::new(),
+                started_at: String::new(),
+                execution_finished_at: None,
+                image_reference: plan.plan.builds[0].reference.clone(),
+            };
+            crate::ssh::assert_empty_project_namespace(&probe).unwrap();
+            let inventory = crate::ssh::inventory(target.host.id).unwrap();
+            assert!(
+                inventory
+                    .images
+                    .iter()
+                    .any(|image| image.reference == "redis:7-alpine")
+            );
+            assert!(
+                inventory
+                    .images
+                    .iter()
+                    .any(|image| image.reference == "postgres:16-alpine")
+            );
+            let mut ids = inventory
+                .containers
+                .iter()
+                .map(|container| container.id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            baseline.push(ids);
+        }
+        let error = super::run_batch_sequential(
+            project.id,
+            &plan,
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .err()
+        .expect("unhealthy first host must pause the batch");
+        let batch_id = error.batch_id.expect("failed batch ID must be retained");
+        let batch = crate::batch_store::get(&batch_id).unwrap();
+        assert_eq!(batch.state, "paused");
+        assert_eq!(batch.targets[0].state, "failed");
+        assert_eq!(batch.targets[1].state, "waiting");
+        assert!(batch.targets[1].release_task_id.is_none());
+        let task_id = batch.targets[0].release_task_id.as_ref().unwrap();
+        let task = crate::release_store::get_task(task_id).unwrap();
+        assert_eq!(
+            (
+                task.phase.as_str(),
+                task.outcome.as_str(),
+                task.health_result.as_deref()
+            ),
+            ("checked", "blocked", Some("failed"))
+        );
+        let observed = crate::ssh::observe_release_project(&task).unwrap();
+        assert_eq!(observed.containers.len(), 4);
+        assert_eq!(
+            observed
+                .containers
+                .iter()
+                .find(|item| item.service == "worker")
+                .unwrap()
+                .health
+                .as_deref(),
+            Some("unhealthy")
+        );
+        let conn = crate::database::connect().unwrap();
+        let pointers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_current_version WHERE project_id = ?1",
+                [project.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pointers, 0);
+        for (target, before) in batch.targets.iter().zip(&baseline) {
+            let mut after = crate::ssh::inventory(target.host.id)
+                .unwrap()
+                .containers
+                .iter()
+                .map(|container| container.id.clone())
+                .collect::<Vec<_>>();
+            after.sort();
+            assert_eq!(
+                after.len(),
+                before.len() + if target.host.id == 2 { 4 } else { 0 }
+            );
+            assert!(before.iter().all(|id| after.contains(id)));
+        }
+        eprintln!(
+            "LAN first-host health failure: project={}, batch={}, task={}",
+            project.id, batch_id, task_id
         );
     }
 
@@ -5704,6 +8235,7 @@ mod tests {
             state: state.into(),
             release_task_id: task_id.map(str::to_owned),
             task_outcome: None,
+            attempt_task_ids: task_id.map(|id| vec![id.into()]).unwrap_or_default(),
         };
         let rows = [
             target(0, "running", Some("task")),

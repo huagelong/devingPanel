@@ -2,7 +2,7 @@ use crate::database::connect;
 use crate::stack_release::BatchPreflight;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[allow(dead_code)] // Batch history UI is not enabled yet.
 pub struct BatchTargetRecord {
@@ -15,6 +15,7 @@ pub struct BatchTargetRecord {
     pub state: String,
     pub release_task_id: Option<String>,
     pub task_outcome: Option<String>,
+    pub attempt_task_ids: Vec<String>,
 }
 
 #[allow(dead_code)] // Batch history UI is not enabled yet.
@@ -32,14 +33,28 @@ pub struct BatchRecord {
     pub id: String,
     pub project_id: i64,
     pub config_sha256: String,
+    pub parallelism: usize,
     pub state: String,
     pub created_at: String,
     pub images: Vec<BatchImageRecord>,
     pub targets: Vec<BatchTargetRecord>,
 }
 
+#[cfg(test)]
 fn create_in(conn: &Connection, project_id: i64, plan: &BatchPreflight) -> Result<String, String> {
+    create_with_parallel_in(conn, project_id, plan, 1)
+}
+
+fn create_with_parallel_in(
+    conn: &Connection,
+    project_id: i64,
+    plan: &BatchPreflight,
+    parallelism: usize,
+) -> Result<String, String> {
     if project_id <= 0
+        || parallelism == 0
+        || parallelism > plan.targets.len()
+        || parallelism > 32
         || plan.config_sha256.len() != 64
         || !plan.config_sha256.bytes().all(|ch| ch.is_ascii_hexdigit())
         || plan.plan.hosts.len() < 2
@@ -152,9 +167,9 @@ fn create_in(conn: &Connection, project_id: i64, plan: &BatchPreflight) -> Resul
     }
     let id = uuid::Uuid::new_v4().to_string();
     tx.execute(
-        "INSERT INTO release_batches (id, project_id, config_sha256, state)
-         VALUES (?1, ?2, ?3, 'prepared')",
-        params![id, project_id, plan.config_sha256],
+        "INSERT INTO release_batches (id, project_id, config_sha256, parallelism, state)
+         VALUES (?1, ?2, ?3, ?4, 'prepared')",
+        params![id, project_id, plan.config_sha256, parallelism as i64],
     )
     .map_err(|_| "项目已有未完成或待核实的批次。".to_owned())?;
     for build in &plan.plan.builds {
@@ -197,12 +212,20 @@ fn create_in(conn: &Connection, project_id: i64, plan: &BatchPreflight) -> Resul
 
 #[allow(dead_code)] // Batch execution remains disabled until per-host release intents are atomic.
 pub fn create(project_id: i64, plan: &BatchPreflight) -> Result<String, String> {
+    create_with_parallel(project_id, plan, 1)
+}
+
+pub fn create_with_parallel(
+    project_id: i64,
+    plan: &BatchPreflight,
+    parallelism: usize,
+) -> Result<String, String> {
     crate::stack_release::revalidate_batch(
         project_id,
         plan,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )?;
-    create_in(&connect()?, project_id, plan)
+    create_with_parallel_in(&connect()?, project_id, plan, parallelism)
 }
 
 fn begin_build_in(conn: &Connection, id: &str) -> Result<(), String> {
@@ -323,7 +346,9 @@ pub(crate) fn skip_failed_in(conn: &Connection, id: &str, host_id: i64) -> Resul
                  OR (other.state = 'healthy' AND r.outcome IS NOT 'complete')
                  OR (other.state IN ('failed', 'skipped') AND r.outcome IS NOT 'failed')))
          AND NOT EXISTS (SELECT 1 FROM release_batch_targets earlier
-             WHERE earlier.batch_id = ?1 AND earlier.ordinal < release_batch_targets.ordinal
+             JOIN release_batches b ON b.id = earlier.batch_id
+             WHERE earlier.batch_id = ?1
+             AND earlier.ordinal / b.parallelism < release_batch_targets.ordinal / b.parallelism
              AND earlier.state NOT IN ('healthy', 'skipped'))",
             params![id, host_id],
         )
@@ -338,7 +363,20 @@ pub(crate) fn skip_failed_in(conn: &Connection, id: &str, host_id: i64) -> Resul
             |row| row.get(0),
         )
         .map_err(|err| err.to_string())?;
-    let state = if pending == 0 { "complete" } else { "running" };
+    let failures: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM release_batch_targets WHERE batch_id = ?1 AND state = 'failed'",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(|err| err.to_string())?;
+    let state = if failures != 0 {
+        "paused"
+    } else if pending == 0 {
+        "complete"
+    } else {
+        "running"
+    };
     let parent = tx
         .execute(
             "UPDATE release_batches SET state = ?2, updated_at = CURRENT_TIMESTAMP
@@ -365,6 +403,70 @@ pub fn skip_failed(id: &str, host_id: i64) -> Result<(), String> {
         .map_err(|_| "批次不存在。")?;
     let _guard = crate::release_materials::acquire_guard(project_id)?;
     skip_failed_in(&conn, id, host_id)
+}
+
+pub(crate) fn retry_failed_in(
+    conn: &Connection,
+    id: &str,
+    host_id: i64,
+    expected_task_id: &str,
+) -> Result<(), String> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|err| err.to_string())?;
+    let changed = tx
+        .execute(
+            "UPDATE release_batch_targets SET state = 'waiting', release_task_id = NULL,
+             updated_at = CURRENT_TIMESTAMP
+             WHERE batch_id = ?1 AND host_id = ?2 AND state = 'failed'
+             AND release_task_id = ?3
+             AND EXISTS (SELECT 1 FROM release_batches b WHERE b.id = ?1 AND b.state = 'paused')
+             AND EXISTS (SELECT 1 FROM release_tasks r WHERE r.id = ?3
+                 AND r.project_id = (SELECT project_id FROM release_batches WHERE id = ?1)
+                 AND r.host_id = ?2 AND r.docker_daemon_id = release_batch_targets.docker_daemon_id
+                 AND r.outcome = 'failed')
+             AND EXISTS (SELECT 1 FROM release_batch_attempts a WHERE a.batch_id = ?1
+                 AND a.ordinal = release_batch_targets.ordinal AND a.task_id = ?3)
+             AND NOT EXISTS (SELECT 1 FROM release_materials m
+                 WHERE m.task_id = ?3 AND m.state = 'writing')
+             AND NOT EXISTS (SELECT 1 FROM release_batch_targets other
+                 WHERE other.batch_id = ?1 AND other.ordinal != release_batch_targets.ordinal
+                 AND other.state IN ('running', 'unknown'))
+             AND NOT EXISTS (SELECT 1 FROM release_batch_targets earlier
+                 JOIN release_batches b ON b.id = earlier.batch_id
+                 LEFT JOIN release_tasks prior ON prior.id = earlier.release_task_id
+                 WHERE earlier.batch_id = ?1
+                 AND earlier.ordinal / b.parallelism < release_batch_targets.ordinal / b.parallelism
+                 AND (earlier.state NOT IN ('healthy', 'skipped')
+                     OR (earlier.state = 'healthy' AND (prior.phase IS NOT 'checked'
+                         OR prior.outcome IS NOT 'complete' OR prior.health_result IS NOT 'healthy'))
+                     OR (earlier.state = 'skipped' AND prior.outcome IS NOT 'failed')))
+             AND NOT EXISTS (SELECT 1 FROM release_batch_targets later
+                 JOIN release_batches b ON b.id = later.batch_id
+                 WHERE later.batch_id = ?1
+                 AND later.ordinal / b.parallelism > release_batch_targets.ordinal / b.parallelism
+                 AND (later.state != 'waiting' OR later.release_task_id IS NOT NULL))",
+            params![id, host_id, expected_task_id],
+        )
+        .map_err(|err| err.to_string())?;
+    if changed != 1 {
+        return Err("失败目标或任务状态已变化，不能重试。".into());
+    }
+    let parent = tx
+        .execute(
+            "UPDATE release_batches SET state = 'running', updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND state = 'paused'",
+            [id],
+        )
+        .map_err(|err| err.to_string())?;
+    if parent != 1 {
+        return Err("批次状态已变化，不能重试。".into());
+    }
+    tx.commit().map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn retry_failed(id: &str, host_id: i64, expected_task_id: &str) -> Result<(), String> {
+    retry_failed_in(&connect()?, id, host_id, expected_task_id)
 }
 
 pub(crate) fn pause_waiting(id: &str, ordinal: usize) -> Result<(), String> {
@@ -396,7 +498,7 @@ pub(crate) fn close_pretransfer_in(conn: &Connection, task_id: &str) -> Result<(
              WHERE m.task_id = release_tasks.id AND m.state = 'writing')
          AND EXISTS (SELECT 1 FROM release_batch_targets t JOIN release_batches b
              ON b.id = t.batch_id WHERE t.release_task_id = ?1
-             AND t.state = 'running' AND b.state = 'running')",
+             AND t.state = 'running' AND b.state IN ('running', 'paused', 'unknown'))",
         [task_id],
     ).map_err(|err| err.to_string())?;
     if changed != 1 {
@@ -411,8 +513,11 @@ pub(crate) fn close_pretransfer_in(conn: &Connection, task_id: &str) -> Result<(
         .map_err(|err| err.to_string())?;
     let parent = tx
         .execute(
-            "UPDATE release_batches SET state = 'paused',
-        updated_at = CURRENT_TIMESTAMP WHERE state = 'running'
+            "UPDATE release_batches SET state = CASE
+            WHEN EXISTS (SELECT 1 FROM release_batch_targets t
+                WHERE t.batch_id = release_batches.id AND t.state = 'unknown') THEN 'unknown'
+            ELSE 'paused' END,
+        updated_at = CURRENT_TIMESTAMP WHERE state IN ('running', 'paused', 'unknown')
         AND id = (SELECT batch_id FROM release_batch_targets WHERE release_task_id = ?1)",
             [task_id],
         )
@@ -637,7 +742,8 @@ pub(crate) fn interrupted_projects_in(conn: &Connection) -> Result<Vec<i64>, Str
         "SELECT DISTINCT b.project_id FROM release_batches b
         JOIN release_batch_targets bt ON bt.batch_id = b.id
         JOIN release_tasks t ON t.id = bt.release_task_id
-        WHERE b.state = 'running' AND bt.state = 'running' AND t.outcome = 'running'
+        WHERE b.state IN ('running', 'paused', 'unknown')
+        AND bt.state = 'running' AND t.outcome = 'running'
         AND t.phase IN ('uploading', 'uploaded', 'loading', 'loaded',
             'awaiting_deployment', 'staging', 'staged', 'validating',
             'validated', 'deploying', 'checking')",
@@ -652,48 +758,55 @@ pub(crate) fn interrupted_projects_in(conn: &Connection) -> Result<Vec<i64>, Str
 pub(crate) fn mark_interrupted_in(conn: &Connection, project_id: i64) -> Result<bool, String> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|err| err.to_string())?;
-    let task: Option<(String, String)> = tx.query_row(
-        "SELECT t.id, b.id FROM release_batches b
+    let batch_id: Option<String> = tx.query_row(
+        "SELECT b.id FROM release_batches b
          JOIN release_batch_targets bt ON bt.batch_id = b.id
          JOIN release_tasks t ON t.id = bt.release_task_id
-         WHERE b.project_id = ?1 AND b.state = 'running' AND bt.state = 'running'
+         WHERE b.project_id = ?1 AND b.state IN ('running', 'paused', 'unknown')
+         AND bt.state = 'running'
          AND t.outcome = 'running' AND t.phase IN ('uploading', 'uploaded', 'loading', 'loaded',
-             'awaiting_deployment', 'staging', 'staged', 'validating', 'validated', 'deploying', 'checking')",
-        [project_id], |row| Ok((row.get(0)?, row.get(1)?)),
+             'awaiting_deployment', 'staging', 'staged', 'validating', 'validated', 'deploying', 'checking')
+         LIMIT 1",
+        [project_id], |row| row.get(0),
     ).optional().map_err(|err| err.to_string())?;
-    let Some((task_id, batch_id)) = task else {
+    let Some(batch_id) = batch_id else {
         return Ok(false);
     };
-    let active: i64 = tx
+    let orphaned: i64 = tx
         .query_row(
-            "SELECT COUNT(*) FROM release_batch_targets WHERE batch_id = ?1 AND state = 'running'",
+            "SELECT COUNT(*) FROM release_batch_targets
+         WHERE batch_id = ?1 AND state = 'running' AND release_task_id IS NULL",
             [&batch_id],
             |row| row.get(0),
         )
         .map_err(|err| err.to_string())?;
-    if active != 1 {
-        return Err("批次存在多个进行中目标，未自动核实。".into());
+    if orphaned != 0 {
+        return Err("批次进行中目标缺少任务记录，未自动核实。".into());
     }
     let changed = tx.execute("UPDATE release_tasks SET outcome = 'unknown',
         detail = '客户端执行中断；远端结果待人工核实，未自动重试', updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?1 AND outcome = 'running' AND phase IN ('uploading', 'uploaded', 'loading', 'loaded',
-            'awaiting_deployment', 'staging', 'staged', 'validating', 'validated', 'deploying', 'checking')",
-        [&task_id]).map_err(|err| err.to_string())?;
+        WHERE id IN (SELECT t.id FROM release_batch_targets bt
+            JOIN release_tasks t ON t.id = bt.release_task_id
+            WHERE bt.batch_id = ?1 AND bt.state = 'running' AND t.outcome = 'running'
+            AND t.phase IN ('uploading', 'uploaded', 'loading', 'loaded',
+                'awaiting_deployment', 'staging', 'staged', 'validating', 'validated', 'deploying', 'checking'))",
+        [&batch_id]).map_err(|err| err.to_string())?;
     let target = tx
         .execute(
             "UPDATE release_batch_targets SET state = 'unknown', updated_at = CURRENT_TIMESTAMP
-        WHERE release_task_id = ?1 AND state = 'running'",
-            [&task_id],
+        WHERE batch_id = ?1 AND state = 'running' AND release_task_id IN
+            (SELECT id FROM release_tasks WHERE outcome = 'unknown')",
+            [&batch_id],
         )
         .map_err(|err| err.to_string())?;
     let batch = tx
         .execute(
             "UPDATE release_batches SET state = 'unknown', updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?1 AND state = 'running'",
+        WHERE id = ?1 AND state IN ('running', 'paused', 'unknown')",
             [&batch_id],
         )
         .map_err(|err| err.to_string())?;
-    if changed != 1 || target != 1 || batch != 1 {
+    if changed == 0 || target != changed || batch != 1 {
         return Err("中断批次状态已变化，未更新。".into());
     }
     tx.commit().map_err(|err| err.to_string())?;
@@ -714,12 +827,20 @@ fn recent_in(conn: &Connection, project_id: Option<i64>) -> Result<Vec<BatchReco
 fn get_in(conn: &Connection, id: &str) -> Result<BatchRecord, String> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)
         .map_err(|err| err.to_string())?;
-    let (project_id, config_sha256, state, created_at) = tx
+    let (project_id, config_sha256, parallelism, state, created_at) = tx
         .query_row(
-            "SELECT project_id, config_sha256, state, created_at
+            "SELECT project_id, config_sha256, parallelism, state, created_at
              FROM release_batches WHERE id = ?1",
             [id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get::<_, i64>(2)? as usize,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .map_err(|_| "批次记录不存在。")?;
     let images = tx
@@ -745,6 +866,21 @@ fn get_in(conn: &Connection, id: &str) -> Result<BatchRecord, String> {
         .map_err(|err| err.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| err.to_string())?;
+    let mut attempts: HashMap<usize, Vec<String>> = HashMap::new();
+    for result in tx
+        .prepare(
+            "SELECT ordinal, task_id FROM release_batch_attempts
+             WHERE batch_id = ?1 ORDER BY ordinal, attempt",
+        )
+        .map_err(|err| err.to_string())?
+        .query_map([id], |row| {
+            Ok((row.get::<_, i64>(0)? as usize, row.get::<_, String>(1)?))
+        })
+        .map_err(|err| err.to_string())?
+    {
+        let (ordinal, task_id) = result.map_err(|err| err.to_string())?;
+        attempts.entry(ordinal).or_default().push(task_id);
+    }
     let targets = tx
         .prepare(
             "SELECT t.ordinal, t.host_id, t.host_name, t.host_group, t.host_address, t.host_port,
@@ -774,6 +910,9 @@ fn get_in(conn: &Connection, id: &str) -> Result<BatchRecord, String> {
                 state: row.get(13)?,
                 release_task_id: row.get(14)?,
                 task_outcome: row.get(15)?,
+                attempt_task_ids: attempts
+                    .remove(&(row.get::<_, i64>(0)? as usize))
+                    .unwrap_or_default(),
             })
         })
         .map_err(|err| err.to_string())?
@@ -784,6 +923,7 @@ fn get_in(conn: &Connection, id: &str) -> Result<BatchRecord, String> {
         id: id.into(),
         project_id,
         config_sha256,
+        parallelism,
         state,
         created_at,
         images,
@@ -794,9 +934,9 @@ fn get_in(conn: &Connection, id: &str) -> Result<BatchRecord, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        begin_build_in, create_in, get_in, interrupted_projects_in, mark_interrupted_in, ready_in,
-        recent_in, record_archive_in, skip_failed_in, terminate_resolved_in,
-        terminate_unstarted_in,
+        begin_build_in, close_pretransfer_in, create_in, get_in, interrupted_projects_in,
+        mark_interrupted_in, ready_in, recent_in, record_archive_in, retry_failed_in,
+        skip_failed_in, terminate_resolved_in, terminate_unstarted_in,
     };
     use crate::database::initialize;
     use crate::host_store::Host;
@@ -806,6 +946,61 @@ mod tests {
     };
     use rusqlite::Connection;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn retry_preserves_failed_attempt_and_checks_current_task() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, path, dockerfile, image)
+             VALUES (7, 'smoke', '.', 'Dockerfile', 'smoke');
+             INSERT INTO release_batches (id, project_id, config_sha256, state)
+             VALUES ('retry-batch', 7, 'digest', 'paused');
+             INSERT INTO release_tasks (id, project_id, host_id, project_name, host_name,
+                 host_address, host_port, host_username, host_auth, host_fingerprint,
+                 docker_endpoint, docker_daemon_id, image_reference, platform,
+                 config_sha256, phase, outcome, health_result)
+             VALUES ('healthy-task', 7, 1, 'smoke', 'first', '127.0.0.1', 22,
+                 'root', 'password', 'SHA256:test', 'unix:///var/run/docker.sock',
+                 'DAEMON:1', 'smoke:v1', 'linux/amd64', 'digest', 'checked',
+                 'complete', 'healthy'),
+                 ('failed-task', 7, 2, 'smoke', 'second', '127.0.0.2', 22,
+                 'root', 'password', 'SHA256:test', 'unix:///var/run/docker.sock',
+                 'DAEMON:2', 'smoke:v1', 'linux/amd64', 'digest', 'checked',
+                 'failed', 'failed');
+             INSERT INTO release_batch_targets (batch_id, ordinal, host_id, host_name,
+                 host_group, host_address, host_port, host_username, host_auth,
+                 host_fingerprint, platform, docker_endpoint, docker_daemon_id,
+                 state, release_task_id)
+             VALUES ('retry-batch', 0, 1, 'first', 'test', '127.0.0.1', 22,
+                 'root', 'password', 'SHA256:test', 'linux/amd64',
+                 'unix:///var/run/docker.sock', 'DAEMON:1', 'healthy', 'healthy-task'),
+                 ('retry-batch', 1, 2, 'second', 'test', '127.0.0.2', 22,
+                 'root', 'password', 'SHA256:test', 'linux/amd64',
+                 'unix:///var/run/docker.sock', 'DAEMON:2', 'failed', 'failed-task');
+             INSERT INTO release_batch_attempts (batch_id, ordinal, attempt, task_id)
+             VALUES ('retry-batch', 0, 1, 'healthy-task'),
+                 ('retry-batch', 1, 1, 'failed-task');
+             INSERT INTO release_materials (task_id, state, chunks)
+             VALUES ('failed-task', 'writing', 0);",
+        )
+        .unwrap();
+        assert!(retry_failed_in(&conn, "retry-batch", 2, "wrong-task").is_err());
+        assert!(retry_failed_in(&conn, "retry-batch", 2, "failed-task").is_err());
+        conn.execute(
+            "UPDATE release_materials SET state = 'ready' WHERE task_id = 'failed-task'",
+            [],
+        )
+        .unwrap();
+        retry_failed_in(&conn, "retry-batch", 2, "failed-task").unwrap();
+        let batch = get_in(&conn, "retry-batch").unwrap();
+        assert_eq!(batch.state, "running");
+        assert_eq!(batch.targets[1].state, "waiting");
+        assert!(batch.targets[1].release_task_id.is_none());
+        assert_eq!(batch.targets[1].attempt_task_ids, ["failed-task"]);
+        assert!(retry_failed_in(&conn, "retry-batch", 2, "failed-task").is_err());
+    }
 
     #[test]
     fn interrupted_remote_batch_becomes_unknown_without_touching_waiting_targets() {
@@ -879,6 +1074,110 @@ mod tests {
         assert!(skip_failed_in(&conn, "interrupted", 11).is_err());
         assert!(terminate_resolved_in(&conn, "interrupted").is_err());
         assert!(interrupted_projects_in(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn interrupted_parallel_wave_marks_every_remote_task_unknown() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, path, dockerfile, image)
+             VALUES (7, 'smoke', '.', 'Dockerfile', 'smoke');
+             INSERT INTO release_batches (id, project_id, config_sha256, parallelism, state)
+             VALUES ('wave', 7, 'digest', 3, 'running');
+             INSERT INTO release_tasks (id, project_id, host_id, project_name, host_name,
+                 host_address, host_port, host_username, host_auth, host_fingerprint,
+                 docker_endpoint, docker_daemon_id, image_reference, platform, config_sha256,
+                 phase, outcome) VALUES
+                 ('one-task', 7, 11, 'smoke', 'one', 'one.invalid', 22, 'root', 'password',
+                  'SHA256:verified', 'unix:///var/run/docker.sock', 'DAEMON:ONE', 'smoke:v1',
+                  'linux/amd64', 'digest', 'uploading', 'running'),
+                 ('two-task', 7, 12, 'smoke', 'two', 'two.invalid', 22, 'root', 'password',
+                  'SHA256:verified', 'unix:///var/run/docker.sock', 'DAEMON:TWO', 'smoke:v1',
+                  'linux/amd64', 'digest', 'deploying', 'running'),
+                 ('built-task', 7, 13, 'smoke', 'three', 'three.invalid', 22, 'root', 'password',
+                  'SHA256:verified', 'unix:///var/run/docker.sock', 'DAEMON:THREE', 'smoke:v1',
+                  'linux/amd64', 'digest', 'built', 'running');
+             INSERT INTO release_batch_targets (batch_id, ordinal, host_id, host_name,
+                 host_group, host_address, host_port, host_username, host_auth, host_fingerprint,
+                 platform, docker_endpoint, docker_daemon_id, state, release_task_id)
+             VALUES ('wave', 0, 11, 'one', 'test', 'one.invalid', 22, 'root', 'password',
+                 'SHA256:verified', 'linux/amd64', 'unix:///var/run/docker.sock',
+                 'DAEMON:ONE', 'running', 'one-task'),
+                 ('wave', 1, 12, 'two', 'test', 'two.invalid', 22, 'root', 'password',
+                 'SHA256:verified', 'linux/amd64', 'unix:///var/run/docker.sock',
+                 'DAEMON:TWO', 'running', 'two-task'),
+                 ('wave', 2, 13, 'three', 'test', 'three.invalid', 22, 'root', 'password',
+                 'SHA256:verified', 'linux/amd64', 'unix:///var/run/docker.sock',
+                 'DAEMON:THREE', 'running', 'built-task'),
+                 ('wave', 3, 14, 'later', 'test', 'later.invalid', 22, 'root', 'password',
+                 'SHA256:verified', 'linux/amd64', 'unix:///var/run/docker.sock',
+                 'DAEMON:LATER', 'waiting', NULL);",
+        )
+        .unwrap();
+        assert_eq!(interrupted_projects_in(&conn).unwrap(), [7]);
+        assert!(mark_interrupted_in(&conn, 7).unwrap());
+        assert!(!mark_interrupted_in(&conn, 7).unwrap());
+        let batch = get_in(&conn, "wave").unwrap();
+        assert_eq!(batch.parallelism, 3);
+        assert_eq!(batch.state, "unknown");
+        assert!(batch.targets[..2].iter().all(|target| {
+            target.state == "unknown" && target.task_outcome.as_deref() == Some("unknown")
+        }));
+        assert_eq!(batch.targets[2].state, "running");
+        assert_eq!(batch.targets[3].state, "waiting");
+        close_pretransfer_in(&conn, "built-task").unwrap();
+        let after = get_in(&conn, "wave").unwrap();
+        assert_eq!(after.state, "unknown");
+        assert_eq!(after.targets[2].state, "failed");
+    }
+
+    #[test]
+    fn parallel_wave_stays_paused_until_all_failed_siblings_are_skipped() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, path, dockerfile, image)
+             VALUES (7, 'smoke', '.', 'Dockerfile', 'smoke');
+             INSERT INTO release_batches (id, project_id, config_sha256, parallelism, state)
+             VALUES ('wave', 7, 'digest', 2, 'paused');
+             INSERT INTO release_tasks (id, project_id, host_id, project_name, host_name,
+                 host_address, host_port, host_username, host_auth, host_fingerprint,
+                 docker_endpoint, docker_daemon_id, image_reference, platform, config_sha256,
+                 phase, outcome) VALUES
+                 ('one-task', 7, 11, 'smoke', 'one', 'one.invalid', 22, 'root', 'password',
+                  'SHA256:verified', 'unix:///var/run/docker.sock', 'DAEMON:ONE', 'smoke:v1',
+                  'linux/amd64', 'digest', 'checked', 'failed'),
+                 ('two-task', 7, 12, 'smoke', 'two', 'two.invalid', 22, 'root', 'password',
+                  'SHA256:verified', 'unix:///var/run/docker.sock', 'DAEMON:TWO', 'smoke:v1',
+                  'linux/amd64', 'digest', 'checked', 'failed');
+             INSERT INTO release_batch_targets (batch_id, ordinal, host_id, host_name,
+                 host_group, host_address, host_port, host_username, host_auth, host_fingerprint,
+                 platform, docker_endpoint, docker_daemon_id, state, release_task_id)
+             VALUES ('wave', 0, 11, 'one', 'test', 'one.invalid', 22, 'root', 'password',
+                 'SHA256:verified', 'linux/amd64', 'unix:///var/run/docker.sock',
+                 'DAEMON:ONE', 'failed', 'one-task'),
+                 ('wave', 1, 12, 'two', 'test', 'two.invalid', 22, 'root', 'password',
+                 'SHA256:verified', 'linux/amd64', 'unix:///var/run/docker.sock',
+                 'DAEMON:TWO', 'failed', 'two-task'),
+                 ('wave', 2, 13, 'later', 'test', 'later.invalid', 22, 'root', 'password',
+                 'SHA256:verified', 'linux/amd64', 'unix:///var/run/docker.sock',
+                 'DAEMON:LATER', 'waiting', NULL);",
+        )
+        .unwrap();
+        skip_failed_in(&conn, "wave", 11).unwrap();
+        let partial = get_in(&conn, "wave").unwrap();
+        assert_eq!(partial.state, "paused");
+        assert_eq!(partial.targets[0].state, "skipped");
+        assert_eq!(partial.targets[1].state, "failed");
+        assert_eq!(partial.targets[2].state, "waiting");
+        skip_failed_in(&conn, "wave", 12).unwrap();
+        let resolved = get_in(&conn, "wave").unwrap();
+        assert_eq!(resolved.state, "running");
+        assert_eq!(resolved.targets[1].state, "skipped");
+        assert_eq!(resolved.targets[2].state, "waiting");
     }
 
     #[test]

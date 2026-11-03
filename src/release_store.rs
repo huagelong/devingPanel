@@ -712,13 +712,15 @@ fn create_with_batch_in(
              AND t.env_sha256 = ?15
              AND NOT EXISTS (SELECT 1 FROM release_batch_targets earlier
                LEFT JOIN release_tasks prior ON prior.id = earlier.release_task_id
-               WHERE earlier.batch_id = t.batch_id AND earlier.ordinal < t.ordinal
+               WHERE earlier.batch_id = t.batch_id
+               AND earlier.ordinal / b.parallelism < t.ordinal / b.parallelism
                AND (earlier.state NOT IN ('healthy', 'skipped')
                  OR (earlier.state = 'healthy' AND (prior.phase IS NOT 'checked'
                      OR prior.outcome IS NOT 'complete' OR prior.health_result IS NOT 'healthy'))
                  OR (earlier.state = 'skipped' AND prior.outcome IS NOT 'failed')))
              AND NOT EXISTS (SELECT 1 FROM release_batch_targets later
-               WHERE later.batch_id = t.batch_id AND later.ordinal > t.ordinal
+               WHERE later.batch_id = t.batch_id
+               AND later.ordinal / b.parallelism > t.ordinal / b.parallelism
                AND (later.state != 'waiting' OR later.release_task_id IS NOT NULL))",
                 params![
                     batch_id,
@@ -871,6 +873,17 @@ fn create_with_batch_in(
         if changed != 1 {
             return Err("批次主机发布意图已变化。".into());
         }
+        transaction
+            .execute(
+                "INSERT INTO release_batch_attempts (batch_id, ordinal, attempt, task_id)
+                 SELECT t.batch_id, t.ordinal,
+                     COALESCE((SELECT MAX(a.attempt) FROM release_batch_attempts a
+                         WHERE a.batch_id = t.batch_id AND a.ordinal = t.ordinal), 0) + 1,
+                     ?3 FROM release_batch_targets t
+                 WHERE t.batch_id = ?1 AND t.host_id = ?2 AND t.release_task_id = ?3",
+                params![batch_id, intent.host.id, intent.id],
+            )
+            .map_err(|err| err.to_string())?;
         transaction
             .execute(
                 "UPDATE release_batches SET state = 'running',
@@ -1869,8 +1882,14 @@ fn transition_batch_target_in(
         .map_err(|err| err.to_string())?;
     let parent = conn
         .execute(
-            "UPDATE release_batches SET state = ?2, updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?1 AND state = ?3",
+            "UPDATE release_batches SET state = CASE
+                WHEN EXISTS (SELECT 1 FROM release_batch_targets t
+                    WHERE t.batch_id = ?1 AND t.state = 'unknown') THEN 'unknown'
+                WHEN EXISTS (SELECT 1 FROM release_batch_targets t
+                    WHERE t.batch_id = ?1 AND t.state = 'failed') THEN 'paused'
+                ELSE ?2 END, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND state IN ('running', 'paused', 'unknown')
+             AND (?3 = state OR state IN ('paused', 'unknown'))",
             params![batch_id, batch_to, batch_from],
         )
         .map_err(|err| err.to_string())?;
@@ -1929,7 +1948,7 @@ mod tests {
         record_archive_in, record_image_ids_in, record_services_in,
         reserve_unknown_uploaded_archive_in, reserve_uploaded_archive_in, resolve_absent_in,
         resolve_predeploy_unchanged_in, retention_plan_in, settle_checked_in, settle_in,
-        task_from_row, unresolved_in,
+        task_from_row, transition_batch_target_in, unresolved_in,
     };
     use crate::database::initialize;
     use crate::host_store::Host;
@@ -1968,6 +1987,59 @@ mod tests {
              INSERT INTO hosts (id, name, address, port, username, auth, group_name, credential_id, trusted_fingerprint)
              VALUES (2, 'web', '203.0.113.10', 22, 'deploy', 'password', 'prod', 'credential-ref', 'SHA256:verified');",
         ).unwrap();
+    }
+
+    #[test]
+    fn parallel_sibling_can_settle_after_batch_is_blocked() {
+        for (first_result, expected_batch) in [("failed", "paused"), ("unknown", "unknown")] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+            initialize(&conn).unwrap();
+            conn.execute_batch(
+                "INSERT INTO projects (id, name, path, dockerfile, image)
+                 VALUES (1, 'test', '.', 'Dockerfile', 'test');
+                 INSERT INTO release_batches (id, project_id, config_sha256, parallelism, state)
+                 VALUES ('wave', 1, 'digest', 2, 'running');
+                 INSERT INTO release_tasks (id, project_id, host_id, project_name, host_name,
+                     host_address, host_port, host_username, host_auth, host_fingerprint,
+                     docker_endpoint, docker_daemon_id, image_reference, platform, config_sha256,
+                     phase, outcome) VALUES
+                     ('one', 1, 1, 'test', 'one', 'one.invalid', 22, 'root', 'password',
+                      'SHA256:test', 'unix:///var/run/docker.sock', 'DAEMON:ONE', 'test:v1',
+                      'linux/amd64', 'digest', 'checking', 'running'),
+                     ('two', 1, 2, 'test', 'two', 'two.invalid', 22, 'root', 'password',
+                      'SHA256:test', 'unix:///var/run/docker.sock', 'DAEMON:TWO', 'test:v1',
+                      'linux/amd64', 'digest', 'checking', 'running');
+                 INSERT INTO release_batch_targets (batch_id, ordinal, host_id, host_name,
+                     host_group, host_address, host_port, host_username, host_auth, host_fingerprint,
+                     platform, docker_endpoint, docker_daemon_id, state, release_task_id)
+                 VALUES ('wave', 0, 1, 'one', 'test', 'one.invalid', 22, 'root', 'password',
+                     'SHA256:test', 'linux/amd64', 'unix:///var/run/docker.sock',
+                     'DAEMON:ONE', 'running', 'one'),
+                     ('wave', 1, 2, 'two', 'test', 'two.invalid', 22, 'root', 'password',
+                     'SHA256:test', 'linux/amd64', 'unix:///var/run/docker.sock',
+                     'DAEMON:TWO', 'running', 'two');",
+            ).unwrap();
+            transition_batch_target_in(
+                &conn,
+                "one",
+                "running",
+                first_result,
+                "running",
+                expected_batch,
+            )
+            .unwrap();
+            transition_batch_target_in(&conn, "two", "running", "healthy", "running", "running")
+                .unwrap();
+            let state: String = conn
+                .query_row(
+                    "SELECT state FROM release_batches WHERE id = 'wave'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, expected_batch);
+        }
     }
 
     #[test]
@@ -2322,6 +2394,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(linked, ("running".into(), draft.id.clone()));
+        let attempts: Vec<(i64, String)> = conn
+            .prepare(
+                "SELECT attempt, task_id FROM release_batch_attempts
+                 WHERE batch_id = ?1 AND ordinal = 0 ORDER BY attempt",
+            )
+            .unwrap()
+            .query_map([&batch_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(attempts, [(1, draft.id.clone())]);
         assert!(
             create_with_batch_in(&conn, &intent(), Some(&batch_id), Some(&env_digest)).is_err()
         );
@@ -2377,6 +2460,116 @@ mod tests {
             .unwrap();
         assert_eq!(states, ("unknown".into(), "unknown".into()));
         assert!(settle_in(&conn, &second.id, Phase::Prepared, Outcome::Failed, "重写").is_err());
+        conn.execute(
+            "UPDATE release_tasks SET phase = 'checked', outcome = 'failed',
+             health_result = 'failed' WHERE id = ?1",
+            [&second.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE release_materials SET state = 'ready' WHERE task_id = ?1",
+            [&second.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE release_batch_targets SET state = 'failed'
+             WHERE batch_id = ?1 AND ordinal = 1",
+            [&batch_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE release_batches SET state = 'paused' WHERE id = ?1",
+            [&batch_id],
+        )
+        .unwrap();
+        crate::batch_store::retry_failed_in(&conn, &batch_id, second.host.id, &second.id).unwrap();
+        let mut retried = intent();
+        retried.host = second.host.clone();
+        retried.docker_daemon_id = second.docker_daemon_id.clone();
+        create_with_batch_in(&conn, &retried, Some(&batch_id), Some(&env_digest)).unwrap();
+        let attempts: Vec<String> = conn
+            .prepare(
+                "SELECT task_id FROM release_batch_attempts WHERE batch_id = ?1
+                 AND ordinal = 1 ORDER BY attempt",
+            )
+            .unwrap()
+            .query_map([&batch_id], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(attempts, [second.id.clone(), retried.id.clone()]);
+        let current: String = conn
+            .query_row(
+                "SELECT release_task_id FROM release_batch_targets
+                 WHERE batch_id = ?1 AND ordinal = 1",
+                [&batch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current, retried.id);
+    }
+
+    #[test]
+    fn parallel_batch_allows_same_wave_and_blocks_later_wave() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        initialize(&conn).unwrap();
+        seed(&conn);
+        conn.execute_batch(
+            "INSERT INTO hosts (id, name, address, port, username, auth, group_name,
+                credential_id, trusted_fingerprint) VALUES
+                (4, 'api', '203.0.113.11', 22, 'deploy', 'password', 'prod',
+                 'credential-api', 'SHA256:verified'),
+                (5, 'worker', '203.0.113.12', 22, 'deploy', 'password', 'prod',
+                 'credential-worker', 'SHA256:verified');
+             INSERT INTO project_hosts (project_id, host_id, ordinal) VALUES
+                (1, 2, 0), (1, 4, 1), (1, 5, 2);
+             INSERT INTO release_batches (id, project_id, config_sha256, parallelism, state)
+                VALUES ('parallel', 1,
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 2, 'ready');
+             INSERT INTO release_batch_images (batch_id, service, platform, reference,
+                archive_bytes, archive_sha256, image_ids) VALUES
+                ('parallel', 'web', 'linux/amd64', 'test:v1-amd64', 123,
+                 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                 '[\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"]');",
+        )
+        .unwrap();
+        let first = intent();
+        let mut second = intent();
+        second.host.id = 4;
+        second.host.name = "api".into();
+        second.host.address = "203.0.113.11".into();
+        second.docker_daemon_id = "OTHER:ID".into();
+        let mut third = intent();
+        third.host.id = 5;
+        third.host.name = "worker".into();
+        third.host.address = "203.0.113.12".into();
+        third.docker_daemon_id = "THIRD:ID".into();
+        for (ordinal, candidate) in [&first, &second, &third].into_iter().enumerate() {
+            conn.execute(
+                "INSERT INTO release_batch_targets (batch_id, ordinal, host_id, host_name,
+                 host_group, host_address, host_port, host_username, host_auth, host_fingerprint,
+                 platform, docker_endpoint, docker_daemon_id, env_sha256, state)
+                 VALUES ('parallel', ?1, ?2, ?3, 'prod', ?4, 22, 'deploy', 'password',
+                 'SHA256:verified', 'linux/amd64', 'unix:///var/run/docker.sock', ?5, ?6, 'waiting')",
+                rusqlite::params![ordinal as i64, candidate.host.id, candidate.host.name,
+                    candidate.host.address, candidate.docker_daemon_id, "e".repeat(64)],
+            ).unwrap();
+        }
+        let digest = "e".repeat(64);
+        assert!(create_with_batch_in(&conn, &third, Some("parallel"), Some(&digest)).is_err());
+        create_with_batch_in(&conn, &second, Some("parallel"), Some(&digest)).unwrap();
+        create_with_batch_in(&conn, &first, Some("parallel"), Some(&digest)).unwrap();
+        assert!(create_with_batch_in(&conn, &third, Some("parallel"), Some(&digest)).is_err());
+        let active: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM release_batch_targets WHERE batch_id = 'parallel'
+             AND state = 'running'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 2);
     }
 
     #[test]

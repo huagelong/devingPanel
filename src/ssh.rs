@@ -1196,7 +1196,8 @@ async fn connect_authenticated(material: ConnectionMaterial) -> Result<Connectio
         observed: observed.clone(),
     };
     let config = Arc::new(client::Config {
-        inactivity_timeout: Some(Duration::from_secs(30)),
+        // Compose startup can be silent for several minutes; its command has a 10-minute limit.
+        inactivity_timeout: Some(Duration::from_secs(11 * 60)),
         ..Default::default()
     });
     let connection = client::connect(
@@ -1506,10 +1507,17 @@ pub fn install_docker(
         .build()
         .map_err(|_| "无法初始化 Docker 安装环境。".to_owned())?
         .block_on(install_docker_on(material, source, &mut on_stage))?;
-    match test_host_snapshot(expected_host, Arc::new(AtomicBool::new(false)))? {
-        TestResult::Connected { .. } => Ok(()),
-        _ => Err("安装命令已结束，但 Docker 尚未通过连接测试；请核对 VPS 状态。".into()),
+    if !matches!(
+        test_host_snapshot(expected_host.clone(), Arc::new(AtomicBool::new(false)))?,
+        TestResult::Connected { .. }
+    ) {
+        return Err("安装命令已结束，但 Docker 尚未通过连接测试；请核对 VPS 状态。".into());
     }
+    on_stage("配置 Docker Hub 镜像源");
+    configure_registry_mirrors(expected_host, |stage| on_stage(stage)).map_err(|error| {
+        format!("Docker 已安装并通过连接测试，但镜像源配置未完成：{error} 请在主机详情中核对后单独配置镜像源。")
+    })?;
+    Ok(())
 }
 
 async fn configure_mirrors_on(
@@ -4436,6 +4444,132 @@ pub fn load_uploaded_archive(
 #[cfg(test)]
 mod tests {
     #[test]
+    #[ignore = "one-shot VPS network outage with a host-local timed restore and read-only unknown-task audit"]
+    fn isolated_lan_host_outage_keeps_upload_unknown() {
+        use std::net::{SocketAddr, TcpStream};
+        use std::time::{Duration, Instant};
+
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        assert_eq!(
+            appdata.parent().unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .join("target/isolated-tests/ui-lan-crash-07df86259bea430e9bd0dc9c57cedf5b")
+                .canonicalize()
+                .unwrap()
+        );
+        let batch_id = "17d64ab0-18f7-4d17-b881-db907a3312b3";
+        let batch = crate::batch_store::get(batch_id).unwrap();
+        assert_eq!(batch.project_id, 1856624467);
+        assert_eq!(batch.state, "unknown");
+        assert_eq!(batch.targets[0].state, "unknown");
+        assert_eq!(batch.targets[1].state, "waiting");
+        let target = &batch.targets[0];
+        assert_eq!(target.host.address, "192.168.63.129");
+        assert_eq!(
+            target.docker_daemon_id,
+            "882622c2-a12a-4ac3-99d4-c3ab389f2641"
+        );
+        let task_id = target.release_task_id.as_ref().unwrap();
+        let task = crate::release_store::get_task(task_id).unwrap();
+        assert_eq!(
+            (task.phase.as_str(), task.outcome.as_str()),
+            ("uploading", "unknown")
+        );
+        let before = super::inventory(target.host.id).unwrap();
+        let mut container_ids = before
+            .containers
+            .iter()
+            .map(|container| container.id.clone())
+            .collect::<Vec<_>>();
+        container_ids.sort();
+        assert_eq!(
+            super::docker_identity_for_host(target.host.clone())
+                .unwrap()
+                .1,
+            target.docker_daemon_id
+        );
+        let address: SocketAddr = "192.168.63.129:22".parse().unwrap();
+        assert!(TcpStream::connect_timeout(&address, Duration::from_secs(3)).is_ok());
+
+        let material = super::material_for(&target.host).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let handle = super::trusted_handle(material).await.unwrap();
+                let route = super::command_limited(&handle, "ip -o -4 route show default", 4096)
+                    .await
+                    .unwrap();
+                assert!(route.contains("dev ens33") && route.contains("src 192.168.63.129"));
+                let unit = format!(
+                    "devingpanel-link-restore-1856624467-{}",
+                    uuid::Uuid::new_v4().simple()
+                );
+                super::command_limited(
+                    &handle,
+                    &format!(
+                        "systemd-run --unit={unit} --on-active=45s /usr/sbin/ip link set dev ens33 up"
+                    ),
+                    4096,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    super::command_limited(
+                        &handle,
+                        &format!("systemctl is-active {unit}.timer"),
+                        4096,
+                    )
+                    .await
+                    .unwrap()
+                    .trim(),
+                    "active"
+                );
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    super::command_limited(&handle, "ip link set dev ens33 down", 4096),
+                )
+                .await;
+            });
+        assert!(TcpStream::connect_timeout(&address, Duration::from_secs(3)).is_err());
+        assert!(crate::release::inspect_unknown_upload(task_id).is_err());
+        assert_eq!(crate::batch_store::get(batch_id).unwrap().state, "unknown");
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            match super::docker_identity_for_host(target.host.clone()) {
+                Ok((_, daemon_id)) => {
+                    assert_eq!(daemon_id, target.docker_daemon_id);
+                    break;
+                }
+                Err(_) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "VPS SSH and Docker did not recover on schedule"
+                    );
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            }
+        }
+        let inspection = crate::release::inspect_unknown_upload(task_id).unwrap();
+        assert!(inspection.containers.is_empty());
+        assert_eq!(inspection.archives.len(), 1);
+        assert_eq!(crate::batch_store::get(batch_id).unwrap().state, "unknown");
+        let mut after = super::inventory(target.host.id)
+            .unwrap()
+            .containers
+            .iter()
+            .map(|container| container.id.clone())
+            .collect::<Vec<_>>();
+        after.sort();
+        assert_eq!(after, container_ids);
+    }
+
+    #[test]
     fn remote_command_exit_error_keeps_status_without_output() {
         assert_eq!(
             super::command_exit_error(Some(17)),
@@ -5026,6 +5160,49 @@ mod tests {
             r#"["https://docker.1panel.live/","https://docker.m.daocloud.io/"]"#
         ));
         assert!(!mirrors_active(r#"["https://untrusted.example/"]"#));
+    }
+
+    #[test]
+    #[ignore = "configures mirrors only on the two audited LAN test hosts"]
+    fn isolated_lan_hosts_configure_registry_mirrors() {
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        assert_eq!(
+            appdata.parent().unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .join("target/isolated-tests/ui-lan-crash-20261030-b")
+                .canonicalize()
+                .unwrap()
+        );
+        let hosts = crate::host_store::list().unwrap().0;
+        for (id, address, daemon) in [
+            (1, "192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
+            (2, "192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
+        ] {
+            let host = hosts.iter().find(|host| host.id == id).unwrap().clone();
+            assert_eq!(host.address, address);
+            assert_eq!(host.username, "root");
+            assert_eq!(
+                super::docker_identity_for_host(host.clone()).unwrap().1,
+                daemon
+            );
+            assert!(
+                super::inventory(id)
+                    .unwrap()
+                    .containers
+                    .iter()
+                    .all(|container| container.state != "running")
+            );
+            let result = super::configure_registry_mirrors(host.clone(), |_| {}).unwrap();
+            assert!(matches!(
+                result,
+                super::MirrorConfigResult::Updated | super::MirrorConfigResult::AlreadyConfigured
+            ));
+            assert_eq!(super::docker_identity_for_host(host).unwrap().1, daemon);
+            eprintln!("LAN mirror configuration verified: host={address}, result={result:?}");
+        }
     }
 
     #[test]

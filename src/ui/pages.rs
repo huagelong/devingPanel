@@ -104,7 +104,27 @@ pub(super) fn next_confirmed_batch_host(batch: &batch_store::BatchRecord) -> Opt
         .targets
         .iter()
         .position(|target| target.state == "waiting")?;
-    if index == 0
+    if batch.parallelism > 1 {
+        let wave_start = index / batch.parallelism * batch.parallelism;
+        let wave_end = (wave_start + batch.parallelism).min(batch.targets.len());
+        if index == 0
+            || batch.targets[index..wave_end]
+                .iter()
+                .any(|target| target.state != "waiting" || target.release_task_id.is_some())
+            || batch.targets[..index].iter().any(|target| {
+                let expected = match target.state.as_str() {
+                    "healthy" => "complete",
+                    "skipped" => "failed",
+                    _ => return true,
+                };
+                target.release_task_id.is_none() || target.task_outcome.as_deref() != Some(expected)
+            })
+        {
+            return None;
+        }
+        return Some(batch.targets[index].host.id);
+    }
+    if (index == 0 && batch.targets[index].attempt_task_ids.is_empty())
         || batch.targets[index].release_task_id.is_some()
         || batch.targets[index + 1..]
             .iter()
@@ -123,6 +143,45 @@ pub(super) fn next_confirmed_batch_host(batch: &batch_store::BatchRecord) -> Opt
     Some(batch.targets[index].host.id)
 }
 
+fn retryable_batch_target(batch: &batch_store::BatchRecord) -> Option<(i64, String)> {
+    if batch.state != "paused" {
+        return None;
+    }
+    let index = batch
+        .targets
+        .iter()
+        .position(|target| target.state == "failed")?;
+    let target = &batch.targets[index];
+    let task_id = target.release_task_id.as_ref()?;
+    let wave_start = index / batch.parallelism * batch.parallelism;
+    let wave_end = (wave_start + batch.parallelism).min(batch.targets.len());
+    if target.task_outcome.as_deref() != Some("failed")
+        || batch.targets[..wave_start].iter().any(|prior| {
+            !matches!(prior.state.as_str(), "healthy" | "skipped")
+                || prior.release_task_id.is_none()
+                || prior.task_outcome.as_deref()
+                    != Some(if prior.state == "healthy" {
+                        "complete"
+                    } else {
+                        "failed"
+                    })
+        })
+        || batch.targets[wave_start..wave_end]
+            .iter()
+            .enumerate()
+            .any(|(offset, other)| {
+                offset + wave_start != index
+                    && matches!(other.state.as_str(), "running" | "unknown")
+            })
+        || batch.targets[wave_end..]
+            .iter()
+            .any(|later| later.state != "waiting" || later.release_task_id.is_some())
+    {
+        return None;
+    }
+    Some((target.host.id, task_id.clone()))
+}
+
 enum DeployRunEvent {
     Stage(String),
     Transfer { sent: u64, total: u64 },
@@ -135,6 +194,15 @@ enum BatchStartEvent {
     Stage(String),
     Transfer { sent: u64, total: u64 },
     Finished(Result<stack_release::BatchProgress, stack_release::BatchRunError>),
+}
+
+#[derive(Clone)]
+struct BatchStartConfirmation {
+    project_id: i64,
+    tag: String,
+    generation: u64,
+    parallelism: usize,
+    snapshot: Arc<stack_release::BatchPreflight>,
 }
 
 fn transfer_progress(event: &str) -> Option<(u64, u64)> {
@@ -1025,7 +1093,8 @@ impl AppView {
                         .gap_3()
                         .child(format!("目标主机：{name} · Debian 13 / amd64 · root"))
                         .child("将添加 Docker CE apt 源与签名密钥，安装 Engine、CLI、containerd、Buildx、Compose，并启动 Docker 服务。可能改变系统软件包与网络配置。")
-                        .child("仓库密钥须匹配 Docker 官方指纹 9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88；不执行 curl | sh，也不设置未知的镜像加速器。")
+                        .child("仓库密钥须匹配 Docker 官方指纹 9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88；不执行 curl | sh。")
+                        .child(format!("安装后自动配置 Docker Hub 镜像源：{}、{}。仅在无运行容器时重启 Docker，并核对配置生效；公共镜像源可能记录镜像名称。", ssh::VERIFIED_REGISTRY_MIRRORS[0], ssh::VERIFIED_REGISTRY_MIRRORS[1]))
                         .child("安装源：mirrors.cloud.tencent.com（腾讯云，国内推荐）或 download.docker.com（官方）。若源不可用会停止，不自动切换。请确认 VPS 有足够磁盘空间并允许 apt 安装。"),
                 )
                 .footer(
@@ -1131,13 +1200,13 @@ impl AppView {
                 match result {
                     Ok(()) => {
                         window.push_notification(
-                            Notification::success("Docker 已安装；正在重新测试连接"),
+                            Notification::success("Docker 与镜像源已配置；正在重新测试连接"),
                             app,
                         );
-                        let _ = view.update(app, |view, cx| view.test_host(id, window, cx));
                     }
                     Err(error) => window.push_notification(Notification::error(error), app),
                 }
+                let _ = view.update(app, |view, cx| view.test_host(id, window, cx));
             });
         })
         .detach();
@@ -5155,7 +5224,7 @@ impl AppView {
                 .footer(div().flex().justify_end().gap_2()
                     .child(Button::new("batch-resume-cancel").debug_selector(|| "batch-resume-cancel".into()).label("取消")
                         .on_click(|_, window, cx| window.close_dialog(cx)))
-                    .child(Button::new("batch-resume-confirm").primary().label("确认核对并续传")
+                    .child(Button::new("batch-resume-confirm").primary().debug_selector(|| "batch-resume-confirm".into()).label("确认核对并续传")
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let batch = batch.clone();
@@ -5311,13 +5380,17 @@ impl AppView {
             .find(|target| target.host.id == expected_host_id)
             .map(|target| target.host.name.clone())
             .unwrap_or_default();
+        let retrying = batch.targets.iter().any(|target| {
+            target.host.id == expected_host_id && !target.attempt_task_ids.is_empty()
+        });
+        let parallel = batch.parallelism > 1;
         let view = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, _| {
             let confirm_view = view.clone();
             let id = batch_id.clone();
-            dialog.title("确认继续下一台主机").w(px(560.))
+            dialog.title(if parallel { "确认继续下一波目标" } else if retrying { "确认继续重试当前主机" } else { "确认继续下一台主机" }).w(px(560.))
                 .child(div().flex().flex_col().gap_3()
-                    .child(format!("下一台：{host_name}。此前已健康的主机不会重建或回滚。"))
+                    .child(format!("首个目标：{host_name}。此前已健康的主机不会重建或回滚。"))
                     .child("将重新核对 YAML、逐主机环境、共享归档、可信 SSH 与 Docker daemon；然后上传镜像、启动完整 Compose 栈并核实全部服务。若出现失败或未知结果会暂停，不自动推进。"))
                 .footer(div().flex().justify_end().gap_2()
                     .child(Button::new("batch-continue-cancel")
@@ -5336,10 +5409,11 @@ impl AppView {
         });
     }
 
-    fn start_continue_batch(
+    fn confirm_retry_batch(
         &mut self,
         batch_id: String,
         expected_host_id: i64,
+        expected_task_id: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -5355,14 +5429,88 @@ impl AppView {
         else {
             return;
         };
-        let next = next_confirmed_batch_host(batch);
-        if self.deploy_run_busy
-            || next != Some(expected_host_id)
-            || !self.batch_resolving.insert(batch_id.clone())
+        if retryable_batch_target(batch) != Some((expected_host_id, expected_task_id.clone()))
+            || self.batch_resolving.contains(&batch_id)
+            || self.deploy_run_busy
         {
             return;
         }
+        let host_name = batch
+            .targets
+            .iter()
+            .find(|target| target.host.id == expected_host_id)
+            .map(|target| target.host.name.clone())
+            .unwrap_or_default();
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm_view = view.clone();
+            let id = batch_id.clone();
+            let task_id = expected_task_id.clone();
+            dialog.title("确认重试失败主机").w(px(560.))
+                .child(div().flex().flex_col().gap_3()
+                    .child(format!("目标：{host_name}。旧失败任务将保留在本批次历史中。"))
+                    .child("将重新核对 YAML、环境、归档、可信主机与 Docker daemon，并确认该项目在目标主机没有容器。核对通过后才创建新任务；结果不明时仍会阻断。"))
+                .footer(div().flex().justify_end().gap_2()
+                    .child(Button::new("batch-retry-cancel")
+                        .debug_selector(|| "batch-retry-cancel".into()).label("取消")
+                        .on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("batch-retry-confirm")
+                        .debug_selector(|| "batch-retry-confirm".into())
+                        .primary().label("确认重试")
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let id = id.clone();
+                            let task_id = task_id.clone();
+                            let _ = confirm_view.update(cx, |view, cx| {
+                                view.start_batch_host(
+                                    id, expected_host_id, Some(task_id), window, cx,
+                                )
+                            });
+                        })))
+        });
+    }
+
+    fn start_continue_batch(
+        &mut self,
+        batch_id: String,
+        expected_host_id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_batch_host(batch_id, expected_host_id, None, window, cx);
+    }
+
+    fn start_batch_host(
+        &mut self,
+        batch_id: String,
+        expected_host_id: i64,
+        retry_task_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(batch) = self
+            .release_batches
+            .iter()
+            .chain(
+                self.release_project_batches
+                    .values()
+                    .flat_map(|items| items.iter()),
+            )
+            .find(|batch| batch.id == batch_id)
+        else {
+            return;
+        };
+        let eligible = if let Some(task_id) = retry_task_id.as_deref() {
+            retryable_batch_target(batch)
+                .is_some_and(|(host_id, current)| host_id == expected_host_id && current == task_id)
+        } else {
+            next_confirmed_batch_host(batch) == Some(expected_host_id)
+        };
+        if self.deploy_run_busy || !eligible || !self.batch_resolving.insert(batch_id.clone()) {
+            return;
+        }
         let project_id = batch.project_id;
+        let parallelism = batch.parallelism;
         self.batch_operation_stage
             .insert(batch_id.clone(), "重新确认批次目标…".into());
         let stage = Arc::new(Mutex::new(String::new()));
@@ -5375,22 +5523,43 @@ impl AppView {
                 .background_executor()
                 .spawn(async move {
                     let cancel = Arc::new(AtomicBool::new(false));
-                    let confirmed = stack_release::reconfirm_batch(&run_id, cancel.clone())
-                        .map_err(|message| stack_release::BatchRunError {
-                            batch_id: Some(run_id.clone()),
-                            message,
-                        })?;
-                    stack_release::continue_batch_sequential(
-                        &run_id,
-                        Some(expected_host_id),
-                        &confirmed,
-                        cancel,
-                        |event| {
-                            *worker_stage
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = event.into();
-                        },
-                    )
+                    let mut report = |event: &str| {
+                        *worker_stage
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = event.into();
+                    };
+                    if let Some(task_id) = retry_task_id {
+                        stack_release::retry_failed_batch_sequential(
+                            &run_id,
+                            expected_host_id,
+                            &task_id,
+                            cancel,
+                            &mut report,
+                        )
+                    } else {
+                        let confirmed = stack_release::reconfirm_batch(&run_id, cancel.clone())
+                            .map_err(|message| stack_release::BatchRunError {
+                                batch_id: Some(run_id.clone()),
+                                message,
+                            })?;
+                        if parallelism == 1 {
+                            stack_release::continue_batch_sequential(
+                                &run_id,
+                                Some(expected_host_id),
+                                &confirmed,
+                                cancel,
+                                report,
+                            )
+                        } else {
+                            stack_release::continue_batch_parallel(
+                                &run_id,
+                                Some(expected_host_id),
+                                &confirmed,
+                                cancel,
+                                report,
+                            )
+                        }
+                    }
                 })
                 .await;
             let _ = cx.update(|window, app| {
@@ -5404,7 +5573,11 @@ impl AppView {
                 window.push_notification(
                     match result {
                         Ok(stack_release::BatchProgress::AwaitingConfirmation { .. }) => {
-                            Notification::success("当前主机健康检查通过；请人工确认后再继续")
+                            Notification::success(if parallelism > 1 {
+                                "本波目标已执行；请在历史页逐台核实并确认"
+                            } else {
+                                "当前主机健康检查通过；请人工确认后再继续"
+                            })
                         }
                         Ok(stack_release::BatchProgress::Complete { .. }) => {
                             Notification::success("批次全部目标已处理完毕")
@@ -5554,7 +5727,9 @@ impl AppView {
                 .footer(div().flex().justify_end().gap_2()
                     .child(Button::new("release-absence-cancel").label("取消")
                         .on_click(|_, window, cx| window.close_dialog(cx)))
-                    .child(Button::new("release-absence-confirm").danger().label("确认无容器并关闭")
+                    .child(Button::new("release-absence-confirm")
+                        .debug_selector(|| "release-absence-confirm-button".into())
+                        .danger().label("确认无容器并关闭")
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let id = task_id.clone();
@@ -6148,6 +6323,80 @@ impl AppView {
         batches.iter().find(|batch| batch.id == batch_id)
     }
 
+    fn open_batch_task_detail(
+        &mut self,
+        source_project_id: Option<i64>,
+        batch_id: &str,
+        host_id: i64,
+        task_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(batch) = self.history_batch(source_project_id, batch_id) else {
+            return;
+        };
+        let project_id = batch.project_id;
+        let Some(target) = batch
+            .targets
+            .iter()
+            .find(|target| target.host.id == host_id)
+        else {
+            return;
+        };
+        if target.release_task_id.as_deref() != Some(task_id)
+            && !target.attempt_task_ids.iter().any(|id| id == task_id)
+        {
+            return;
+        }
+        let task_id = task_id.to_owned();
+        if self.release_history_selected.as_deref() == Some(task_id.as_str()) {
+            self.release_history_loading_task = None;
+            self.release_history_load_error = None;
+            self.release_history_selected = None;
+            cx.notify();
+            return;
+        }
+        let listed = match source_project_id {
+            Some(id) => self.release_project_tasks.get(&id).map(Vec::as_slice),
+            None => Some(self.release_tasks.as_slice()),
+        };
+        if listed.is_some_and(|tasks| tasks.iter().any(|task| task.id == task_id)) {
+            self.release_history_loading_task = None;
+            self.release_history_selected = Some(task_id);
+            self.release_history_load_error = None;
+            cx.notify();
+            return;
+        }
+        self.release_history_loading_task = Some(task_id.clone());
+        self.release_history_load_error = None;
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let lookup_id = task_id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { release_store::get_task(&lookup_id) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if view.release_history_loading_task.as_deref() != Some(task_id.as_str()) {
+                    return;
+                }
+                view.release_history_loading_task = None;
+                match result {
+                    Ok(task) if task.project_id == project_id && task.host.id == host_id => {
+                        view.release_history_selected = Some(task_id);
+                        view.release_history_loaded_task = Some(task);
+                    }
+                    Ok(_) => {
+                        view.release_history_load_error =
+                            Some("批次目标与发布任务身份不一致。".into())
+                    }
+                    Err(error) => view.release_history_load_error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn confirm_batch_resolution(
         &mut self,
         project_id: Option<i64>,
@@ -6347,6 +6596,11 @@ impl AppView {
             } else {
                 next_confirmed_batch_host(batch)
             };
+            let retry_target = if resolving || self.deploy_run_busy {
+                None
+            } else {
+                retryable_batch_target(batch)
+            };
             let unresolved = batch.targets.iter().any(|target| {
                 matches!(target.state.as_str(), "running" | "unknown")
                     || matches!(
@@ -6445,9 +6699,14 @@ impl AppView {
                     && target.state == "failed"
                     && target.release_task_id.is_some()
                     && target.task_outcome.as_deref() == Some("failed");
+                let retry_task_id = retry_target.as_ref().and_then(|(host_id, task_id)| {
+                    (*host_id == target.host.id).then(|| task_id.clone())
+                });
                 let batch_id = batch.id.clone();
+                let retry_batch_id = batch_id.clone();
                 let host_id = target.host.id;
-                let task_id = task.map(|task| task.id.clone());
+                let task_id = target.release_task_id.clone();
+                let has_task_id = task_id.is_some();
                 table = table.child(
                     div()
                         .min_h(px(42.))
@@ -6497,17 +6756,48 @@ impl AppView {
                                 .flex_wrap()
                                 .gap_2()
                                 .when_some(task_id, |actions, task_id| {
+                                    let batch_id = batch_id.clone();
+                                    let loading = self.release_history_loading_task.as_deref()
+                                        == Some(task_id.as_str());
                                     actions.child(
                                         Button::new(format!("batch-task-{task_id}"))
                                             .debug_selector(|| "batch-task-detail-button".into())
-                                            .label("查看任务详情")
+                                            .label(if loading {
+                                                "读取中…"
+                                            } else {
+                                                "查看任务详情"
+                                            })
+                                            .disabled(loading)
                                             .on_click(cx.listener(move |view, _, _, cx| {
-                                                view.release_history_selected =
-                                                    Some(task_id.clone());
-                                                cx.notify();
+                                                view.open_batch_task_detail(
+                                                    project_id, &batch_id, host_id, &task_id, cx,
+                                                );
                                             })),
                                     )
                                 })
+                                .children(target.attempt_task_ids.iter().enumerate().filter_map(
+                                    |(attempt, old_id)| {
+                                        if target.release_task_id.as_deref() == Some(old_id) {
+                                            return None;
+                                        }
+                                        let old_id = old_id.clone();
+                                        let lookup_id = old_id.clone();
+                                        let batch_id = batch.id.clone();
+                                        Some(
+                                            Button::new(format!("batch-attempt-{old_id}"))
+                                                .debug_selector(|| {
+                                                    "batch-attempt-detail-button".into()
+                                                })
+                                                .label(format!("第 {} 次详情", attempt + 1))
+                                                .on_click(cx.listener(move |view, _, _, cx| {
+                                                    view.open_batch_task_detail(
+                                                        project_id, &batch_id, host_id, &lookup_id,
+                                                        cx,
+                                                    );
+                                                })),
+                                        )
+                                    },
+                                ))
                                 .when(can_skip, |actions| {
                                     actions.child(
                                         Button::new(format!("batch-skip-{batch_id}-{host_id}"))
@@ -6524,7 +6814,27 @@ impl AppView {
                                             })),
                                     )
                                 })
-                                .when(task.is_none(), |actions| actions.child("—")),
+                                .when_some(retry_task_id, |actions, retry_task_id| {
+                                    actions.child(
+                                        Button::new(format!(
+                                            "batch-retry-{retry_batch_id}-{host_id}"
+                                        ))
+                                        .debug_selector(|| "batch-retry-button".into())
+                                        .label("重试失败主机")
+                                        .on_click(
+                                            cx.listener(move |view, _, window, cx| {
+                                                view.confirm_retry_batch(
+                                                    retry_batch_id.clone(),
+                                                    host_id,
+                                                    retry_task_id.clone(),
+                                                    window,
+                                                    cx,
+                                                )
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .when(!has_task_id, |actions| actions.child("—")),
                         ),
                 );
             }
@@ -6545,14 +6855,17 @@ impl AppView {
                             "批次 {} · {project_name} · {}",
                             batch.id.chars().take(8).collect::<String>(), batch.created_at)))
                         .child(div().text_color(self.palette().muted).child(format!(
-                            "健康 {healthy}/{} · 待核实 {unknown} · 未开始 {waiting} · 共享镜像 {} 份",
-                            batch.targets.len(), batch.images.len())))
+                            "健康 {healthy}/{} · 待核实 {unknown} · 未开始 {waiting} · 并行度 {} · 共享镜像 {} 份",
+                            batch.targets.len(), batch.parallelism, batch.images.len())))
                         .when(next_host_id.is_some(), |el| {
                             let host_id = next_host_id.unwrap_or_default();
                             let batch_id = batch.id.clone();
+                            let retrying = batch.targets.iter().any(|target| {
+                                target.host.id == host_id && !target.attempt_task_ids.is_empty()
+                            });
                             el.child(Button::new(format!("batch-continue-{batch_id}"))
                                 .debug_selector(|| "batch-continue-button".into())
-                                .primary().label("继续下一台")
+                                .primary().label(if batch.parallelism > 1 { "继续下一波" } else if retrying { "继续重试当前主机" } else { "继续下一台" })
                                 .on_click(cx.listener(move |view, _, window, cx| {
                                     view.confirm_continue_batch(batch_id.clone(), host_id, window, cx)
                                 })))
@@ -6573,6 +6886,7 @@ impl AppView {
                         .child(format!("批次操作中：{stage}")))
                 })
                 .child(div().id(format!("batch-history-scroll-{}", batch.id))
+                    .debug_selector(|| "batch-history-scroll".into())
                     .overflow_x_scroll().child(table)));
         }
         content.into_any_element()
@@ -6740,6 +7054,13 @@ impl AppView {
                     .child(error.clone()),
             );
         }
+        if let Some(error) = &self.release_history_load_error {
+            rows = rows.child(
+                div()
+                    .text_color(self.palette().destructive)
+                    .child(format!("任务详情读取失败：{error}")),
+            );
+        }
         let tasks = match project_id {
             Some(id) => self
                 .release_project_tasks
@@ -6750,6 +7071,17 @@ impl AppView {
         };
         rows = rows.child(self.batch_history_rows(project_id, tasks, cx));
         if tasks.is_empty() {
+            let batches = match project_id {
+                Some(id) => self.release_project_batches.get(&id).map(Vec::as_slice),
+                None => Some(self.release_batches.as_slice()),
+            }
+            .unwrap_or(&[]);
+            let has_batch_task = batches.iter().any(|batch| {
+                batch
+                    .targets
+                    .iter()
+                    .any(|target| target.release_task_id.is_some())
+            });
             rows = rows.child(div().text_color(self.palette().muted).child(
                 if project_id.is_some_and(|id| self.release_project_loading.contains(&id))
                     || (project_id.is_none() && self.release_tasks_loading)
@@ -6757,11 +7089,9 @@ impl AppView {
                     "正在读取任务…"
                 } else if error.is_some() {
                     "历史读取失败，请重试"
-                } else if project_id.map_or(!self.release_batches.is_empty(), |id| {
-                    self.release_project_batches
-                        .get(&id)
-                        .is_some_and(|batches| !batches.is_empty())
-                }) {
+                } else if has_batch_task {
+                    "最近任务列表为空；可从批次目标查看已保存任务"
+                } else if !batches.is_empty() {
                     "批次尚无逐主机发布任务"
                 } else {
                     "暂无发布任务；版本回滚历史尚未接入"
@@ -6870,6 +7200,8 @@ impl AppView {
                                     .on_click(cx.listener({
                                         let id = task.id.clone();
                                         move |view, _, _, cx| {
+                                            view.release_history_loading_task = None;
+                                            view.release_history_load_error = None;
                                             view.release_history_selected =
                                                 if view.release_history_selected.as_deref()
                                                     == Some(&id)
@@ -6913,7 +7245,12 @@ impl AppView {
                     .child(table),
             );
         }
-        for (index, task) in tasks.iter().enumerate() {
+        let loaded_task = self.release_history_loaded_task.iter().filter(|task| {
+            self.release_history_selected.as_deref() == Some(task.id.as_str())
+                && project_id.is_none_or(|id| id == task.project_id)
+                && !tasks.iter().any(|listed| listed.id == task.id)
+        });
+        for (index, task) in tasks.iter().chain(loaded_task).enumerate() {
             if self.release_history_selected.as_deref() != Some(task.id.as_str()) {
                 continue;
             }
@@ -6994,6 +7331,7 @@ impl AppView {
                     div()
                         .border_1()
                         .border_color(self.palette().border)
+                        .debug_selector(|| "release-task-detail-card".into())
                         .rounded_md()
                         .p_4()
                         .flex()
@@ -7108,6 +7446,7 @@ impl AppView {
                                 .gap_2()
                                 .child(
                                     Button::new(("release-inspect", index))
+                                        .debug_selector(|| "release-inspect-button".into())
                                         .label(if checking {
                                             "核实中…"
                                         } else {
@@ -7184,6 +7523,7 @@ impl AppView {
                                 .when(absent && eligible, |row| {
                                     row.child(
                                         Button::new(("release-confirm-absence", index))
+                                            .debug_selector(|| "release-confirm-absence-button".into())
                                             .danger()
                                             .label(if resolving {
                                                 "处理中…"
@@ -7879,7 +8219,7 @@ impl AppView {
             && ids.len() > 1
             && project.host_ids == ids
             && self.deploy_project_id == Some(project.id)
-            && self.deploy_parallel == 1
+            && (1..=ids.len().min(32)).contains(&self.deploy_parallel)
             && !self.deploy_run_busy
             && self.batch_resolving.is_empty()
             && self.rollback_running.is_none()
@@ -7915,29 +8255,32 @@ impl AppView {
         let Some(Ok(snapshot)) = &self.deploy_batch_check else {
             return;
         };
-        let snapshot = snapshot.clone();
-        let generation = self.deploy_batch_check_generation;
-        let project_id = project.id;
+        let confirmation = BatchStartConfirmation {
+            project_id: project.id,
+            tag: self.deploy_tag.read(cx).value().to_string(),
+            generation: self.deploy_batch_check_generation,
+            parallelism: self.deploy_parallel,
+            snapshot: snapshot.clone(),
+        };
         let name = project.name.clone();
-        let tag = self.deploy_tag.read(cx).value().to_string();
-        let targets = snapshot
+        let targets = confirmation
+            .snapshot
             .targets
             .iter()
             .map(|target| target.host.name.clone())
             .collect::<Vec<_>>()
             .join(" → ");
-        let images = snapshot.plan.builds.len();
+        let images = confirmation.snapshot.plan.builds.len();
+        let parallelism = confirmation.parallelism;
         let view = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, _| {
             let confirm_view = view.clone();
-            let snapshot = snapshot.clone();
-            let tag = tag.clone();
+            let confirmation = confirmation.clone();
             dialog.title("确认多主机批次发布").w(px(560.))
                 .child(div().flex().flex_col().gap_3()
-                    .child(format!("项目：{name} · 发布标识：{tag}"))
-                    .child(format!("顺序：{targets} · 共享镜像 {images} 份"))
-                    .child("当前并行度为 1。执行前将重新核对完整预检快照；只构建一次共享镜像，再依次处理目标。")
-                    .child("第一台全部服务健康后会暂停，须到历史页人工核实并确认，才可显式继续下一台。失败或结果未知不会自动重试或回滚。"))
+                    .child(format!("项目：{name} · 发布标识：{}", confirmation.tag))
+                    .child(format!("目标：{targets} · 并行度 {parallelism} · 共享镜像 {images} 份"))
+                    .child("执行前会重新核对完整预检快照；每波目标同时部署，全部健康并逐一确认后才能继续下一波。失败或结果未知不会自动重试或回滚。"))
                 .footer(div().flex().justify_end().gap_2()
                     .child(Button::new("batch-start-cancel").debug_selector(|| "batch-start-cancel".into())
                         .label("取消").on_click(|_, window, cx| window.close_dialog(cx)))
@@ -7946,7 +8289,7 @@ impl AppView {
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let _ = confirm_view.update(cx, |view, cx| {
-                                view.start_batch_deploy(project_id, &tag, generation, snapshot.clone(), window, cx)
+                                view.start_batch_deploy(confirmation.clone(), window, cx)
                             });
                         })))
         });
@@ -7954,19 +8297,24 @@ impl AppView {
 
     fn start_batch_deploy(
         &mut self,
-        project_id: i64,
-        tag: &str,
-        generation: u64,
-        snapshot: Arc<stack_release::BatchPreflight>,
+        confirmation: BatchStartConfirmation,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let BatchStartConfirmation {
+            project_id,
+            tag,
+            generation,
+            parallelism,
+            snapshot,
+        } = confirmation;
         let Some(project) = self.projects.iter().find(|item| item.id == project_id) else {
             return;
         };
         if !self.batch_start_ready(project, &self.deploy_host_ids)
             || self.deploy_batch_check_generation != generation
-            || self.deploy_tag.read(cx).value() != tag
+            || self.deploy_parallel != parallelism
+            || self.deploy_tag.read(cx).value() != tag.as_str()
             || !matches!(&self.deploy_batch_check, Some(Ok(current)) if Arc::ptr_eq(current, &snapshot))
         {
             window.push_notification(
@@ -7988,20 +8336,27 @@ impl AppView {
         let (tx, rx) = mpsc::channel::<BatchStartEvent>();
         cx.background_executor()
             .spawn(async move {
-                let result = stack_release::run_batch_sequential(
-                    project_id,
-                    &snapshot,
-                    Arc::new(AtomicBool::new(false)),
-                    |event| {
-                        if let Some((sent, total)) = transfer_progress(event) {
-                            let _ = tx.send(BatchStartEvent::Transfer { sent, total });
-                            return;
-                        }
-                        if let Some(stage) = safe_deploy_stage(event) {
-                            let _ = tx.send(BatchStartEvent::Stage(stage));
-                        }
-                    },
-                );
+                let mut report = |event: &str| {
+                    if let Some((sent, total)) = transfer_progress(event) {
+                        let _ = tx.send(BatchStartEvent::Transfer { sent, total });
+                        return;
+                    }
+                    if let Some(stage) = safe_deploy_stage(event) {
+                        let _ = tx.send(BatchStartEvent::Stage(stage));
+                    }
+                };
+                let cancel = Arc::new(AtomicBool::new(false));
+                let result = if parallelism == 1 {
+                    stack_release::run_batch_sequential(project_id, &snapshot, cancel, &mut report)
+                } else {
+                    stack_release::run_batch_parallel(
+                        project_id,
+                        &snapshot,
+                        parallelism,
+                        cancel,
+                        &mut report,
+                    )
+                };
                 let _ = tx.send(BatchStartEvent::Finished(result));
             })
             .detach();
@@ -8049,8 +8404,13 @@ impl AppView {
                                         batch_id,
                                         ..
                                     }) => Notification::success(format!(
-                                        "批次 {} 当前主机已健康；请在历史页人工确认",
-                                        &batch_id[..8]
+                                        "批次 {} {}",
+                                        &batch_id[..8],
+                                        if parallelism > 1 {
+                                            "本波目标已执行；请在历史页逐台核实并确认"
+                                        } else {
+                                            "当前主机已健康；请在历史页人工确认"
+                                        }
                                     )),
                                     Ok(stack_release::BatchProgress::Complete { batch_id }) => {
                                         Notification::success(format!(
@@ -8835,14 +9195,14 @@ impl AppView {
             && matches!(self.deploy_env_result, Some(Ok(())))
             && matches!(self.deploy_batch_plan, Some(Ok(_)))
             && matches!(self.deploy_tag_plan, Some(Ok(_)));
-        let parallel_options = ids.len().max(1);
+        let parallel_options = ids.len().clamp(1, 32);
         let parallel_selector = Popover::new("deploy-parallel-select")
             .trigger(
                 Button::new("deploy-parallel-trigger")
                     .h(px(36.))
                     .w_full()
                     .outline()
-                    .disabled(project.manifest_mode)
+                    .disabled(project.manifest_mode && !MULTI_HOST_START_ENABLED)
                     .label(format!("{}  ▾", self.deploy_parallel)),
             )
             .content(move |_, _, cx| {
