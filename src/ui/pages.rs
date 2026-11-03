@@ -7349,7 +7349,14 @@ impl AppView {
                         )))
                         .when_some(task.health_result.as_deref(), |row, health| {
                             let (label, color) = match health {
-                                "healthy" => ("发布时核实：全部健康（仍未解除阻断）", self.palette().success),
+                                "healthy" => (
+                                    if task.outcome == "complete" {
+                                        "发布时核实：全部健康（已确认完成）"
+                                    } else {
+                                        "发布时核实：全部健康（仍未解除阻断）"
+                                    },
+                                    self.palette().success,
+                                ),
                                 "running_unverified" => ("发布时核实：运行中，未验证就绪", self.palette().warning),
                                 _ => ("发布时核实：未健康", self.palette().destructive),
                             };
