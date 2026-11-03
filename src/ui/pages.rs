@@ -8280,7 +8280,7 @@ impl AppView {
                 .child(div().flex().flex_col().gap_3()
                     .child(format!("项目：{name} · 发布标识：{}", confirmation.tag))
                     .child(format!("目标：{targets} · 并行度 {parallelism} · 共享镜像 {images} 份"))
-                    .child("执行前会重新核对完整预检快照；每波目标同时部署，全部健康并逐一确认后才能继续下一波。失败或结果未知不会自动重试或回滚。"))
+                    .child("执行前会重新核对完整预检快照；每波目标同时部署。健康目标逐一确认，已核实失败目标显式跳过后，才能继续下一波；结果未知会阻断，不会自动重试或回滚。"))
                 .footer(div().flex().justify_end().gap_2()
                     .child(Button::new("batch-start-cancel").debug_selector(|| "batch-start-cancel".into())
                         .label("取消").on_click(|_, window, cx| window.close_dialog(cx)))
