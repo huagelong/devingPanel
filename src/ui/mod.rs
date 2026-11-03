@@ -3807,7 +3807,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    #[ignore = "one-shot GUI next-wave click and real third-host deployment in an isolated LAN batch"]
+    #[ignore = "one-shot GUI next-wave click, optionally after skipping an audited failed target"]
     fn isolated_gui_lan_three_host_next_wave(cx: &mut gpui_kit::TestAppContext) {
         use super::{AppView, DeployTab, Page};
         use gpui_kit::component::WindowExt as _;
@@ -3832,9 +3832,10 @@ mod tests {
                 .unwrap()
         );
         let batch_id = std::env::var("DEVINGPANEL_TEST_EXISTING_BATCH").unwrap();
+        let skip_failed = std::env::var("DEVINGPANEL_TEST_GUI_SKIP_FAILED").as_deref() == Ok("1");
         let batch = crate::batch_store::get(&batch_id).unwrap();
         assert!(batch.project_id > 1_000_000_000);
-        assert_eq!(batch.state, "running");
+        assert_eq!(batch.state, if skip_failed { "paused" } else { "running" });
         assert_eq!(batch.parallelism, 2);
         assert_eq!(batch.targets.len(), 3);
         assert_eq!(batch.targets[2].state, "waiting");
@@ -3858,7 +3859,14 @@ mod tests {
             ids.sort();
             baseline.push(ids);
             if index < 2 {
-                assert_eq!(target.state, "healthy");
+                assert_eq!(
+                    target.state,
+                    if skip_failed && index == 1 {
+                        "failed"
+                    } else {
+                        "healthy"
+                    }
+                );
                 let task = crate::release_store::get_task(target.release_task_id.as_ref().unwrap())
                     .unwrap();
                 assert_eq!(
@@ -3867,7 +3875,11 @@ mod tests {
                         task.outcome.as_str(),
                         task.health_result.as_deref()
                     ),
-                    ("checked", "complete", Some("healthy"))
+                    if skip_failed && index == 1 {
+                        ("built", "failed", None)
+                    } else {
+                        ("checked", "complete", Some("healthy"))
+                    }
                 );
                 tasks.push(task);
             }
@@ -3880,7 +3892,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(pointers, 2);
+        assert_eq!(pointers, if skip_failed { 1 } else { 2 });
         cx.update(gpui_kit::init);
         let (handle, entity) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -3905,6 +3917,48 @@ mod tests {
         visual.simulate_resize(size(px(1700.), px(1200.)));
         cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
+        if skip_failed {
+            assert!(visual.debug_bounds("batch-continue-button").is_none());
+            let skip = visual.debug_bounds("batch-skip-button").unwrap();
+            visual.simulate_click(skip.center(), Modifiers::default());
+            cx.update_window(handle, |_, window, cx| {
+                assert!(window.has_active_dialog(cx));
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(350));
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            let confirm = visual.debug_bounds("batch-resolution-confirm").unwrap();
+            visual.simulate_click(confirm.center(), Modifiers::default());
+            let started = std::time::Instant::now();
+            loop {
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(200));
+                cx.run_until_parked();
+                let current = crate::batch_store::get(&batch_id).unwrap();
+                if current.state == "running"
+                    && current.targets[1].state == "skipped"
+                    && cx.read(|app| {
+                        entity
+                            .read(app)
+                            .history_batch(None, &batch_id)
+                            .is_some_and(|shown| {
+                                shown.state == "running" && shown.targets[1].state == "skipped"
+                            })
+                    })
+                {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(30),
+                    "GUI skip did not settle"
+                );
+            }
+            cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+        }
         let button = visual.debug_bounds("batch-continue-button").unwrap();
         visual.simulate_click(button.center(), Modifiers::default());
         cx.update_window(handle, |_, window, cx| {
@@ -3992,6 +4046,18 @@ mod tests {
             crate::batch_store::get(&batch_id).unwrap().state,
             "complete"
         );
+        if skip_failed {
+            let finished = crate::batch_store::get(&batch_id).unwrap();
+            assert_eq!(finished.targets[1].state, "skipped");
+            assert_eq!(
+                crate::release_store::get_task(
+                    finished.targets[1].release_task_id.as_ref().unwrap()
+                )
+                .unwrap()
+                .outcome,
+                "failed"
+            );
+        }
         eprintln!("LAN GUI next wave complete: batch={batch_id}, task={third_id}");
     }
 

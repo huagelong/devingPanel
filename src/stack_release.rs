@@ -4624,6 +4624,94 @@ mod tests {
             ids.sort();
             baselines.push(ids);
         }
+        if std::env::var("DEVINGPANEL_TEST_PRETRANSFER_FAIL_SECOND").as_deref() == Ok("1") {
+            let batch_id = crate::batch_store::create_with_parallel(project.id, &plan, 2).unwrap();
+            crate::batch_store::begin_build(&batch_id).unwrap();
+            super::build_shared_images(project.id, &batch_id, &plan, cancel.clone(), |_| {})
+                .unwrap();
+            let guard = Arc::new(crate::release_materials::acquire_guard(project.id).unwrap());
+            let first = super::prepare_batch_host(
+                project.id,
+                &batch_id,
+                &plan,
+                0,
+                guard.clone(),
+                cancel.clone(),
+            )
+            .unwrap();
+            let failed =
+                super::prepare_batch_host(project.id, &batch_id, &plan, 1, guard, cancel.clone())
+                    .unwrap();
+            let failed_task = failed.task_id.clone();
+            assert!(
+                crate::ssh::observe_release_project(
+                    &crate::release_store::get_task(&failed_task).unwrap()
+                )
+                .unwrap()
+                .containers
+                .is_empty()
+            );
+            super::upload_batch_host_archives(&first, &batch_id, &plan, 0, cancel.clone(), |_| {})
+                .unwrap();
+            super::load_batch_host_archives(&first, &batch_id, &plan, 0, cancel.clone(), |_| {})
+                .unwrap();
+            let staged =
+                super::stage_batch_host_stack(&first, &batch_id, &plan, 0, cancel.clone(), |_| {})
+                    .unwrap();
+            let first_task = super::deploy_batch_host_stack(
+                &first,
+                &batch_id,
+                &plan,
+                0,
+                &staged,
+                cancel,
+                |_| {},
+            )
+            .unwrap();
+            drop(first);
+            drop(failed);
+            crate::batch_store::close_pretransfer(&failed_task).unwrap();
+            let paused = crate::batch_store::get(&batch_id).unwrap();
+            assert_eq!(paused.state, "paused");
+            assert_eq!(paused.targets[0].state, "running");
+            assert_eq!(paused.targets[1].state, "failed");
+            assert_eq!(paused.targets[2].state, "waiting");
+            assert!(paused.targets[2].release_task_id.is_none());
+            let task = crate::release_store::get_task(&first_task).unwrap();
+            assert_eq!(
+                (
+                    task.phase.as_str(),
+                    task.outcome.as_str(),
+                    task.health_result.as_deref()
+                ),
+                ("checked", "blocked", Some("healthy"))
+            );
+            assert_eq!(
+                crate::release::confirm_healthy_and_complete(&first_task).unwrap(),
+                4
+            );
+            let paused = crate::batch_store::get(&batch_id).unwrap();
+            assert_eq!(paused.targets[0].state, "healthy");
+            for (index, target) in paused.targets.iter().enumerate() {
+                let mut after = crate::ssh::inventory(target.host.id)
+                    .unwrap()
+                    .containers
+                    .into_iter()
+                    .map(|item| item.id)
+                    .collect::<Vec<_>>();
+                after.sort();
+                assert_eq!(
+                    after.len(),
+                    baselines[index].len() + if index == 0 { 4 } else { 0 }
+                );
+                assert!(baselines[index].iter().all(|id| after.contains(id)));
+            }
+            eprintln!(
+                "three-host pretransfer failure ready for GUI skip: project={}, batch={}, failed={}",
+                project.id, batch_id, failed_task
+            );
+            return;
+        }
         let batch_id =
             match super::run_batch_parallel(project.id, &plan, 2, cancel.clone(), |stage| {
                 eprintln!("first wave: {stage}")
