@@ -4512,6 +4512,262 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "one-shot parallel process crash on two trusted LAN VPS hosts; requires fresh parallel-crash APPDATA and test password"]
+    fn isolated_lan_parallel_crash_recovers_both_unknown() {
+        use std::io::{BufRead as _, Write as _};
+
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        let root = appdata.parent().unwrap();
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("parallel-crash-")
+        );
+        assert_eq!(
+            root.parent().unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .join("target/isolated-tests")
+                .canonicalize()
+                .unwrap()
+        );
+        if std::env::var("DEVINGPANEL_TEST_PARALLEL_CRASH_CHILD").as_deref() == Ok("1") {
+            let project_id: i64 = std::env::var("DEVINGPANEL_TEST_PARALLEL_PROJECT")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let tag = std::env::var("DEVINGPANEL_TEST_PARALLEL_TAG").unwrap();
+            let plan = preflight_batch(project_id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
+            let _ = super::run_batch_parallel(
+                project_id,
+                &plan,
+                2,
+                Arc::new(AtomicBool::new(false)),
+                |event| {
+                    if event.starts_with("传输镜像：") {
+                        println!("PARALLEL_UPLOAD_STARTED");
+                        std::io::stdout().flush().unwrap();
+                        loop {
+                            std::thread::park();
+                        }
+                    }
+                },
+            );
+            panic!("child must be terminated while both remote tasks are active");
+        }
+
+        assert!(std::fs::read_dir(&appdata).unwrap().next().is_none());
+        let password = std::env::var("DEVINGPANEL_TEST_LAN_PASSWORD").unwrap();
+        let fingerprint = "SHA256:+YD+qOVvzV7TP3DUXlFSIXadVdH8aNaUoeYLfEGcKE4";
+        let mut hosts = Vec::new();
+        for (name, address) in [
+            ("vps-smoke", "192.168.63.129"),
+            ("vps-second", "192.168.63.130"),
+        ] {
+            let host = crate::host_store::create(crate::host_store::NewHost {
+                name: name.into(),
+                address: address.into(),
+                port: "22".into(),
+                username: "root".into(),
+                group: "test".into(),
+                auth: "password".into(),
+                credential: password.clone(),
+            })
+            .unwrap();
+            crate::host_store::trust_fingerprint(host.id, address, 22, None, fingerprint).unwrap();
+            hosts.push(host.id);
+        }
+        drop(password);
+        let source = std::env::current_dir()
+            .unwrap()
+            .join("tests/fixtures/stack-v2-success");
+        let project_dir = root.join("project");
+        std::fs::create_dir(&project_dir).unwrap();
+        for file in [
+            "compose.yaml",
+            "Dockerfile.web",
+            "Dockerfile.worker",
+            "probe-web.txt",
+            "probe-worker.txt",
+        ] {
+            std::fs::copy(source.join(file), project_dir.join(file)).unwrap();
+        }
+        let yaml = std::fs::read_to_string(source.join("devingpanel.yaml")).unwrap();
+        std::fs::write(
+            project_dir.join("devingpanel.yaml"),
+            yaml.replace(
+                "name: stack-v2-success",
+                &format!("name: stack-v2-parallel-crash-{}", uuid::Uuid::new_v4().simple()),
+            ).replace(
+                "    - group: test\n      host: vps-smoke",
+                "    - group: test\n      host: vps-smoke\n    - group: test\n      host: vps-second",
+            ),
+        ).unwrap();
+        let reservation_id = chrono::Utc::now().timestamp_millis();
+        crate::database::connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO projects (id, name, path, dockerfile, image)
+             VALUES (?1, 'parallel-crash-id-reservation', '.', 'Dockerfile', 'reservation')",
+                [reservation_id],
+            )
+            .unwrap();
+        let project = crate::project_store::create_from_manifest(&project_dir).unwrap();
+        assert!(project.id > 1_000_000_000);
+        assert_eq!(project.host_ids, hosts);
+        let tag = format!("parallelcrash{}", uuid::Uuid::new_v4().simple());
+        let plan = preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(plan.targets.len(), 2);
+        assert_eq!(
+            plan.targets[0].docker_daemon_id,
+            "882622c2-a12a-4ac3-99d4-c3ab389f2641"
+        );
+        assert_eq!(
+            plan.targets[1].docker_daemon_id,
+            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"
+        );
+        let mut baselines = Vec::new();
+        for target in &plan.targets {
+            let probe = crate::release_store::TaskSnapshot {
+                id: "namespace-probe".into(),
+                project_id: project.id,
+                project_name: project.name.clone(),
+                host: target.host.clone(),
+                docker_endpoint: Some(target.docker_endpoint.clone()),
+                docker_daemon_id: Some(target.docker_daemon_id.clone()),
+                phase: "prepared".into(),
+                outcome: "running".into(),
+                health_result: None,
+                detail: String::new(),
+                started_at: String::new(),
+                execution_finished_at: None,
+                image_reference: plan.plan.builds[0].reference.clone(),
+            };
+            crate::ssh::assert_empty_project_namespace(&probe).unwrap();
+            let inventory = crate::ssh::inventory(target.host.id).unwrap();
+            for image in ["redis:7-alpine", "postgres:16-alpine"] {
+                assert!(inventory.images.iter().any(|item| item.reference == image));
+            }
+            let mut ids = inventory
+                .containers
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            baselines.push(ids);
+        }
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("stack_release::tests::isolated_lan_parallel_crash_recovers_both_unknown")
+            .args(["--ignored", "--exact", "--nocapture"])
+            .env("DEVINGPANEL_TEST_PARALLEL_CRASH_CHILD", "1")
+            .env("DEVINGPANEL_TEST_PARALLEL_PROJECT", project.id.to_string())
+            .env("DEVINGPANEL_TEST_PARALLEL_TAG", &tag)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = KillOnDrop(child);
+        let mut reached_upload = false;
+        for line in std::io::BufReader::new(child.0.stdout.take().unwrap()).lines() {
+            let line = line.unwrap();
+            if line.contains("PARALLEL_UPLOAD_STARTED") {
+                reached_upload = true;
+                break;
+            }
+        }
+        assert!(reached_upload, "parallel child exited before remote upload");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let batch = loop {
+            let batches = crate::batch_store::recent(Some(project.id)).unwrap();
+            if let Some(batch) = batches.into_iter().next() {
+                let both_remote = batch.targets.len() == 2
+                    && batch.targets.iter().all(|target| {
+                        target.state == "running"
+                            && target.release_task_id.as_deref().is_some_and(|id| {
+                                crate::release_store::get_task(id).is_ok_and(|task| {
+                                    task.outcome == "running"
+                                        && matches!(
+                                            task.phase.as_str(),
+                                            "uploading"
+                                                | "uploaded"
+                                                | "loading"
+                                                | "loaded"
+                                                | "awaiting_deployment"
+                                                | "staging"
+                                                | "staged"
+                                                | "validating"
+                                                | "validated"
+                                                | "deploying"
+                                                | "checking"
+                                        )
+                                })
+                            })
+                    });
+                if both_remote {
+                    break batch;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "both targets did not reach remote execution before crash"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        };
+        assert_eq!(batch.parallelism, 2);
+        assert!(crate::release_materials::acquire_guard(project.id).is_err());
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert_eq!(
+            crate::release_materials::recover_interrupted_batches().unwrap(),
+            1
+        );
+        assert_eq!(
+            crate::release_materials::recover_interrupted_batches().unwrap(),
+            0
+        );
+        let recovered = crate::batch_store::get(&batch.id).unwrap();
+        assert_eq!(recovered.state, "unknown");
+        for target in &recovered.targets {
+            assert_eq!(target.state, "unknown");
+            let task =
+                crate::release_store::get_task(target.release_task_id.as_ref().unwrap()).unwrap();
+            assert_eq!(task.outcome, "unknown");
+        }
+        let conn = crate::database::connect().unwrap();
+        let pointers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_current_version WHERE project_id = ?1",
+                [project.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pointers, 0);
+        for (index, target) in recovered.targets.iter().enumerate() {
+            let inventory = crate::ssh::inventory(target.host.id).unwrap();
+            let mut ids = inventory
+                .containers
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            assert_eq!(ids, baselines[index]);
+        }
+        eprintln!(
+            "parallel LAN crash recovered unknown: project={}, batch={}",
+            project.id, batch.id
+        );
+    }
+
     fn audit_completed_lan_batch(batch_id: &str, previous_id: &str) {
         let batch = crate::batch_store::get(batch_id).unwrap();
         let previous = crate::batch_store::get(previous_id).unwrap();
