@@ -2570,6 +2570,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!(active, 2);
+        conn.execute(
+            "UPDATE release_tasks SET phase = 'checked', outcome = 'complete',
+             health_result = 'healthy' WHERE id = ?1",
+            [&first.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE release_tasks SET phase = 'checked', outcome = 'failed',
+             health_result = 'failed' WHERE id = ?1",
+            [&second.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE release_batch_targets SET state = 'healthy' WHERE release_task_id = ?1",
+            [&first.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE release_batch_targets SET state = 'failed' WHERE release_task_id = ?1",
+            [&second.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE release_batches SET state = 'paused' WHERE id = 'parallel'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE release_materials SET state = 'ready' WHERE task_id IN (?1, ?2)",
+            rusqlite::params![first.id, second.id],
+        )
+        .unwrap();
+        assert!(create_with_batch_in(&conn, &third, Some("parallel"), Some(&digest)).is_err());
+        crate::batch_store::skip_failed_in(&conn, "parallel", second.host.id).unwrap();
+        create_with_batch_in(&conn, &third, Some("parallel"), Some(&digest)).unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM release_batches WHERE id = 'parallel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "running");
+        let targets = conn
+            .prepare(
+                "SELECT state, release_task_id FROM release_batch_targets
+                 WHERE batch_id = 'parallel' ORDER BY ordinal",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(targets[0], ("healthy".into(), Some(first.id)));
+        assert_eq!(targets[1], ("skipped".into(), Some(second.id)));
+        assert_eq!(targets[2], ("running".into(), Some(third.id)));
     }
 
     #[test]
