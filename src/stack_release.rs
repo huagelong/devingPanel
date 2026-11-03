@@ -4677,15 +4677,20 @@ mod tests {
             }
         }
         let mut child = KillOnDrop(child);
-        let mut reached_upload = false;
-        for line in std::io::BufReader::new(child.0.stdout.take().unwrap()).lines() {
-            let line = line.unwrap();
-            if line.contains("PARALLEL_UPLOAD_STARTED") {
-                reached_upload = true;
-                break;
-            }
-        }
-        assert!(reached_upload, "parallel child exited before remote upload");
+        let stdout = child.0.stdout.take().unwrap();
+        let (started, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let reached_upload = std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+                .any(|line| line.contains("PARALLEL_UPLOAD_STARTED"));
+            let _ = started.send(reached_upload);
+        });
+        assert_eq!(
+            received.recv_timeout(std::time::Duration::from_secs(120)),
+            Ok(true),
+            "parallel child did not reach remote upload"
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
         let batch = loop {
             let batches = crate::batch_store::recent(Some(project.id)).unwrap();
@@ -4695,21 +4700,7 @@ mod tests {
                         target.state == "running"
                             && target.release_task_id.as_deref().is_some_and(|id| {
                                 crate::release_store::get_task(id).is_ok_and(|task| {
-                                    task.outcome == "running"
-                                        && matches!(
-                                            task.phase.as_str(),
-                                            "uploading"
-                                                | "uploaded"
-                                                | "loading"
-                                                | "loaded"
-                                                | "awaiting_deployment"
-                                                | "staging"
-                                                | "staged"
-                                                | "validating"
-                                                | "validated"
-                                                | "deploying"
-                                                | "checking"
-                                        )
+                                    task.outcome == "running" && task.phase == "uploading"
                                 })
                             })
                     });
