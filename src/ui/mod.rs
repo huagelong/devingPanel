@@ -2096,8 +2096,8 @@ mod tests {
 
         let failed_batch_id = uuid::Uuid::new_v4().to_string();
         conn.execute(
-            "INSERT INTO release_batches (id, project_id, config_sha256, state)
-             VALUES (?1, ?2, ?3, 'paused')",
+            "INSERT INTO release_batches (id, project_id, config_sha256, parallelism, state)
+             VALUES (?1, ?2, ?3, 2, 'paused')",
             rusqlite::params![failed_batch_id, project.id, "b".repeat(64)],
         )
         .unwrap();
@@ -2182,6 +2182,7 @@ mod tests {
             .unwrap();
         assert_eq!(count, 2);
         let skip = test_window.debug_bounds("batch-skip-button").unwrap();
+        assert!(test_window.debug_bounds("batch-continue-button").is_none());
         test_window.simulate_click(skip.center(), Modifiers::default());
         cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
@@ -2230,6 +2231,22 @@ mod tests {
                         && batch.targets[2].state == "waiting"
                 })
         }));
+        cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let continue_button = test_window.debug_bounds("batch-continue-button").unwrap();
+        test_window.simulate_click(continue_button.center(), Modifiers::default());
+        cx.update_window(handle, |_, window, cx| {
+            assert!(window.has_active_dialog(cx));
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let cancel = test_window.debug_bounds("batch-continue-cancel").unwrap();
+        test_window.simulate_click(cancel.center(), Modifiers::default());
+        assert!(
+            crate::batch_store::get(&failed_batch_id).unwrap().targets[2]
+                .release_task_id
+                .is_none()
+        );
         cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
         let terminate = test_window.debug_bounds("batch-terminate-button").unwrap();
