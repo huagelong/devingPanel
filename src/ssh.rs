@@ -1410,7 +1410,7 @@ fn docker_install_commands(source: DockerInstallSource) -> Vec<(&'static str, St
         ("验证 Docker 官方密钥", "gpg --batch --show-keys --with-colons /etc/apt/keyrings/devingpanel-docker.asc.tmp".into(), Duration::from_secs(15)),
         ("配置 Docker 软件源", format!("chmod 0644 /etc/apt/keyrings/devingpanel-docker.asc.tmp && mv /etc/apt/keyrings/devingpanel-docker.asc.tmp /etc/apt/keyrings/devingpanel-docker.asc && printf 'Types: deb\\nURIs: {url}\\nSuites: trixie\\nComponents: stable\\nArchitectures: amd64\\nSigned-By: /etc/apt/keyrings/devingpanel-docker.asc\\n' > /etc/apt/sources.list.d/devingpanel-docker.sources && printf 'Package: docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\\nPin: origin \"{host}\"\\nPin-Priority: 990\\n' > /etc/apt/preferences.d/devingpanel-docker.pref"), Duration::from_secs(15)),
         ("更新 Docker 软件源", "DEBIAN_FRONTEND=noninteractive apt-get -o APT::Update::Error-Mode=any update -qq > /dev/null".into(), Duration::from_secs(300)),
-        ("核对软件包来源", "apt-cache policy docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin".into(), Duration::from_secs(15)),
+        ("核对软件包来源", "LC_ALL=C apt-cache policy docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin".into(), Duration::from_secs(15)),
         ("安装 Docker Engine 与 Compose", "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin > /dev/null".into(), Duration::from_secs(900)),
         ("启动 Docker 服务", "systemctl enable --now docker > /dev/null".into(), Duration::from_secs(90)),
     ]
@@ -5475,6 +5475,7 @@ mod tests {
             );
             assert!(commands[4].1.contains(&format!("Pin: origin \"{host}\"")));
             assert!(commands[5].1.contains("APT::Update::Error-Mode=any"));
+            assert!(commands[6].1.starts_with("LC_ALL=C apt-cache policy"));
             assert!(commands[7].1.contains("--no-remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"));
             assert!(
                 !commands

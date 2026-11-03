@@ -3807,6 +3807,195 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    #[ignore = "one-shot GUI next-wave click and real third-host deployment in an isolated LAN batch"]
+    fn isolated_gui_lan_three_host_next_wave(cx: &mut gpui_kit::TestAppContext) {
+        use super::{AppView, DeployTab, Page};
+        use gpui_kit::component::WindowExt as _;
+        use gpui_kit::{AppContext as _, Modifiers, WindowOptions, px, size};
+
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        let root = appdata.parent().unwrap();
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("parallel-lan-three-")
+        );
+        assert_eq!(
+            root.parent().unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .join("target/isolated-tests")
+                .canonicalize()
+                .unwrap()
+        );
+        let batch_id = std::env::var("DEVINGPANEL_TEST_EXISTING_BATCH").unwrap();
+        let batch = crate::batch_store::get(&batch_id).unwrap();
+        assert!(batch.project_id > 1_000_000_000);
+        assert_eq!(batch.state, "running");
+        assert_eq!(batch.parallelism, 2);
+        assert_eq!(batch.targets.len(), 3);
+        assert_eq!(batch.targets[2].state, "waiting");
+        assert!(batch.targets[2].release_task_id.is_none());
+        let project = crate::project_store::effective(batch.project_id).unwrap();
+        assert!(
+            std::path::Path::new(&project.path)
+                .canonicalize()
+                .unwrap()
+                .starts_with(root)
+        );
+        let mut baseline = Vec::new();
+        let mut tasks = Vec::new();
+        for (index, target) in batch.targets.iter().enumerate() {
+            let mut ids = crate::ssh::inventory(target.host.id)
+                .unwrap()
+                .containers
+                .into_iter()
+                .map(|container| container.id)
+                .collect::<Vec<_>>();
+            ids.sort();
+            baseline.push(ids);
+            if index < 2 {
+                assert_eq!(target.state, "healthy");
+                let task = crate::release_store::get_task(target.release_task_id.as_ref().unwrap())
+                    .unwrap();
+                assert_eq!(
+                    (
+                        task.phase.as_str(),
+                        task.outcome.as_str(),
+                        task.health_result.as_deref()
+                    ),
+                    ("checked", "complete", Some("healthy"))
+                );
+                tasks.push(task);
+            }
+        }
+        let conn = crate::database::connect().unwrap();
+        let pointers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_current_version WHERE project_id = ?1",
+                [batch.project_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pointers, 2);
+        cx.update(gpui_kit::init);
+        let (handle, entity) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| AppView::new(window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            entity.update(cx, |view, cx| {
+                view.page = Page::Deploy;
+                view.deploy_tab = DeployTab::History;
+                view.release_tasks = tasks;
+                view.release_batches = vec![crate::batch_store::get(&batch_id).unwrap()];
+                view.release_tasks_loading = false;
+                view.release_history_selected = None;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        visual.simulate_resize(size(px(1700.), px(1200.)));
+        cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let button = visual.debug_bounds("batch-continue-button").unwrap();
+        visual.simulate_click(button.center(), Modifiers::default());
+        cx.update_window(handle, |_, window, cx| {
+            assert!(window.has_active_dialog(cx));
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let confirm = visual.debug_bounds("batch-continue-confirm").unwrap();
+        visual.simulate_click(confirm.center(), Modifiers::default());
+        cx.update_window(handle, |_, window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let started = std::time::Instant::now();
+        let third_id = loop {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(200));
+            cx.run_until_parked();
+            let current = crate::batch_store::get(&batch_id).unwrap();
+            assert_eq!(
+                current.state, "running",
+                "GUI continuation requires audit: {}",
+                current.state
+            );
+            if let Some(id) = &current.targets[2].release_task_id {
+                let task = crate::release_store::get_task(id).unwrap();
+                if task.phase == "checked" {
+                    break id.clone();
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(600),
+                "GUI next wave did not settle; audit batch {batch_id}"
+            );
+        };
+        let third = crate::release_store::get_task(&third_id).unwrap();
+        assert_eq!(
+            (third.outcome.as_str(), third.health_result.as_deref()),
+            ("blocked", Some("healthy"))
+        );
+        let refresh_started = std::time::Instant::now();
+        loop {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(200));
+            cx.run_until_parked();
+            if cx.read(|app| {
+                let view = entity.read(app);
+                !view.batch_resolving.contains(&batch_id)
+                    && view.release_batches.iter().any(|item| {
+                        item.id == batch_id
+                            && item.targets[2].release_task_id.as_deref() == Some(third_id.as_str())
+                    })
+            }) {
+                break;
+            }
+            assert!(
+                refresh_started.elapsed() < std::time::Duration::from_secs(30),
+                "GUI next-wave result was not refreshed"
+            );
+        }
+        for (index, target) in batch.targets.iter().enumerate() {
+            let mut after = crate::ssh::inventory(target.host.id)
+                .unwrap()
+                .containers
+                .into_iter()
+                .map(|container| container.id)
+                .collect::<Vec<_>>();
+            after.sort();
+            assert_eq!(
+                after.len(),
+                baseline[index].len() + if index == 2 { 4 } else { 0 }
+            );
+            assert!(baseline[index].iter().all(|id| after.contains(id)));
+        }
+        assert_eq!(
+            crate::release::confirm_healthy_and_complete(&third_id).unwrap(),
+            4
+        );
+        assert_eq!(
+            crate::batch_store::get(&batch_id).unwrap().state,
+            "complete"
+        );
+        eprintln!("LAN GUI next wave complete: batch={batch_id}, task={third_id}");
+    }
+
+    #[gpui_kit::test]
     #[ignore = "one-shot GUI health confirmation of the second host in an audited LAN batch"]
     fn isolated_gui_lan_existing_second_confirmation(cx: &mut gpui_kit::TestAppContext) {
         use super::{AppView, DeployTab, Page};
