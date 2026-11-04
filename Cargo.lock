@@ -1570,12 +1570,14 @@ dependencies = [
 
 [[package]]
 name = "deving-panel"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "embed-resource",
  "gpui-kit",
  "gpui-pre",
+ "image",
  "keyring",
  "rand 0.10.3",
  "rusqlite",
@@ -3677,6 +3679,7 @@ dependencies = [
  "qoi",
  "ravif",
  "rayon",
+ "rgb",
  "tiff",
  "zune-core 0.5.3",
  "zune-jpeg 0.5.15",

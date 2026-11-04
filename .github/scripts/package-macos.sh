@@ -18,6 +18,7 @@ trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/$app/Contents/MacOS" "$work/$app/Contents/Resources" dist
 cp target/release/deving-panel "$work/$app/Contents/MacOS/deving-panel"
 cp LICENSE "$work/$app/Contents/Resources/LICENSE"
+cp .github/packaging/deving-panel.icns "$work/$app/Contents/Resources/deving-panel.icns"
 cat > "$work/$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -26,6 +27,7 @@ cat > "$work/$app/Contents/Info.plist" <<EOF
   <key>CFBundleDisplayName</key><string>devingPanel</string>
   <key>CFBundleIdentifier</key><string>com.devingpanel.desktop</string>
   <key>CFBundleExecutable</key><string>deving-panel</string>
+  <key>CFBundleIconFile</key><string>deving-panel.icns</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>
   <key>CFBundleVersion</key><string>$version</string>

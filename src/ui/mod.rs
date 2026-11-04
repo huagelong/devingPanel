@@ -1114,17 +1114,7 @@ impl AppView {
                     .px_3()
                     .font_weight(FontWeight::BOLD)
                     .text_size(px(16.))
-                    .child(
-                        div()
-                            .size(px(28.))
-                            .rounded_md()
-                            .bg(self.palette().foreground)
-                            .text_color(self.palette().background)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(Icon::new(assets::IconName::SquareTerminal).size(px(17.))),
-                    )
+                    .child(svg().path("branding/deving-panel.svg").size(px(28.)))
                     .child("devingPanel"),
             )
             .child(links)

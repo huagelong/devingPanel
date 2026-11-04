@@ -171,6 +171,10 @@ SQLite v21 原先仅允许启动已确认后的 `checking/unknown`，或进程�
 
 macOS 的 `.app` 在制作 DMG 前使用 ad-hoc 签名并校验签名；未使用 Apple Developer ID，也未公证，首次运行可能需要用户在系统安全设置中确认。Windows 安装程序未进行代码签名。Linux `.deb` 面向 Ubuntu 24.04 的依赖命名；AppImage 由同版本 Ubuntu runner 收集动态库，其他 Linux 发行版的兼容性仍需实机验证。打包成功只证明构建和封装完成，不代替各平台 GUI、系统凭据库与 Docker/SSH 的运行验收。
 
+Windows 发布版可执行文件使用 GUI 子系统，安装版和 Portable 版启动时不显示命令行窗口；本地调试构建仍保留控制台输出。
+
+桌面客户端侧栏、Linux 桌面入口及各平台应用图标共用 `.github/packaging/deving-panel.svg` 的 `DP` 标识。Windows 可执行文件内嵌 ICO，macOS 应用包包含 ICNS，Linux 窗口使用 PNG；这些图标均由同一 SVG 生成。WebUI 原型保持原有样式。
+
 ## 本地运行
 
 先安装 Rust 1.95+ MSVC 工具链、Visual Studio C++ Build Tools（含 Windows SDK）及 CMake。其他平台的系统依赖见 [GPUI Kit 安装说明](https://gpui-kit.com/docs/installation)。
