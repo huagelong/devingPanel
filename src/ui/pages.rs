@@ -6846,48 +6846,128 @@ impl AppView {
                     || format!("项目 {}", batch.project_id),
                     |item| item.name.clone(),
                 );
-            content = content.child(div().border_1().border_color(self.palette().border)
-                .debug_selector(|| "batch-history-card".into())
-                .rounded_md().overflow_hidden()
-                .child(div().px_4().py_3().flex().flex_wrap().justify_between().gap_3()
-                    .child(div().flex().flex_col().items_start().gap_1()
-                        .child(div().font_family(mono_font()).child(format!(
-                            "批次 {} · {project_name} · {}",
-                            batch.id.chars().take(8).collect::<String>(), batch.created_at)))
-                        .child(div().text_color(self.palette().muted).child(format!(
-                            "健康 {healthy}/{} · 待核实 {unknown} · 未开始 {waiting} · 并行度 {} · 共享镜像 {} 份",
-                            batch.targets.len(), batch.parallelism, batch.images.len())))
-                        .when(next_host_id.is_some(), |el| {
-                            let host_id = next_host_id.unwrap_or_default();
-                            let batch_id = batch.id.clone();
-                            let retrying = batch.targets.iter().any(|target| {
-                                target.host.id == host_id && !target.attempt_task_ids.is_empty()
-                            });
-                            el.child(Button::new(format!("batch-continue-{batch_id}"))
-                                .debug_selector(|| "batch-continue-button".into())
-                                .primary().label(if batch.parallelism > 1 { "继续下一波" } else if retrying { "继续重试当前主机" } else { "继续下一台" })
-                                .on_click(cx.listener(move |view, _, window, cx| {
-                                    view.confirm_continue_batch(batch_id.clone(), host_id, window, cx)
-                                })))
-                        }))
-                    .child(div().flex().flex_wrap().items_center().gap_3()
-                        .child(div().text_color(color).child(status))
-                        .when(can_terminate, |el| {
-                            let batch_id = batch.id.clone();
-                            el.child(Button::new(format!("batch-terminate-{batch_id}"))
-                                .debug_selector(|| "batch-terminate-button".into())
-                                .danger().label("终止批次")
-                                .on_click(cx.listener(move |view, _, window, cx| {
-                                    view.confirm_batch_resolution(project_id, batch_id.clone(), None, window, cx)
-                                })))
-                        })))
-                .when_some(self.batch_operation_stage.get(&batch.id), |card, stage| {
-                    card.child(div().px_4().pb_3().text_color(self.palette().warning)
-                        .child(format!("批次操作中：{stage}")))
-                })
-                .child(div().id(format!("batch-history-scroll-{}", batch.id))
-                    .debug_selector(|| "batch-history-scroll".into())
-                    .overflow_x_scroll().child(table)));
+            content = content.child(
+                div()
+                    .border_1()
+                    .border_color(self.palette().border)
+                    .debug_selector(|| "batch-history-card".into())
+                    .rounded_md()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .px_4()
+                            .py_3()
+                            .flex()
+                            .flex_wrap()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .items_start()
+                                    .gap_1()
+                                    .child(div().font_family(mono_font()).child(format!(
+                                        "批次 {} · {}",
+                                        batch.id.chars().take(8).collect::<String>(),
+                                        batch.created_at
+                                    )))
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .truncate()
+                                            .font_family(mono_font())
+                                            .child(project_name),
+                                    )
+                                    .child(div().text_color(self.palette().muted).child(format!(
+                                        "健康 {healthy}/{} · 待核实 {unknown} · 未开始 {waiting}",
+                                        batch.targets.len()
+                                    )))
+                                    .child(div().text_color(self.palette().muted).child(format!(
+                                        "并行度 {} · 共享镜像 {} 份",
+                                        batch.parallelism,
+                                        batch.images.len()
+                                    )))
+                                    .when(next_host_id.is_some(), |el| {
+                                        let host_id = next_host_id.unwrap_or_default();
+                                        let batch_id = batch.id.clone();
+                                        let retrying = batch.targets.iter().any(|target| {
+                                            target.host.id == host_id
+                                                && !target.attempt_task_ids.is_empty()
+                                        });
+                                        el.child(
+                                            Button::new(format!("batch-continue-{batch_id}"))
+                                                .debug_selector(|| "batch-continue-button".into())
+                                                .primary()
+                                                .label(if batch.parallelism > 1 {
+                                                    "继续下一波"
+                                                } else if retrying {
+                                                    "继续重试当前主机"
+                                                } else {
+                                                    "继续下一台"
+                                                })
+                                                .on_click(cx.listener(
+                                                    move |view, _, window, cx| {
+                                                        view.confirm_continue_batch(
+                                                            batch_id.clone(),
+                                                            host_id,
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    },
+                                                )),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(div().text_color(color).child(status))
+                                    .when(can_terminate, |el| {
+                                        let batch_id = batch.id.clone();
+                                        el.child(
+                                            Button::new(format!("batch-terminate-{batch_id}"))
+                                                .debug_selector(|| "batch-terminate-button".into())
+                                                .danger()
+                                                .label("终止批次")
+                                                .on_click(cx.listener(
+                                                    move |view, _, window, cx| {
+                                                        view.confirm_batch_resolution(
+                                                            project_id,
+                                                            batch_id.clone(),
+                                                            None,
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    },
+                                                )),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .when_some(self.batch_operation_stage.get(&batch.id), |card, stage| {
+                        card.child(
+                            div()
+                                .px_4()
+                                .pb_3()
+                                .text_color(self.palette().warning)
+                                .child(format!("批次操作中：{stage}")),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id(format!("batch-history-scroll-{}", batch.id))
+                            .debug_selector(|| "batch-history-scroll".into())
+                            .overflow_x_scroll()
+                            .child(table),
+                    ),
+            );
         }
         content.into_any_element()
     }
