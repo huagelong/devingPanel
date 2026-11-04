@@ -51,9 +51,9 @@ jobs:
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc g++ clang libfontconfig-dev libwayland-dev \
+          sudo apt-get install -y gcc g++ clang file libfontconfig-dev libwayland-dev \
             libwebkit2gtk-4.1-dev libxkbcommon-x11-dev libx11-xcb-dev \
-            libssl-dev libzstd-dev libasound2-dev vulkan-validationlayers libvulkan1
+            libssl-dev libzstd-dev libasound2-dev vulkan-validationlayers libvulkan1 rpm
       - name: Build Linux and macOS
         if: matrix.platform != 'windows'
         shell: bash
@@ -107,12 +107,13 @@ jobs:
           for arch in x64 arm64; do
             if [ "$arch" = x64 ]; then deb_arch=amd64; else deb_arch=arm64; fi
             test -f "dist/deving-panel_${version}_${deb_arch}.deb"
+            test -f "dist/deving-panel_${version}_linux_${arch}.rpm"
             test -f "dist/deving-panel_${version}_linux_${arch}.AppImage"
             test -f "dist/deving-panel_${version}_windows_${arch}_setup.exe"
             test -f "dist/deving-panel_${version}_windows_${arch}_portable.zip"
             test -f "dist/deving-panel_${version}_macos_${arch}.dmg"
           done
-          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 10
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 12
           find dist -maxdepth 1 -type f -printf '%f\n' | sort
       - uses: softprops/action-gh-release@v2
         with:

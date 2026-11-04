@@ -15,9 +15,10 @@ icon=.github/packaging/deving-panel.svg
 mkdir -p dist
 
 deb_root=$(mktemp -d)
+rpm_top=$(mktemp -d)
 appdir=$(mktemp -d)/deving-panel.AppDir
 tools_dir=$(mktemp -d)
-trap 'rm -rf "$deb_root" "$(dirname "$appdir")" "$tools_dir"' EXIT
+trap 'rm -rf "$deb_root" "$rpm_top" "$(dirname "$appdir")" "$tools_dir"' EXIT
 
 install -Dm755 "$binary" "$deb_root/usr/bin/deving-panel"
 install -Dm644 "$icon" "$deb_root/usr/share/icons/hicolor/scalable/apps/deving-panel.svg"
@@ -35,6 +36,14 @@ Depends: libasound2t64, libfontconfig1, libsecret-1-0, libssl3t64, libvulkan1, l
 Description: Desktop client for Docker deployment over SSH
 EOF
 dpkg-deb --build --root-owner-group "$deb_root" "dist/deving-panel_${version}_${deb_arch}.deb"
+
+rpmbuild -bb --target "$image_arch" \
+  --define "_topdir $rpm_top" \
+  --define "_sourcedir $deb_root" \
+  --define "app_version $version" \
+  .github/packaging/deving-panel.spec
+install -m644 "$rpm_top/RPMS/$image_arch/deving-panel-$version-1.$image_arch.rpm" \
+  "dist/deving-panel_${version}_linux_${arch}.rpm"
 
 curl -fL --retry 3 -o "$tools_dir/linuxdeploy.AppImage" \
   "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${image_arch}.AppImage"
