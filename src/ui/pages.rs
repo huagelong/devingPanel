@@ -188,8 +188,6 @@ enum DeployRunEvent {
     Finished(Result<(String, usize), String>),
 }
 
-const MULTI_HOST_START_ENABLED: bool = false;
-
 enum BatchStartEvent {
     Stage(String),
     Transfer { sent: u64, total: u64 },
@@ -7179,7 +7177,8 @@ impl AppView {
             ));
         }
         if !tasks.is_empty() {
-            let mut table = div().min_w(px(900.)).flex().flex_col();
+            let table_width = if project_id.is_none() { 1040. } else { 900. };
+            let mut table = div().min_w(px(table_width)).flex().flex_col();
             let mut header = div()
                 .h(px(42.))
                 .px_4()
@@ -7205,7 +7204,7 @@ impl AppView {
                 )
                 .child(div().w(px(155.)).flex_shrink_0().child("结果"))
                 .child(div().w(px(90.)).flex_shrink_0().child("耗时"))
-                .child("操作");
+                .child(div().w(px(145.)).flex_shrink_0().child("操作"));
             table = table.child(header);
             for (index, task) in tasks.iter().enumerate() {
                 let (status, color) = match (task.outcome.as_str(), task.health_result.as_deref()) {
@@ -7271,6 +7270,8 @@ impl AppView {
                     )))
                     .child(
                         div()
+                            .w(px(145.))
+                            .flex_shrink_0()
                             .flex()
                             .gap_1()
                             .child(
@@ -7318,6 +7319,7 @@ impl AppView {
             rows = rows.child(
                 div()
                     .id("release-history-table-scroll")
+                    .debug_selector(|| "release-history-table-scroll".into())
                     .overflow_x_scroll()
                     .border_1()
                     .border_color(self.palette().border)
@@ -8561,7 +8563,7 @@ impl AppView {
             return;
         };
         let ids = self.deploy_host_ids.clone();
-        if ids.len() > 1 && MULTI_HOST_START_ENABLED {
+        if project.manifest_mode && ids.len() > 1 {
             self.confirm_batch_deploy(window, cx);
             return;
         }
@@ -9268,8 +9270,7 @@ impl AppView {
                 options
             });
         let parallel_view = cx.weak_entity();
-        let can_start = self.deploy_ready(project, &ids)
-            || (MULTI_HOST_START_ENABLED && self.batch_start_ready(project, &ids));
+        let can_start = self.deploy_ready(project, &ids) || self.batch_start_ready(project, &ids);
         let can_batch_check = project.manifest_mode
             && ids.len() > 1
             && !self.deploy_batch_check_loading
@@ -9289,7 +9290,7 @@ impl AppView {
                     .h(px(36.))
                     .w_full()
                     .outline()
-                    .disabled(project.manifest_mode && !MULTI_HOST_START_ENABLED)
+                    .disabled(ids.len() <= 1 || self.deploy_run_busy)
                     .label(format!("{}  ▾", self.deploy_parallel)),
             )
             .content(move |_, _, cx| {
@@ -9437,10 +9438,8 @@ impl AppView {
                     .child(Button::new("start-deploy").primary()
                         .debug_selector(|| "start-deploy-button".into())
                         .label(if self.deploy_run_busy { "发布中…" } else { "开始发布" })
-                        .tooltip(if project.manifest_mode && ids.len() > 1 && !MULTI_HOST_START_ENABLED {
-                            "批次发布仍在隔离验收，开始按钮保持禁用；不会只发布第一台"
-                        } else if project.manifest_mode && ids.len() > 1 {
-                            "将按 YAML 目标顺序逐台发布；每台健康后都须人工确认"
+                        .tooltip(if project.manifest_mode && ids.len() > 1 {
+                            "将按 YAML 目标顺序分波次发布；每台健康后都须人工确认"
                         } else {
                             "当前支持 YAML v2 单主机整栈发布；开始前将再次预检"
                         })
@@ -9463,7 +9462,7 @@ impl AppView {
                     .when_some(self.deploy_batch_plan.as_ref(), |el, batch| el.child(
                         div().whitespace_normal().text_color(self.palette().muted).child(match batch {
                             Ok(plan) => format!(
-                                "只读批次矩阵 · {} 份唯一服务/架构镜像 → {} 台目标：{}。初始执行入口仍待隔离验收。",
+                                "只读批次矩阵 · {} 份唯一服务/架构镜像 → {} 台目标：{}。发布前需完成目标/材料预检。",
                                 plan.builds.len(), plan.hosts.len(),
                                 plan.hosts.iter().map(|target| {
                                     let name = self.hosts.iter().find(|host| host.id == target.host_id)
@@ -9495,14 +9494,10 @@ impl AppView {
                                 None => "批次目标尚未完整预检；当前仍不能开始多主机发布。".into(),
                             }))
                     ))
-                    .when(project.manifest_mode && ids.len() > 1, |el| el.child(
-                        div().debug_selector(|| "multi-host-unavailable".into())
-                            .border_1().border_color(self.palette().warning).rounded_md().p_3()
-                            .text_color(self.palette().warning)
-                            .child(format!("YAML 预设 {} 台目标主机；批次初始执行仍在隔离验收。开始发布保持禁用，不会仅部署第一台。", ids.len()))
-                    ))
                     .child(div().text_color(self.palette().muted).child(if self.deploy_run_busy && self.deploy_run_project_id == Some(project.id) {
                         format!("正在执行：{}；传输百分比按当前镜像计算，多镜像时会重置。离开页面不会取消任务，请勿关闭程序。", self.deploy_run_stage)
+                    } else if project.manifest_mode && ids.len() > 1 {
+                        "YAML v2 多主机按并行度分波次发布；每台健康后须人工确认。传输百分比按当前镜像计算，多镜像时会重置。".into()
                     } else {
                         "当前仅支持 YAML v2 单主机整栈发布；传输百分比按当前镜像计算，多镜像时会重置。全部服务健康后再次核实材料与远端状态。".into()
                     })),

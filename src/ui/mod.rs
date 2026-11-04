@@ -1325,7 +1325,6 @@ mod tests {
         })
         .unwrap();
         let mut test_window = gpui_kit::VisualTestContext::from_window(handle, cx);
-        assert!(test_window.debug_bounds("multi-host-unavailable").is_some());
         let disabled_batch_check = test_window
             .debug_bounds("batch-preflight-check-button")
             .unwrap();
@@ -1385,11 +1384,9 @@ mod tests {
             window.draw(cx).clear(cx);
         })
         .unwrap();
-        let gated_start = test_window.debug_bounds("start-deploy-button").unwrap();
-        test_window.simulate_click(gated_start.center(), Modifiers::default());
+        let batch_start = test_window.debug_bounds("start-deploy-button").unwrap();
+        test_window.simulate_click(batch_start.center(), Modifiers::default());
         cx.update_window(handle, |_, window, cx| {
-            assert!(!window.has_active_dialog(cx));
-            view_entity.update(cx, |view, cx| view.confirm_batch_deploy(window, cx));
             assert!(window.has_active_dialog(cx));
             window.draw(cx).clear(cx);
         })
@@ -1406,11 +1403,12 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             assert!(!window.has_active_dialog(cx));
-            view_entity.update(cx, |view, cx| {
-                let project = &view.projects[0];
-                assert!(view.batch_start_ready(project, &view.deploy_host_ids));
-                view.confirm_batch_deploy(window, cx);
-            });
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let batch_start = test_window.debug_bounds("start-deploy-button").unwrap();
+        test_window.simulate_click(batch_start.center(), Modifiers::default());
+        cx.update_window(handle, |_, window, cx| {
             assert!(window.has_active_dialog(cx));
             window.draw(cx).clear(cx);
         })
@@ -2155,6 +2153,39 @@ mod tests {
             window.draw(cx).clear(cx);
         })
         .unwrap();
+        test_window.simulate_resize(size(px(456.), px(1600.)));
+        cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let history_scroll = test_window
+            .debug_bounds("release-history-table-scroll")
+            .unwrap();
+        let history_visible = |bounds: gpui_kit::Bounds<gpui_kit::Pixels>| {
+            bounds.origin.x >= history_scroll.origin.x
+                && bounds.origin.x + bounds.size.width
+                    <= history_scroll.origin.x + history_scroll.size.width
+        };
+        let mut rollback = test_window.debug_bounds("release-rollback-button");
+        for delta in [-1200., 1200.] {
+            if rollback.is_some_and(history_visible) {
+                break;
+            }
+            test_window.simulate_event(ScrollWheelEvent {
+                position: history_scroll.center(),
+                delta: ScrollDelta::Pixels(point(px(delta), px(0.))),
+                modifiers: Modifiers::default(),
+                touch_phase: Default::default(),
+            });
+            cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            rollback = test_window.debug_bounds("release-rollback-button");
+        }
+        assert!(
+            rollback.is_some_and(history_visible),
+            "narrow history rollback button stayed outside the scroll viewport"
+        );
+        test_window.simulate_resize(size(px(1700.), px(900.)));
+        cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
         let retry = test_window.debug_bounds("batch-retry-button").unwrap();
         test_window.simulate_click(retry.center(), Modifiers::default());
         cx.update_window(handle, |_, window, cx| {
@@ -2337,12 +2368,12 @@ mod tests {
                 .is_some()
         );
 
-        test_window.simulate_resize(size(px(760.), px(1600.)));
+        test_window.simulate_resize(size(px(456.), px(1600.)));
         cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
         let scroll = test_window.debug_bounds("batch-history-scroll").unwrap();
         assert!(scroll.origin.x >= px(0.));
-        assert!(scroll.origin.x + scroll.size.width <= px(760.));
+        assert!(scroll.origin.x + scroll.size.width <= px(456.));
         let visible = |bounds: gpui_kit::Bounds<gpui_kit::Pixels>| {
             bounds.origin.x >= scroll.origin.x
                 && bounds.origin.x + bounds.size.width <= scroll.origin.x + scroll.size.width
