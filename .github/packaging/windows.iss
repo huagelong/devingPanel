@@ -34,7 +34,7 @@ UninstallDisplayIcon={app}\deving-panel.exe
 
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\devingPanel"; Filename: "{app}\deving-panel.exe"
