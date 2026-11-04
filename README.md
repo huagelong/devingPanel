@@ -167,13 +167,13 @@ SQLite v21 原先仅允许启动已确认后的 `checking/unknown`，或进程�
 
 ## GitHub Release 打包
 
-先将验证后的代码发布到 `master`，再给 `master` 历史中的提交推送与 `Cargo.toml` 版本一致的 `v<版本>` 标签（例如 `v0.1.0`）。标签不属于远端 `master` 历史时，工作流在构建前失败，不创建 Release。六个原生 runner 分别构建 Linux、Windows、macOS 的 x64 和 ARM64 版本；所有任务成功后，工作流创建 GitHub Release 并上传 10 个文件：Linux 每种架构各有 AppImage、`.deb`，Windows 各有 `.exe` 安装程序、Portable ZIP，macOS 各有 `.dmg`。也可从 Actions 手动运行工作流检查构建，手动运行仅保留短期构建产物，不创建 Release。
+先将验证后的代码发布到 `master`，再给 `master` 历史中的提交推送与 `Cargo.toml` 版本一致的 `v<版本>` 标签（例如 `v0.1.1`）。标签不属于远端 `master` 历史时，工作流在构建前失败，不创建 Release。六个原生 runner 分别构建 Linux、Windows、macOS 的 x64 和 ARM64 版本；所有任务成功后，工作流创建 GitHub Release 并上传 10 个文件：Linux 每种架构各有 AppImage、`.deb`，Windows 各有 `.exe` 安装程序、Portable ZIP，macOS 各有 `.dmg`。也可从 Actions 手动运行工作流检查构建，手动运行仅保留短期构建产物，不创建 Release。
 
 macOS 的 `.app` 在制作 DMG 前使用 ad-hoc 签名并校验签名；未使用 Apple Developer ID，也未公证，首次运行可能需要用户在系统安全设置中确认。Windows 安装程序未进行代码签名。Linux `.deb` 面向 Ubuntu 24.04 的依赖命名；AppImage 由同版本 Ubuntu runner 收集动态库，其他 Linux 发行版的兼容性仍需实机验证。打包成功只证明构建和封装完成，不代替各平台 GUI、系统凭据库与 Docker/SSH 的运行验收。
 
 ## 本地运行
 
-先安装 Rust 1.92+ MSVC 工具链、Visual Studio C++ Build Tools（含 Windows SDK）及 CMake。其他平台的系统依赖见 [GPUI Kit 安装说明](https://gpui-kit.com/docs/installation)。
+先安装 Rust 1.95+ MSVC 工具链、Visual Studio C++ Build Tools（含 Windows SDK）及 CMake。其他平台的系统依赖见 [GPUI Kit 安装说明](https://gpui-kit.com/docs/installation)。
 
 ```sh
 cargo run

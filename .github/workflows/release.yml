@@ -42,11 +42,11 @@ jobs:
           - { platform: macos, arch: arm64, runner: macos-15, rust_host: aarch64-apple-darwin }
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust 1.92
+      - name: Install Rust 1.95
         shell: bash
         run: |
-          rustup toolchain install 1.92.0-${{ matrix.rust_host }} --profile minimal --no-self-update
-          rustup default 1.92.0-${{ matrix.rust_host }}
+          rustup toolchain install 1.95.0-${{ matrix.rust_host }} --profile minimal --no-self-update
+          rustup default 1.95.0-${{ matrix.rust_host }}
       - name: Install Linux build dependencies
         if: matrix.platform == 'linux'
         run: |
