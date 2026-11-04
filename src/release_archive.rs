@@ -378,6 +378,88 @@ pub fn preview_local_reclaim(project_id: i64) -> Result<LocalArchivePreview, Str
     }))
 }
 
+pub fn remove_historical(task_id: &str) -> Result<u64, String> {
+    let root = archive_root()?;
+    let services = release_store::planned_archive_services(task_id)?;
+    if services.is_empty() {
+        return Err("历史任务没有可核对的本机归档计划。".into());
+    }
+    let mut removed = 0u64;
+    for (service, recorded) in services {
+        if !recorded {
+            continue;
+        }
+        let path = archive_path(&root, task_id, &service)?;
+        if !path.exists() {
+            continue;
+        }
+        let path = checked_existing_archive_path(&root, task_id, &service)?;
+        verify(task_id, &service)?;
+        let bytes = fs::metadata(&path)
+            .map_err(|_| "无法核对历史归档大小。")?
+            .len();
+        fs::remove_file(&path).map_err(|_| "无法删除历史镜像归档。")?;
+        removed = removed.checked_add(bytes).ok_or("归档释放字节数溢出。")?;
+    }
+    let directory = root.join(task_id);
+    if directory.exists() {
+        let meta = fs::symlink_metadata(&directory).map_err(|_| "无法核对归档任务目录。")?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err("归档任务目录不可信。".into());
+        }
+        fs::remove_dir(&directory).map_err(|_| "归档任务目录含未登记文件，需人工核对。")?;
+    }
+    Ok(removed)
+}
+
+pub fn remove_orphaned(id: &str, batch: bool) -> Result<(), String> {
+    let root = if batch {
+        batch_archive_root()?
+    } else {
+        archive_root()?
+    };
+    remove_orphaned_in(&root, id)
+}
+
+fn remove_orphaned_in(root: &Path, id: &str) -> Result<(), String> {
+    uuid::Uuid::parse_str(id).map_err(|_| "归档任务 ID 无效。")?;
+    let directory = root.join(id);
+    if !directory.exists() {
+        return Ok(());
+    }
+    let root = root.canonicalize().map_err(|_| "无法核对归档根目录。")?;
+    let metadata = fs::symlink_metadata(&directory).map_err(|_| "无法核对归档任务目录。")?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || directory
+            .canonicalize()
+            .map_err(|_| "无法核对归档路径。")?
+            .parent()
+            != Some(root.as_path())
+    {
+        return Err("归档任务目录不可信。".into());
+    }
+    for entry in fs::read_dir(&directory).map_err(|_| "无法读取归档任务目录。")? {
+        let entry = entry.map_err(|_| "无法读取归档文件。")?;
+        let metadata = entry
+            .path()
+            .symlink_metadata()
+            .map_err(|_| "无法核对归档文件。")?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or("归档文件名无效。")?;
+        let managed = name.strip_suffix(".tar").is_some_and(|stem| {
+            stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) || name.strip_suffix(".partial").is_some_and(|stem| {
+            stem.len() == 32 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+        if !metadata.is_file() || metadata.file_type().is_symlink() || !managed {
+            return Err("归档目录包含未登记文件，需人工核对。".into());
+        }
+        fs::remove_file(entry.path()).map_err(|_| "无法删除旧镜像归档。")?;
+    }
+    fs::remove_dir(directory).map_err(|_| "无法删除旧归档目录。".into())
+}
+
 fn copy_verified_in(
     root: &Path,
     task_id: &str,
@@ -452,12 +534,34 @@ pub fn copy_verified(
 #[cfg(test)]
 mod tests {
     use super::{
-        archive_path, batch_archive_key, copy_verified_in, preview_from_plan, retain_in, verify_in,
-        verify_shared_identity_in,
+        archive_path, batch_archive_key, copy_verified_in, preview_from_plan, remove_orphaned_in,
+        retain_in, verify_in, verify_shared_identity_in,
     };
     use crate::build::SavedArchive;
     use crate::release_store::{RetentionClass, RetentionEntry, RetentionPlan};
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn orphan_cleanup_removes_managed_partial_and_preserves_unknown_files() {
+        let root =
+            std::env::temp_dir().join(format!("archive-orphan-test-{}", uuid::Uuid::new_v4()));
+        let id = uuid::Uuid::new_v4().to_string();
+        let directory = root.join(&id);
+        std::fs::create_dir_all(&directory).unwrap();
+        let partial = directory.join(format!("{}.partial", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&partial, b"partial").unwrap();
+        remove_orphaned_in(&root, &id).unwrap();
+        assert!(!directory.exists());
+
+        std::fs::create_dir(&directory).unwrap();
+        let unknown = directory.join("notes.txt");
+        std::fs::write(&unknown, b"keep").unwrap();
+        assert!(remove_orphaned_in(&root, &id).is_err());
+        assert_eq!(std::fs::read(&unknown).unwrap(), b"keep");
+        std::fs::remove_file(unknown).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn shared_archive_key_separates_architectures() {

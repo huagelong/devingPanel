@@ -50,7 +50,7 @@ pub fn local_engine_endpoint() -> Result<String, String> {
     {
         return validate_local_endpoint(&endpoint.to_string_lossy());
     }
-    let mut child = Command::new("docker")
+    let mut child = crate::local_process::command("docker")
         .args([
             "context",
             "inspect",
@@ -92,7 +92,7 @@ pub fn local_engine_endpoint() -> Result<String, String> {
 }
 
 pub fn command_for_endpoint(endpoint: &str) -> Command {
-    let mut command = Command::new("docker");
+    let mut command = crate::local_process::command("docker");
     command
         .arg("--host")
         .arg(endpoint)

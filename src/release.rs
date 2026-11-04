@@ -6,6 +6,7 @@ use crate::host_store;
 use crate::host_store::Host;
 use crate::project_config;
 use crate::project_store::{self, NewProject, Project};
+use crate::registry;
 use crate::release_archive;
 use crate::release_materials;
 use crate::release_store::{self, HealthResult, Intent, Outcome, Phase};
@@ -443,6 +444,14 @@ pub fn run_single_host_until_checked(
     }
     let (project, host, image, digest) =
         prepare_single_host(project_id, host_id, base_tag, cancel.clone())?;
+    let registry_credentials = registry::enabled_credentials()?;
+    if let Some(credentials) = &registry_credentials
+        && !image
+            .reference
+            .starts_with(&format!("{}/", credentials.config.address))
+    {
+        return Err("镜像仓库模式要求项目镜像名以 Registry 地址开头。".into());
+    }
     let files = deployment_files(&project)?;
     let env_file = env_store::deployment_env_file(project_id, host_id)?;
     let materials = release_materials::prepare(&files, &env_file)?;
@@ -455,22 +464,25 @@ pub fn run_single_host_until_checked(
         daemon_id: &docker_daemon_id,
     };
     let id = uuid::Uuid::new_v4().to_string();
-    release_store::create(&Intent {
-        id: id.clone(),
-        project_id,
-        project_name: project.name.clone(),
-        host: host.clone(),
-        docker_endpoint: docker_endpoint.clone(),
-        docker_daemon_id: docker_daemon_id.clone(),
-        image_reference: image.reference.clone(),
-        platform: image.platform.clone(),
-        images: vec![(
-            project.service.clone(),
-            image.reference.clone(),
-            image.platform.clone(),
-        )],
-        config_sha256: digest.clone(),
-    })?;
+    registry::create_release_intent(
+        &Intent {
+            id: id.clone(),
+            project_id,
+            project_name: project.name.clone(),
+            host: host.clone(),
+            docker_endpoint: docker_endpoint.clone(),
+            docker_daemon_id: docker_daemon_id.clone(),
+            image_reference: image.reference.clone(),
+            platform: image.platform.clone(),
+            images: vec![(
+                project.service.clone(),
+                image.reference.clone(),
+                image.platform.clone(),
+            )],
+            config_sha256: digest.clone(),
+        },
+        &registry_credentials,
+    )?;
     if let Err(error) = release_materials::save(&id, materials) {
         let outcome = if error.contains("部分凭据可能残留") {
             Outcome::Unknown
@@ -499,66 +511,126 @@ pub fn run_single_host_until_checked(
         return Err("项目文件在构建期间变化，未开始上传。".into());
     }
     release_store::advance(&id, Phase::Built, Phase::Uploading)?;
-    on_event("传输镜像");
-    let uploaded = match transfer_built_image(
-        &id,
-        &project.service,
-        host.clone(),
-        &built,
-        cancel.clone(),
-        |sent, total| on_event(&format!("镜像传输 {sent}/{total} 字节")),
-    ) {
-        Ok(uploaded) => uploaded,
-        Err(error) => {
-            let _ =
-                release_store::settle(&id, Phase::Uploading, Outcome::Unknown, "传输结果待核实");
+    let image_ids = if let Some(credentials) = &registry_credentials {
+        on_event("准备镜像仓库推送");
+        let result = (|| {
+            let archive = build::save_image(&built, cancel.clone())?;
+            release_archive::retain(&id, &project.service, &archive)?;
+            registry::push_with_credentials(credentials, &built.reference, &cancel)?;
+            Ok::<_, String>(archive.image_ids.clone())
+        })();
+        let ids = match result {
+            Ok(ids) => ids,
+            Err(error) => {
+                let _ = release_store::settle(
+                    &id,
+                    Phase::Uploading,
+                    Outcome::Unknown,
+                    "镜像仓库推送结果待核实",
+                );
+                return Err(error);
+            }
+        };
+        release_store::advance(&id, Phase::Uploading, Phase::Uploaded)?;
+        release_store::advance(&id, Phase::Uploaded, Phase::Loading)?;
+        if let Err(error) = release_store::record_image_ids(&id, &project.service, &ids) {
+            let _ = release_store::settle(
+                &id,
+                Phase::Loading,
+                Outcome::Unknown,
+                "镜像仓库镜像 ID 保存结果待核实",
+            );
             return Err(error);
         }
+        on_event("远端拉取镜像");
+        if let Err(error) = ssh::pull_registry_image(
+            host.clone(),
+            docker_identity,
+            &id,
+            &built.reference,
+            &built.platform,
+            &ids,
+            credentials,
+            cancel.clone(),
+        ) {
+            let _ = release_store::settle(
+                &id,
+                Phase::Loading,
+                Outcome::Unknown,
+                "远端镜像仓库拉取结果待核实",
+            );
+            return Err(error);
+        }
+        release_store::advance(&id, Phase::Loading, Phase::Loaded)?;
+        ids
+    } else {
+        on_event("传输镜像");
+        let uploaded = match transfer_built_image(
+            &id,
+            &project.service,
+            host.clone(),
+            &built,
+            cancel.clone(),
+            |sent, total| on_event(&format!("镜像传输 {sent}/{total} 字节")),
+        ) {
+            Ok(uploaded) => uploaded,
+            Err(error) => {
+                let _ = release_store::settle(
+                    &id,
+                    Phase::Uploading,
+                    Outcome::Unknown,
+                    "传输结果待核实",
+                );
+                return Err(error);
+            }
+        };
+        release_store::advance(&id, Phase::Uploading, Phase::Uploaded)?;
+        release_store::advance(&id, Phase::Uploaded, Phase::Loading)?;
+        if let Err(error) =
+            release_store::record_image_ids(&id, &project.service, &uploaded.image_ids)
+        {
+            let cleanup = ssh::cleanup_uploaded_archive(host.clone(), &uploaded);
+            let _ = release_store::settle(
+                &id,
+                Phase::Loading,
+                Outcome::Unknown,
+                "镜像归档 ID 保存结果待核实",
+            );
+            return Err(if cleanup.is_ok() {
+                error
+            } else {
+                format!("{error}；远端临时归档清理待核实")
+            });
+        }
+        on_event("远端加载镜像");
+        if let Err(error) = ssh::load_uploaded_archive(
+            host.clone(),
+            docker_identity,
+            &uploaded,
+            &built.reference,
+            &built.platform,
+            cancel.clone(),
+        ) {
+            let _ = release_store::settle(
+                &id,
+                Phase::Loading,
+                Outcome::Unknown,
+                "远端镜像加载结果待核实",
+            );
+            return Err(error);
+        }
+        release_store::advance(&id, Phase::Loading, Phase::Loaded)?;
+        if let Err(error) = ssh::cleanup_uploaded_archive(host.clone(), &uploaded) {
+            release_store::settle(
+                &id,
+                Phase::Loaded,
+                Outcome::Unknown,
+                "镜像已加载，但临时归档清理待核实",
+            )?;
+            return Err(error);
+        }
+        uploaded.image_ids
     };
-    release_store::advance(&id, Phase::Uploading, Phase::Uploaded)?;
-    release_store::advance(&id, Phase::Uploaded, Phase::Loading)?;
-    if let Err(error) = release_store::record_image_ids(&id, &project.service, &uploaded.image_ids)
-    {
-        let cleanup = ssh::cleanup_uploaded_archive(host.clone(), &uploaded);
-        let _ = release_store::settle(
-            &id,
-            Phase::Loading,
-            Outcome::Unknown,
-            "镜像归档 ID 保存结果待核实",
-        );
-        return Err(if cleanup.is_ok() {
-            error
-        } else {
-            format!("{error}；远端临时归档清理待核实")
-        });
-    }
-    on_event("远端加载镜像");
-    if let Err(error) = ssh::load_uploaded_archive(
-        host.clone(),
-        docker_identity,
-        &uploaded,
-        &built.reference,
-        &built.platform,
-        cancel.clone(),
-    ) {
-        let _ = release_store::settle(
-            &id,
-            Phase::Loading,
-            Outcome::Unknown,
-            "远端镜像加载结果待核实",
-        );
-        return Err(error);
-    }
-    release_store::advance(&id, Phase::Loading, Phase::Loaded)?;
-    if let Err(error) = ssh::cleanup_uploaded_archive(host.clone(), &uploaded) {
-        release_store::settle(
-            &id,
-            Phase::Loaded,
-            Outcome::Unknown,
-            "镜像已加载，但临时归档清理待核实",
-        )?;
-        return Err(error);
-    }
     release_store::advance(&id, Phase::Loaded, Phase::AwaitingDeployment)?;
     release_store::advance(&id, Phase::AwaitingDeployment, Phase::Staging)?;
     on_event("上传 Compose 和环境配置");
@@ -613,7 +685,7 @@ pub fn run_single_host_until_checked(
     let target = ssh::StackService {
         service: project.service.clone(),
         reference: built.reference.clone(),
-        image_ids: uploaded.image_ids.clone(),
+        image_ids: image_ids.clone(),
     };
     on_event("远端启动 Compose 服务");
     if let Err(error) = ssh::start_staged_compose(
@@ -1335,8 +1407,8 @@ mod tests {
             assert_eq!(
                 candidate_ids,
                 std::collections::HashSet::from([
-                    "adaf8c60-f460-4f1d-9da6-1225c5fad7b7",
-                    "ba6717cf-7d58-488a-8a31-9393bd3df38c",
+                    "00000000-0000-4000-8000-000000000033",
+                    "00000000-0000-4000-8000-000000000034",
                 ])
             );
             assert!(

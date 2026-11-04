@@ -14,7 +14,7 @@ use gpui_kit::component::scroll::ScrollableElement;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
@@ -23,7 +23,7 @@ fn generate_release_tag(project: &Project) -> Result<String, String> {
     let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
     let mut tag = project.tag_rule.replace("{timestamp}", &timestamp);
     if tag.contains("{git-sha}") {
-        let output = Command::new("git")
+        let output = crate::local_process::command("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(&project.path)
             .stderr(Stdio::null())
@@ -61,7 +61,7 @@ fn history_duration(start: &str, finished: Option<&str>) -> String {
     match (parse(start), parse(finished)) {
         (Ok(start), Ok(finished)) => {
             let secs = (finished - start).num_seconds().max(0);
-            format!("{}分{}秒", secs / 60, secs % 60)
+            tfmt!("{}分{}秒", secs / 60, secs % 60)
         }
         _ => "—".into(),
     }
@@ -339,6 +339,115 @@ impl LogSheetState {
 }
 
 impl AppView {
+    fn save_screen_lock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.lock_busy {
+            return;
+        }
+        let current = self.lock_current.read(cx).value().to_string();
+        let password = self.lock_new.read(cx).value().to_string();
+        let confirmation = self.lock_confirm.read(cx).value().to_string();
+        let minutes = match self.lock_interval.read(cx).value().trim().parse::<u16>() {
+            Ok(value) if (1..=1440).contains(&value) => value,
+            _ => {
+                self.lock_error = Some(tr("自动锁屏间隔须为 1～1440 分钟。"));
+                cx.notify();
+                return;
+            }
+        };
+        let enabled = self.lock_settings.is_some();
+        self.lock_busy = true;
+        self.lock_error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if enabled {
+                        let next = if password.is_empty() && confirmation.is_empty() {
+                            None
+                        } else {
+                            Some((password.as_str(), confirmation.as_str()))
+                        };
+                        security::change(&current, next, minutes)
+                    } else {
+                        security::enable(&password, &confirmation, minutes)
+                    }
+                })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.lock_busy = false;
+                    match result {
+                        Ok(settings) => {
+                            crate::audit::record(
+                                if enabled { "change" } else { "enable" },
+                                "screen_lock",
+                                1,
+                                "completed",
+                                true,
+                            );
+                            view.lock_settings = Some(settings);
+                            view.last_activity = Instant::now();
+                            for field in [&view.lock_current, &view.lock_new, &view.lock_confirm] {
+                                field.update(cx, |field, cx| field.set_value("", window, cx));
+                            }
+                            window
+                                .push_notification(Notification::success(tr("锁屏设置已保存")), cx);
+                        }
+                        Err(error) => {
+                            crate::audit::record(
+                                if enabled { "change" } else { "enable" },
+                                "screen_lock",
+                                1,
+                                "completed",
+                                false,
+                            );
+                            view.lock_error = Some(tr_system(&error));
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn disable_screen_lock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.lock_busy {
+            return;
+        }
+        let current = self.lock_current.read(cx).value().to_string();
+        self.lock_busy = true;
+        self.lock_error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { security::disable(&current) })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.lock_busy = false;
+                    match result {
+                        Ok(()) => {
+                            crate::audit::record("disable", "screen_lock", 1, "completed", true);
+                            view.lock_settings = None;
+                            view.lock_current
+                                .update(cx, |field, cx| field.set_value("", window, cx));
+                            window.push_notification(Notification::success(tr("锁屏已关闭")), cx);
+                        }
+                        Err(error) => {
+                            crate::audit::record("disable", "screen_lock", 1, "completed", false);
+                            view.lock_error = Some(tr_system(&error));
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
     fn panel(
         &self,
         title: &'static str,
@@ -363,7 +472,7 @@ impl AppView {
                         div()
                             .text_size(px(18.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
+                            .child(tr(title)),
                     )
                     .child(
                         div()
@@ -372,7 +481,7 @@ impl AppView {
                             .whitespace_normal()
                             .text_size(px(14.))
                             .text_color(self.palette().muted)
-                            .child(description),
+                            .child(tr(description)),
                     ),
             )
             .child(body)
@@ -410,7 +519,7 @@ impl AppView {
             .justify_center()
             .gap_4()
             .child(Icon::new(icon).size(px(24.)))
-            .child(title)
+            .child(tr(title))
     }
 
     fn tab(
@@ -437,7 +546,7 @@ impl AppView {
             .when(selected, |el| el.font_weight(FontWeight::SEMIBOLD))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
-            .child(title)
+            .child(tr(title))
             .into_any_element()
     }
 
@@ -447,7 +556,7 @@ impl AppView {
             .flex()
             .flex_col()
             .gap_2()
-            .child(label)
+            .child(tr(label))
             .child(input)
     }
 
@@ -455,17 +564,19 @@ impl AppView {
         self.dialog_seq = self.dialog_seq.wrapping_add(1);
         let dialog_seq = self.dialog_seq;
         let muted = self.palette().muted;
-        let name = cx.new(|cx| InputState::new(window, cx).placeholder("例如 web-1"));
-        let address = cx.new(|cx| InputState::new(window, cx).placeholder("IP 或域名"));
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder(tr("例如 web-1")));
+        let address = cx.new(|cx| InputState::new(window, cx).placeholder(tr("IP 或域名")));
         let port = cx.new(|cx| InputState::new(window, cx).default_value("22"));
         let user = cx.new(|cx| InputState::new(window, cx).default_value("root"));
-        let group = cx.new(|cx| InputState::new(window, cx).placeholder("可选"));
+        let group = cx.new(|cx| InputState::new(window, cx).placeholder(tr("可选")));
         let password = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("SSH 密码")
+                .placeholder(tr("SSH 密码"))
                 .masked(true)
         });
-        let private_key = cx.new(|cx| TextareaState::new(window, cx).placeholder("粘贴私钥内容"));
+        let private_key =
+            cx.new(|cx| TextareaState::new(window, cx).placeholder(tr("粘贴私钥内容")));
+        let key_passphrase = cx.new(|cx| InputState::new(window, cx).masked(true));
         let use_key = Rc::new(Cell::new(false));
         let view = cx.weak_entity();
         let submitting = Rc::new(Cell::new(false));
@@ -478,6 +589,7 @@ impl AppView {
             let save_group = group.clone();
             let save_password = password.clone();
             let save_private_key = private_key.clone();
+            let save_key_passphrase = key_passphrase.clone();
             let save_use_key = use_key.clone();
             let password_radio = use_key.clone();
             let key_radio = use_key.clone();
@@ -488,7 +600,7 @@ impl AppView {
             let cancel_alive = alive.clone();
             let close_alive = alive.clone();
             dialog
-                .title("添加主机")
+                .title(tr("添加主机"))
                 .w(px(512.))
                 .close_button(!submitting.get())
                 .overlay_closable(!submitting.get())
@@ -528,7 +640,7 @@ impl AppView {
                                 .gap_4()
                                 .child(
                                     Radio::new("host-password-auth")
-                                        .label("密码")
+                                        .label(tr("密码"))
                                         .checked(!use_key.get())
                                         .disabled(submitting.get())
                                         .on_click(move |_, window, _| {
@@ -538,7 +650,7 @@ impl AppView {
                                 )
                                 .child(
                                     Radio::new("host-key-auth")
-                                        .label("私钥")
+                                        .label(tr("私钥"))
                                         .checked(use_key.get())
                                         .disabled(submitting.get())
                                         .on_click(move |_, window, _| {
@@ -548,13 +660,24 @@ impl AppView {
                                 ),
                         ))
                         .child(if use_key.get() {
-                            Self::form_field(
-                                "私钥",
-                                Textarea::new(&private_key)
-                                    .h(px(120.))
-                                    .disabled(submitting.get()),
-                            )
-                            .into_any_element()
+                            div()
+                                .w_full()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .child(Self::form_field(
+                                    "私钥",
+                                    Textarea::new(&private_key)
+                                        .h(px(120.))
+                                        .disabled(submitting.get()),
+                                ))
+                                .child(Self::form_field(
+                                    "私钥口令（可选）",
+                                    Input::new(&key_passphrase)
+                                        .w_full()
+                                        .disabled(submitting.get()),
+                                ))
+                                .into_any_element()
                         } else {
                             Self::form_field(
                                 "密码",
@@ -566,9 +689,9 @@ impl AppView {
                             "分组",
                             Input::new(&group).w_full().disabled(submitting.get()),
                         ))
-                        .child(div().text_size(px(12.)).text_color(muted).child(
+                        .child(div().text_size(px(12.)).text_color(muted).child(tr(
                             "密码或私钥只写入系统凭据管理器；保存后从主机列表测试 SSH 和 Docker。",
-                        )),
+                        ))),
                 )
                 .footer(
                     div()
@@ -578,13 +701,13 @@ impl AppView {
                         .child(
                             Button::new("host-test")
                                 .outline()
-                                .label("测试连接")
+                                .label(tr("测试连接"))
                                 .disabled(true),
                         )
                         .child(
                             Button::new("host-save")
                                 .primary()
-                                .label("保存")
+                                .label(tr("保存"))
                                 .disabled(submitting.get())
                                 .on_click(move |_, window, cx| {
                                     if save_submitting.replace(true) {
@@ -604,7 +727,11 @@ impl AppView {
                                         }
                                         .into(),
                                         credential: if save_use_key.get() {
-                                            save_private_key.read(cx).value().to_string()
+                                            let key = save_private_key.read(cx).value().to_string();
+                                            let passphrase =
+                                                save_key_passphrase.read(cx).value().to_string();
+                                            host_store::key_credential(&key, &passphrase)
+                                                .unwrap_or_default()
                                         } else {
                                             save_password.read(cx).value().to_string()
                                         },
@@ -628,7 +755,7 @@ impl AppView {
                         )
                         .child(
                             Button::new("host-cancel")
-                                .label("取消")
+                                .label(tr("取消"))
                                 .disabled(submitting.get())
                                 .on_click(move |_, window, cx| {
                                     if !cancel_submitting.get() {
@@ -677,12 +804,12 @@ impl AppView {
                         window.close_dialog(app);
                     }
                     window.push_notification(
-                        Notification::success("主机已保存；请从主机列表测试 SSH 和 Docker"),
+                        Notification::success(tr("主机已保存；请从主机列表测试 SSH 和 Docker")),
                         app,
                     );
                 }
                 Err(error) => {
-                    window.push_notification(Notification::error(error), app);
+                    window.push_notification(Notification::error(tr_system(&error)), app);
                     window.refresh();
                 }
             });
@@ -693,7 +820,7 @@ impl AppView {
     fn open_edit_host_dialog(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         if self.host_installing == Some(id) || self.host_mirror_configuring == Some(id) {
             window.push_notification(
-                Notification::warning("Docker 配置操作期间不可编辑主机连接配置。"),
+                Notification::warning(tr("Docker 配置操作期间不可编辑主机连接配置。")),
                 cx,
             );
             return;
@@ -710,12 +837,13 @@ impl AppView {
         let group = cx.new(|cx| InputState::new(window, cx).default_value(host.group.clone()));
         let password = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("已安全保存，留空不修改")
+                .placeholder(tr("已安全保存，留空不修改"))
                 .masked(true)
         });
         let private_key = cx.new(|cx| {
-            TextareaState::new(window, cx).placeholder("已安全保存，留空不修改；粘贴新私钥")
+            TextareaState::new(window, cx).placeholder(tr("已安全保存，留空不修改；粘贴新私钥"))
         });
+        let key_passphrase = cx.new(|cx| InputState::new(window, cx).masked(true));
         let use_key = Rc::new(Cell::new(host.auth == "key"));
         let view = cx.weak_entity();
         let submitting = Rc::new(Cell::new(false));
@@ -728,6 +856,7 @@ impl AppView {
             let save_group = group.clone();
             let save_password = password.clone();
             let save_private_key = private_key.clone();
+            let save_key_passphrase = key_passphrase.clone();
             let save_use_key = use_key.clone();
             let password_radio = use_key.clone();
             let key_radio = use_key.clone();
@@ -738,7 +867,7 @@ impl AppView {
             let cancel_alive = alive.clone();
             let close_alive = alive.clone();
             dialog
-                .title("编辑主机")
+                .title(tr("编辑主机"))
                 .w(px(512.))
                 .close_button(!submitting.get())
                 .overlay_closable(!submitting.get())
@@ -774,15 +903,19 @@ impl AppView {
                         .child(Self::form_field(
                             "认证方式",
                             div().flex().gap_4()
-                                .child(Radio::new("host-edit-password-auth").label("密码")
+                                .child(Radio::new("host-edit-password-auth").label(tr("密码"))
                                     .checked(!use_key.get()).disabled(submitting.get())
                                     .on_click(move |_, window, _| { password_radio.set(false); window.refresh(); }))
-                                .child(Radio::new("host-edit-key-auth").label("私钥")
+                                .child(Radio::new("host-edit-key-auth").label(tr("私钥"))
                                     .checked(use_key.get()).disabled(submitting.get())
                                     .on_click(move |_, window, _| { key_radio.set(true); window.refresh(); })),
                         ))
                         .child(if use_key.get() {
-                            Self::form_field("私钥", Textarea::new(&private_key).h(px(120.)).disabled(submitting.get())).into_any_element()
+                            div().w_full().flex().flex_col().gap_3()
+                                .child(Self::form_field("私钥", Textarea::new(&private_key).h(px(120.)).disabled(submitting.get())))
+                                .child(Self::form_field("私钥口令（更换私钥时填写）",
+                                    Input::new(&key_passphrase).w_full().disabled(submitting.get())))
+                                .into_any_element()
                         } else {
                             Self::form_field("密码", Input::new(&password).w_full().mask_toggle().disabled(submitting.get())).into_any_element()
                         })
@@ -792,7 +925,7 @@ impl AppView {
                         ))
                         .child(
                             div().text_size(px(12.)).child(
-                                "同方式留空保留已保存凭据；切换认证方式须填写新凭据。修改地址或端口将清除旧指纹信任。",
+                                tr("同方式留空保留已保存凭据；切换认证方式须填写新凭据。修改地址或端口将清除旧指纹信任。"),
                             ),
                         ),
                 )
@@ -803,7 +936,7 @@ impl AppView {
                         .gap_2()
                         .child(
                             Button::new("host-edit-cancel")
-                                .label("取消")
+                                .label(tr("取消"))
                                 .disabled(submitting.get())
                                 .on_click(move |_, window, cx| {
                                     if !cancel_submitting.get() {
@@ -815,7 +948,7 @@ impl AppView {
                         .child(
                             Button::new("host-edit-save")
                                 .primary()
-                                .label("保存")
+                                .label(tr("保存"))
                                 .disabled(submitting.get())
                                 .on_click(move |_, window, cx| {
                                     if save_submitting.replace(true) {
@@ -831,11 +964,18 @@ impl AppView {
                                         auth: if save_use_key.get() { "key" } else { "password" }.into(),
                                         credential: {
                                             let value = if save_use_key.get() {
-                                                save_private_key.read(cx).value().to_string()
+                                                let key = save_private_key.read(cx).value().to_string();
+                                                let passphrase = save_key_passphrase.read(cx).value().to_string();
+                                                if key.is_empty() { String::new() } else {
+                                                    host_store::key_credential(&key, &passphrase).unwrap_or_default()
+                                                }
                                             } else {
                                                 save_password.read(cx).value().to_string()
                                             };
-                                            (!value.is_empty()).then_some(value)
+                                            if save_use_key.get() && value.is_empty()
+                                                && !save_key_passphrase.read(cx).value().is_empty() {
+                                                Some(String::new())
+                                            } else { (!value.is_empty()).then_some(value) }
                                         },
                                     };
                                     if save_view
@@ -873,7 +1013,7 @@ impl AppView {
         if self.host_installing == Some(id) || self.host_mirror_configuring == Some(id) {
             dialog.submitting.set(false);
             window.push_notification(
-                Notification::warning("Docker 配置操作期间不可修改主机。"),
+                Notification::warning(tr("Docker 配置操作期间不可修改主机。")),
                 cx,
             );
             return;
@@ -914,15 +1054,15 @@ impl AppView {
                     window.push_notification(
                         match warning {
                             Some(warning) => {
-                                Notification::warning(format!("主机配置已更新；{warning}"))
+                                Notification::warning(tfmt!("主机配置已更新；{warning}"))
                             }
-                            None => Notification::success("主机配置已更新，连接状态待重新核实"),
+                            None => Notification::success(tr("主机配置已更新，连接状态待重新核实")),
                         },
                         app,
                     );
                 }
                 Err(error) => {
-                    window.push_notification(Notification::error(error), app);
+                    window.push_notification(Notification::error(tr_system(&error)), app);
                     window.refresh();
                 }
             });
@@ -1082,28 +1222,28 @@ impl AppView {
             let tencent_view = view.clone();
             let official_view = view.clone();
             dialog
-                .title("一键安装 Docker")
+                .title(tr("一键安装 Docker"))
                 .w(px(560.))
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .child(format!("目标主机：{name} · Debian 13 / amd64 · root"))
-                        .child("将添加 Docker CE apt 源与签名密钥，安装 Engine、CLI、containerd、Buildx、Compose，并启动 Docker 服务。可能改变系统软件包与网络配置。")
-                        .child("仓库密钥须匹配 Docker 官方指纹 9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88；不执行 curl | sh。")
-                        .child(format!("安装后自动配置 Docker Hub 镜像源：{}、{}。仅在无运行容器时重启 Docker，并核对配置生效；公共镜像源可能记录镜像名称。", ssh::VERIFIED_REGISTRY_MIRRORS[0], ssh::VERIFIED_REGISTRY_MIRRORS[1]))
-                        .child("安装源：mirrors.cloud.tencent.com（腾讯云，国内推荐）或 download.docker.com（官方）。若源不可用会停止，不自动切换。请确认 VPS 有足够磁盘空间并允许 apt 安装。"),
+                        .child(tfmt!("目标主机：{name} · Debian 13 / amd64 · root"))
+                        .child(tr("将添加 Docker CE apt 源与签名密钥，安装 Engine、CLI、containerd、Buildx、Compose，并启动 Docker 服务。可能改变系统软件包与网络配置。"))
+                        .child(tr("仓库密钥须匹配 Docker 官方指纹 9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88；不执行 curl | sh。"))
+                        .child(tfmt!("安装后自动配置 Docker Hub 镜像源：{}、{}。仅在无运行容器时重启 Docker，并核对配置生效；公共镜像源可能记录镜像名称。", ssh::VERIFIED_REGISTRY_MIRRORS[0], ssh::VERIFIED_REGISTRY_MIRRORS[1]))
+                        .child(tr("安装源：mirrors.cloud.tencent.com（腾讯云，国内推荐）或 download.docker.com（官方）。若源不可用会停止，不自动切换。请确认 VPS 有足够磁盘空间并允许 apt 安装。")),
                 )
                 .footer(
                     div()
                         .flex()
                         .justify_end()
                         .gap_2()
-                        .child(Button::new("docker-install-cancel").label("取消").on_click(
+                        .child(Button::new("docker-install-cancel").label(tr("取消")).on_click(
                             |_, window, cx| window.close_dialog(cx),
                         ))
-                        .child(Button::new("docker-install-official").label("使用官方源安装").on_click(
+                        .child(Button::new("docker-install-official").label(tr("使用官方源安装")).on_click(
                             move |_, window, cx| {
                                 window.close_dialog(cx);
                                 let _ = official_view.update(cx, |view, cx| {
@@ -1111,7 +1251,7 @@ impl AppView {
                                 });
                             },
                         ))
-                        .child(Button::new("docker-install-tencent").primary().label("使用腾讯云镜像安装").on_click(
+                        .child(Button::new("docker-install-tencent").primary().label(tr("使用腾讯云镜像安装")).on_click(
                             move |_, window, cx| {
                                 window.close_dialog(cx);
                                 let _ = tencent_view.update(cx, |view, cx| {
@@ -1198,11 +1338,13 @@ impl AppView {
                 match result {
                     Ok(()) => {
                         window.push_notification(
-                            Notification::success("Docker 与镜像源已配置；正在重新测试连接"),
+                            Notification::success(tr("Docker 与镜像源已配置；正在重新测试连接")),
                             app,
                         );
                     }
-                    Err(error) => window.push_notification(Notification::error(error), app),
+                    Err(error) => {
+                        window.push_notification(Notification::error(tr_system(&error)), app)
+                    }
                 }
                 let _ = view.update(app, |view, cx| view.test_host(id, window, cx));
             });
@@ -1230,27 +1372,27 @@ impl AppView {
         window.open_dialog(cx, move |dialog, _, _| {
             let confirm_view = view.clone();
             dialog
-                .title("配置 Docker Hub 镜像源")
+                .title(tr("配置 Docker Hub 镜像源"))
                 .w(px(560.))
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .child("将保留 daemon.json 中其他设置，仅将 registry-mirrors 设置为：")
+                        .child(tr("将保留 daemon.json 中其他设置，仅将 registry-mirrors 设置为："))
                         .child("https://docker.1panel.live")
                         .child("https://docker.m.daocloud.io")
-                        .child("操作会重启 Docker；如果有运行中的容器，将阻断而不修改。公共镜像源可能记录镜像名称，生产镜像请优先使用受控 Registry 并固定 digest。"),
+                        .child(tr("操作会重启 Docker；如果有运行中的容器，将阻断而不修改。公共镜像源可能记录镜像名称，生产镜像请优先使用受控 Registry 并固定 digest。")),
                 )
                 .footer(
                     div()
                         .flex()
                         .justify_end()
                         .gap_2()
-                        .child(Button::new("mirror-cancel").label("取消").on_click(
+                        .child(Button::new("mirror-cancel").label(tr("取消")).on_click(
                             |_, window, cx| window.close_dialog(cx),
                         ))
-                        .child(Button::new("mirror-confirm").primary().label("确认配置").on_click(
+                        .child(Button::new("mirror-confirm").primary().label(tr("确认配置")).on_click(
                             move |_, window, cx| {
                                 window.close_dialog(cx);
                                 let _ = confirm_view.update(cx, |view, cx| {
@@ -1287,17 +1429,19 @@ impl AppView {
                 });
                 match result {
                     Ok(ssh::MirrorConfigResult::AlreadyConfigured) => window.push_notification(
-                        Notification::success("Docker 镜像源已一致，无需重启"),
+                        Notification::success(tr("Docker 镜像源已一致，无需重启")),
                         app,
                     ),
                     Ok(ssh::MirrorConfigResult::Updated) => {
                         window.push_notification(
-                            Notification::success("Docker 镜像源已配置并验证"),
+                            Notification::success(tr("Docker 镜像源已配置并验证")),
                             app,
                         );
                         let _ = view.update(app, |view, cx| view.test_host(id, window, cx));
                     }
-                    Err(error) => window.push_notification(Notification::error(error), app),
+                    Err(error) => {
+                        window.push_notification(Notification::error(tr_system(&error)), app)
+                    }
                 }
             });
         })
@@ -1324,9 +1468,9 @@ impl AppView {
             let close_alive = alive.clone();
             dialog
                 .title(if challenge.previous.is_some() {
-                    "主机指纹变化：连接已阻断"
+                    tr("主机指纹变化：连接已阻断")
                 } else {
-                    "首次连接：核对 SSH 主机指纹"
+                    tr("首次连接：核对 SSH 主机指纹")
                 })
                 .w(px(560.))
                 .close_button(!submitting.get())
@@ -1338,19 +1482,18 @@ impl AppView {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .child(format!(
-                            "连接目标：{}:{}",
-                            challenge.address, challenge.port
-                        ))
+                        .child(tfmt!("连接目标：{}:{}", challenge.address, challenge.port))
                         .when_some(challenge.previous.as_ref(), |el, old| {
-                            el.child(format!("旧指纹：{old}"))
+                            el.child(tfmt!("旧指纹：{old}"))
                         })
                         .child(
                             div()
                                 .font_family(mono_font())
-                                .child(format!("新指纹：{}", challenge.fingerprint)),
+                                .child(tfmt!("新指纹：{}", challenge.fingerprint)),
                         )
-                        .child("请通过独立渠道核对服务器指纹。确认后才会保存信任并重新测试连接。"),
+                        .child(tr(
+                            "请通过独立渠道核对服务器指纹。确认后才会保存信任并重新测试连接。",
+                        )),
                 )
                 .footer(
                     div()
@@ -1359,7 +1502,7 @@ impl AppView {
                         .gap_2()
                         .child(
                             Button::new("host-trust-cancel")
-                                .label("取消")
+                                .label(tr("取消"))
                                 .disabled(submitting.get())
                                 .on_click(move |_, window, cx| {
                                     cancel_alive.set(false);
@@ -1370,9 +1513,9 @@ impl AppView {
                             Button::new("host-trust-confirm")
                                 .primary()
                                 .label(if challenge.previous.is_some() {
-                                    "更新可信指纹"
+                                    tr("更新可信指纹")
                                 } else {
-                                    "确认指纹"
+                                    tr("确认指纹")
                                 })
                                 .disabled(submitting.get())
                                 .on_click(move |_, window, cx| {
@@ -1453,7 +1596,9 @@ impl AppView {
                     Ok(_) => {
                         let _ = view.update(app, |view, cx| view.test_host(id, window, cx));
                     }
-                    Err(error) => window.push_notification(Notification::error(error), app),
+                    Err(error) => {
+                        window.push_notification(Notification::error(tr_system(&error)), app)
+                    }
                 }
             });
         })
@@ -1463,7 +1608,7 @@ impl AppView {
     fn confirm_host_delete(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         if self.host_installing == Some(id) || self.host_mirror_configuring == Some(id) {
             window.push_notification(
-                Notification::warning("Docker 配置操作期间不可删除主机。"),
+                Notification::warning(tr("Docker 配置操作期间不可删除主机。")),
                 cx,
             );
             return;
@@ -1485,7 +1630,7 @@ impl AppView {
             let cancel_alive = alive.clone();
             let close_alive = alive.clone();
             dialog
-                .title("删除主机")
+                .title(tr("删除主机"))
                 .w(px(480.))
                 .close_button(!submitting.get())
                 .overlay_closable(!submitting.get())
@@ -1496,8 +1641,8 @@ impl AppView {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .child(format!("确定删除「{name}」？"))
-                        .child("仅删除本机配置与凭据，不影响 VPS 上的容器、镜像或数据。"),
+                        .child(tfmt!("确定删除「{name}」？"))
+                        .child(tr("仅删除本机配置与凭据，不影响 VPS 上的容器、镜像或数据；历史记录仍保留，但无法再通过这台主机执行核实或回滚。")),
                 )
                 .footer(
                     div()
@@ -1506,7 +1651,7 @@ impl AppView {
                         .gap_2()
                         .child(
                             Button::new("delete-cancel")
-                                .label("取消")
+                                .label(tr("取消"))
                                 .disabled(submitting.get())
                                 .on_click(move |_, window, cx| {
                                     if !cancel_submitting.get() {
@@ -1518,7 +1663,7 @@ impl AppView {
                         .child(
                             Button::new("delete-confirm")
                                 .danger()
-                                .label("确认删除")
+                                .label(tr("确认删除"))
                                 .disabled(submitting.get())
                                 .on_click(move |_, window, cx| {
                                     if save_submitting.replace(true) {
@@ -1558,7 +1703,7 @@ impl AppView {
         if self.host_installing == Some(id) || self.host_mirror_configuring == Some(id) {
             submitting.set(false);
             window.push_notification(
-                Notification::warning("Docker 配置操作期间不可删除主机。"),
+                Notification::warning(tr("Docker 配置操作期间不可删除主机。")),
                 cx,
             );
             return;
@@ -1630,14 +1775,14 @@ impl AppView {
                 match result {
                     Ok(warning) => window.push_notification(
                         match warning {
-                            Some(warning) => {
-                                Notification::warning(format!("主机已删除；{warning}"))
-                            }
-                            None => Notification::success("主机本地配置已删除，VPS 未受影响"),
+                            Some(warning) => Notification::warning(tfmt!("主机已删除；{warning}")),
+                            None => Notification::success(tr("主机本地配置已删除，VPS 未受影响")),
                         },
                         app,
                     ),
-                    Err(error) => window.push_notification(Notification::error(error), app),
+                    Err(error) => {
+                        window.push_notification(Notification::error(tr_system(&error)), app)
+                    }
                 }
             });
         })
@@ -1650,7 +1795,7 @@ impl AppView {
             .trigger(
                 Button::new(("host-more", id as usize))
                     .icon(assets::IconName::Ellipsis)
-                    .accessibility_label("更多操作"),
+                    .accessibility_label(tr("更多操作")),
             )
             .content(move |_, _, cx| {
                 let detail_view = view.clone();
@@ -1666,7 +1811,7 @@ impl AppView {
                     .flex_col()
                     .child(
                         Button::new(("host-details", id as usize))
-                            .label("详情")
+                            .label(tr("详情"))
                             .on_click(move |_, window, cx| {
                                 let _ = detail_popover
                                     .update(cx, |state, cx| state.dismiss(window, cx));
@@ -1677,7 +1822,7 @@ impl AppView {
                     )
                     .child(
                         Button::new(("host-menu-edit", id as usize))
-                            .label("编辑")
+                            .label(tr("编辑"))
                             .on_click(move |_, window, cx| {
                                 let _ =
                                     edit_popover.update(cx, |state, cx| state.dismiss(window, cx));
@@ -1689,7 +1834,7 @@ impl AppView {
                     .child(
                         Button::new(("host-menu-delete", id as usize))
                             .danger()
-                            .label("删除")
+                            .label(tr("删除"))
                             .on_click(move |_, window, cx| {
                                 let _ = delete_popover
                                     .update(cx, |state, cx| state.dismiss(window, cx));
@@ -1803,10 +1948,10 @@ impl AppView {
             .gap_6()
             .child(
                 self.page_head(
-                    "主机",
+                    tr("主机"),
                     Button::new("host-new")
                         .primary()
-                        .label("＋ 添加主机")
+                        .label(tr("＋ 添加主机"))
                         .on_click(
                             cx.listener(|this, _, window, cx| this.open_host_dialog(window, cx)),
                         ),
@@ -1817,7 +1962,7 @@ impl AppView {
                     Button::new("host-group")
                         .outline()
                         .label(if self.host_group == "all" {
-                            "全部分组  ▾".into()
+                            tr("全部分组  ▾").into()
                         } else {
                             format!("{}  ▾", self.host_group)
                         })
@@ -1868,7 +2013,7 @@ impl AppView {
                         .px_6()
                         .pb_6()
                         .text_color(self.palette().destructive)
-                        .child(error.clone()),
+                        .child(tr_system(error)),
                 )
                 .into_any_element()
             } else if self.hosts.is_empty() {
@@ -1884,11 +2029,11 @@ impl AppView {
                     .justify_center()
                     .gap_4()
                     .child(Icon::new(assets::IconName::Server).size(px(24.)))
-                    .child("还没有主机")
+                    .child(tr("还没有主机"))
                     .child(
                         Button::new("host-empty-add")
                             .primary()
-                            .label("添加主机")
+                            .label(tr("添加主机"))
                             .on_click(
                                 cx.listener(|this, _, window, cx| {
                                     this.open_host_dialog(window, cx)
@@ -1962,9 +2107,9 @@ impl AppView {
                                 Some(HostTestState::Connected { checked_at, .. }) => {
                                     let elapsed = checked_at.elapsed().as_secs() / 60;
                                     if elapsed == 0 {
-                                        "刚刚".into()
+                                        tr("刚刚")
                                     } else {
-                                        format!("{elapsed} 分钟前")
+                                        tfmt!("{elapsed} 分钟前")
                                     }
                                 }
                                 _ => "—".into(),
@@ -1977,8 +2122,8 @@ impl AppView {
                             .child(
                                 Button::new(("host-test", id as usize))
                                     .icon(assets::IconName::RefreshCw)
-                                    .accessibility_label("测试连接")
-                                    .tooltip("测试 SSH、Docker 与 Compose")
+                                    .accessibility_label(tr("测试连接"))
+                                    .tooltip(tr("测试 SSH、Docker 与 Compose"))
                                     .disabled(self.host_testing.is_some())
                                     .on_click(cx.listener(move |view, _, window, cx| {
                                         view.test_host(id, window, cx)
@@ -2003,32 +2148,32 @@ impl AppView {
                     .items_center()
                     .px_4()
                     .text_color(self.palette().muted)
-                    .child(div().w(px(120.)).flex_shrink_0().child("状态"))
-                    .child(div().w(px(130.)).flex_shrink_0().child("别名"))
-                    .child(div().w(px(220.)).flex_shrink_0().child("地址"))
-                    .child(div().w(px(130.)).flex_shrink_0().child("用户"))
-                    .child(div().w(px(140.)).flex_shrink_0().child("分组"))
-                    .child(div().w(px(105.)).flex_shrink_0().child("最近连接"))
-                    .child("操作"),
+                    .child(div().w(px(120.)).flex_shrink_0().child(tr("状态")))
+                    .child(div().w(px(130.)).flex_shrink_0().child(tr("别名")))
+                    .child(div().w(px(220.)).flex_shrink_0().child(tr("地址")))
+                    .child(div().w(px(130.)).flex_shrink_0().child(tr("用户")))
+                    .child(div().w(px(140.)).flex_shrink_0().child(tr("分组")))
+                    .child(div().w(px(105.)).flex_shrink_0().child(tr("最近连接")))
+                    .child(tr("操作")),
             )
             .child(rows)
     }
 
     fn host_status(&self, id: i64) -> (String, Hsla) {
         match self.host_tests.get(&id) {
-            Some(HostTestState::Checking) => ("测试中".into(), self.palette().muted),
+            Some(HostTestState::Checking) => (tr("测试中"), self.palette().muted),
             Some(HostTestState::Connected { stale: false, .. }) => {
-                ("在线".into(), self.palette().success)
+                (tr("在线"), self.palette().success)
             }
             Some(HostTestState::Connected { stale: true, .. }) => {
-                ("待复核".into(), self.palette().muted)
+                (tr("待复核"), self.palette().muted)
             }
-            Some(HostTestState::NeedsTrust) => ("待确认指纹".into(), self.palette().warning),
+            Some(HostTestState::NeedsTrust) => (tr("待确认指纹"), self.palette().warning),
             Some(HostTestState::DockerMissing { .. }) => {
-                ("Docker 未安装".into(), self.palette().warning)
+                (tr("Docker 未安装"), self.palette().warning)
             }
-            Some(HostTestState::Failed(_)) => ("连接失败".into(), self.palette().destructive),
-            None => ("未连接".into(), self.palette().muted),
+            Some(HostTestState::Failed(_)) => (tr("连接失败"), self.palette().destructive),
+            None => (tr("未连接"), self.palette().muted),
         }
     }
 
@@ -2054,7 +2199,7 @@ impl AppView {
             .flex()
             .flex_col()
             .gap_3()
-            .child(div().text_color(self.palette().muted).child(label))
+            .child(div().text_color(self.palette().muted).child(tr(label)))
             .child(
                 div()
                     .text_size(px(22.))
@@ -2076,11 +2221,11 @@ impl AppView {
         if let Some(error) = &self.host_monitor_error {
             let id = host.id;
             let message = match self.host_tests.get(&id) {
-                Some(HostTestState::Checking) => "正在测试 SSH 与 Docker…".into(),
+                Some(HostTestState::Checking) => tr("正在测试 SSH 与 Docker…"),
                 Some(HostTestState::Failed(latest)) => latest.clone(),
-                Some(HostTestState::NeedsTrust) => "请先独立核对并确认 SSH 主机指纹。".into(),
+                Some(HostTestState::NeedsTrust) => tr("请先独立核对并确认 SSH 主机指纹。"),
                 Some(HostTestState::DockerMissing { .. }) => {
-                    "SSH 已连接，但 Docker 未安装；请到基本信息查看安装引导。".into()
+                    tr("SSH 已连接，但 Docker 未安装；请到基本信息查看安装引导。")
                 }
                 _ => error.clone(),
             };
@@ -2095,10 +2240,14 @@ impl AppView {
                         .flex_col()
                         .items_start()
                         .gap_3()
-                        .child(div().text_color(self.palette().destructive).child(message))
+                        .child(
+                            div()
+                                .text_color(self.palette().destructive)
+                                .child(tr_system(&message)),
+                        )
                         .child(
                             Button::new("host-monitor-retry")
-                                .label("测试连接 / 重连")
+                                .label(tr("测试连接 / 重连"))
                                 .disabled(self.host_testing.is_some())
                                 .on_click(cx.listener(move |view, _, window, cx| {
                                     view.test_host(id, window, cx)
@@ -2240,11 +2389,11 @@ impl AppView {
                                 .flex()
                                 .items_center()
                                 .text_color(self.palette().muted)
-                                .child(div().w(px(170.)).flex_shrink_0().child("名称"))
-                                .child(div().w(px(260.)).flex_shrink_0().child("镜像"))
-                                .child(div().w(px(120.)).flex_shrink_0().child("状态"))
+                                .child(div().w(px(170.)).flex_shrink_0().child(tr("名称")))
+                                .child(div().w(px(260.)).flex_shrink_0().child(tr("镜像")))
+                                .child(div().w(px(120.)).flex_shrink_0().child(tr("状态")))
                                 .child(div().w(px(90.)).flex_shrink_0().child("CPU"))
-                                .child("内存"),
+                                .child(tr("内存")),
                         )
                         .child(rows)
                         .into_any_element()
@@ -2261,7 +2410,7 @@ impl AppView {
             .flex()
             .flex_col()
             .gap_1()
-            .child(div().text_color(self.palette().muted).child(label))
+            .child(div().text_color(self.palette().muted).child(tr(label)))
             .child(div().min_w_0().whitespace_normal().child(value))
     }
 
@@ -2350,12 +2499,12 @@ impl AppView {
                     div()
                         .flex()
                         .gap_2()
-                        .child(Button::new("host-edit").label("编辑").on_click(cx.listener(
+                        .child(Button::new("host-edit").label(tr("编辑")).on_click(cx.listener(
                             move |view, _, window, cx| view.open_edit_host_dialog(id, window, cx),
                         )))
                         .child(
                             Button::new("host-containers")
-                                .label("打开容器管理")
+                                .label(tr("打开容器管理"))
                                 .on_click(cx.listener(move |view, _, window, cx| {
                                     view.navigate(Page::Containers, window, cx);
                                     view.switch_container_host(id, window, cx);
@@ -2456,23 +2605,23 @@ impl AppView {
                                         .flex_col()
                                         .items_start()
                                         .gap_3()
-                                        .child(div().text_color(self.palette().warning).child("SSH 已连接 · Docker 未安装"))
+                                        .child(div().text_color(self.palette().warning).child(tr("SSH 已连接 · Docker 未安装")))
                                         .child(if install_supported {
                                             "国内推荐腾讯云 Docker CE apt 镜像；安装前需确认仓库签名，完成后自动重新测试。"
                                         } else {
                                             "一键安装目前仅支持 Debian 13 / amd64 且以 root 登录；请按 Docker 官方文档手动安装 Engine 与 Compose。"
                                         })
                                         .when_some(self.host_install_error.as_ref().filter(|(failed_id, _)| *failed_id == id), |el, (_, error)| {
-                                            el.child(div().text_color(self.palette().destructive).child(error.clone()))
+                                            el.child(div().text_color(self.palette().destructive).child(tr_system(error)))
                                         })
                                         .when(install_supported, |el| {
                                             el.child(Button::new("docker-install-open")
-                                                .label(if self.host_installing == Some(id) { "正在安装 Docker…" } else { "一键安装 Docker" })
+                                                .label(if self.host_installing == Some(id) { tr("正在安装 Docker…") } else { tr("一键安装 Docker") })
                                                 .disabled(self.host_installing.is_some())
                                                 .on_click(cx.listener(move |view, _, window, cx| view.confirm_docker_install(id, window, cx))))
                                         })
                                         .when(self.host_installing == Some(id), |el| {
-                                            el.child(self.host_install_stage.clone().unwrap_or_else(|| "安装中…".into()))
+                                            el.child(tr(&self.host_install_stage.clone().unwrap_or_else(|| "安装中…".into())))
                                         }),
                                 )
                             })
@@ -2487,18 +2636,18 @@ impl AppView {
                                         .flex_col()
                                         .items_start()
                                         .gap_3()
-                                        .child("Docker Hub 镜像源")
-                                        .child("已实测候选：1Panel、DaoCloud。配置时保留其他 daemon 设置；会重启 Docker，运行容器不为空则阻断。")
+                                        .child(tr("Docker Hub 镜像源"))
+                                        .child(tr("已实测候选：1Panel、DaoCloud。配置时保留其他 daemon 设置；会重启 Docker，运行容器不为空则阻断。"))
                                         .when_some(self.host_mirror_error.as_ref().filter(|(failed_id, _)| *failed_id == id), |el, (_, error)| {
-                                            el.child(div().text_color(self.palette().destructive).child(error.clone()))
+                                            el.child(div().text_color(self.palette().destructive).child(tr_system(error)))
                                         })
                                         .child(Button::new("mirror-config-open")
-                                            .label(if self.host_mirror_configuring == Some(id) { "正在配置镜像源…" } else { "配置镜像源" })
+                                            .label(if self.host_mirror_configuring == Some(id) { tr("正在配置镜像源…") } else { tr("配置镜像源") })
                                             .disabled(self.host_installing.is_some() || self.host_mirror_configuring.is_some())
                                             .on_click(cx.listener(move |view, _, window, cx| view.confirm_mirror_config(id, window, cx)))),
                                 )
                             })
-                            .child(div().text_color(color).child(format!(
+                            .child(div().text_color(color).child(tfmt!(
                                 "连接状态：{status} · 主机指纹{} · {status_detail}",
                                 if host.trusted_fingerprint.is_some() {
                                     "已确认"
@@ -2559,9 +2708,9 @@ impl AppView {
             let close_alive = alive.clone();
             dialog
                 .title(if id.is_some() {
-                    "编辑项目"
+                    tr("编辑项目")
                 } else {
-                    "新建项目"
+                    tr("新建项目")
                 })
                 .w(px(640.))
                 .close_button(!submitting.get())
@@ -2583,7 +2732,7 @@ impl AppView {
                                 .child(div().flex_1().child(Input::new(&path).w_full()))
                                 .child(
                                     Button::new("browse-project")
-                                        .label("浏览")
+                                        .label(tr("浏览"))
                                         .disabled(submitting.get())
                                         .on_click(move |_, window, cx| {
                                             let _ = browse_view.update(cx, |view, cx| {
@@ -2617,7 +2766,7 @@ impl AppView {
                         .gap_2()
                         .child(
                             Button::new("project-cancel")
-                                .label("取消")
+                                .label(tr("取消"))
                                 .disabled(submitting.get())
                                 .on_click(move |_, window, cx| {
                                     if !cancel_submitting.get() {
@@ -2630,9 +2779,9 @@ impl AppView {
                             Button::new("project-save")
                                 .primary()
                                 .label(if id.is_some() {
-                                    "保存"
+                                    tr("保存")
                                 } else {
-                                    "创建项目"
+                                    tr("创建项目")
                                 })
                                 .disabled(submitting.get())
                                 .on_click(move |_, window, cx| {
@@ -2740,11 +2889,11 @@ impl AppView {
                         view.select_project(id, window, cx);
                     });
                     window.push_notification(
-                        Notification::success("已导入 devingpanel.yaml；请核对发布就绪状态"),
+                        Notification::success(tr("已导入 devingpanel.yaml；请核对发布就绪状态")),
                         app,
                     );
                 }
-                Err(error) => window.push_notification(Notification::error(error), app),
+                Err(error) => window.push_notification(Notification::error(tr_system(&error)), app),
             });
         })
         .detach();
@@ -2781,7 +2930,7 @@ impl AppView {
                         cx.notify();
                     });
                 }
-                Err(error) => window.push_notification(Notification::error(error), app),
+                Err(error) => window.push_notification(Notification::error(tr_system(&error)), app),
             });
         })
         .detach();
@@ -2799,16 +2948,16 @@ impl AppView {
         window.open_dialog(cx, move |dialog, _, _| {
             let confirm_view = view.clone();
             dialog
-                .title("改用 devingpanel.yaml")
+                .title(tr("改用 devingpanel.yaml"))
                 .w(px(520.))
                 .child(div().flex().flex_col().gap_3()
-                    .child("若项目目录已有 devingpanel.yaml，将读取并校验，绝不覆盖。否则从现有非秘密配置生成文件。")
-                    .child("Build args 会作为明文写入项目目录；请先确认其中没有密码或令牌。SSH 凭据及敏感环境变量不会写入文件。")
-                    .child("目标主机按 YAML 顺序重新绑定；移除绑定可能清理该主机的本地专属变量。迁移后项目构建、Compose 和目标主机设置由 YAML 唯一决定。"))
+                    .child(tr("若项目目录已有 devingpanel.yaml，将读取并校验，绝不覆盖。否则从现有非秘密配置生成文件。"))
+                    .child(tr("Build args 会作为明文写入项目目录；请先确认其中没有密码或令牌。SSH 凭据及敏感环境变量不会写入文件。"))
+                    .child(tr("目标主机按 YAML 顺序重新绑定；移除绑定可能清理该主机的本地专属变量。迁移后项目构建、Compose 和目标主机设置由 YAML 唯一决定。")))
                 .footer(div().flex().justify_end().gap_2()
-                    .child(Button::new("adopt-cancel").label("取消")
+                    .child(Button::new("adopt-cancel").label(tr("取消"))
                         .on_click(|_, window, cx| window.close_dialog(cx)))
-                    .child(Button::new("adopt-confirm").primary().label("确认迁移")
+                    .child(Button::new("adopt-confirm").primary().label(tr("确认迁移"))
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let _ = confirm_view.update(cx, |view, cx| view.adopt_manifest(id, window, cx));
@@ -2841,13 +2990,13 @@ impl AppView {
                     });
                     window.push_notification(
                         match warning {
-                            Some(warning) => Notification::warning(format!("已迁移；{warning}")),
-                            None => Notification::success("项目已改用 devingpanel.yaml"),
+                            Some(warning) => Notification::warning(tfmt!("已迁移；{warning}")),
+                            None => Notification::success(tr("项目已改用 devingpanel.yaml")),
                         },
                         app,
                     );
                 }
-                Err(error) => window.push_notification(Notification::error(error), app),
+                Err(error) => window.push_notification(Notification::error(tr_system(&error)), app),
             });
         })
         .detach();
@@ -2864,15 +3013,15 @@ impl AppView {
         let view = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, _| {
             let confirm_view = view.clone();
-            dialog.title("确认 YAML 目标主机")
+            dialog.title(tr("确认 YAML 目标主机"))
                 .w(px(520.))
                 .child(div().flex().flex_col().gap_3()
-                    .child("请先由管理员核对本机主机组、别名、SSH 凭据和指纹。")
-                    .child("确认后按 devingpanel.yaml 顺序绑定目标；取消旧绑定可能清理对应的本机主机专属环境变量。"))
+                    .child(tr("请先由管理员核对本机主机组、别名、SSH 凭据和指纹。"))
+                    .child(tr("确认后按 devingpanel.yaml 顺序绑定目标；取消旧绑定可能清理对应的本机主机专属环境变量。")))
                 .footer(div().flex().justify_end().gap_2()
-                    .child(Button::new("manifest-target-cancel").label("取消")
+                    .child(Button::new("manifest-target-cancel").label(tr("取消"))
                         .on_click(|_, window, cx| window.close_dialog(cx)))
-                    .child(Button::new("manifest-target-confirm").primary().label("确认绑定")
+                    .child(Button::new("manifest-target-confirm").primary().label(tr("确认绑定"))
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let _ = confirm_view.update(cx, |view, cx| view.sync_manifest_targets(id, window, cx));
@@ -2901,15 +3050,13 @@ impl AppView {
                     });
                     window.push_notification(
                         match warning {
-                            Some(warning) => {
-                                Notification::warning(format!("目标已更新；{warning}"))
-                            }
-                            None => Notification::success("YAML 目标主机已核对"),
+                            Some(warning) => Notification::warning(tfmt!("目标已更新；{warning}")),
+                            None => Notification::success(tr("YAML 目标主机已核对")),
                         },
                         app,
                     );
                 }
-                Err(error) => window.push_notification(Notification::error(error), app),
+                Err(error) => window.push_notification(Notification::error(tr_system(&error)), app),
             });
         })
         .detach();
@@ -2975,7 +3122,7 @@ impl AppView {
                     );
                 }
                 Err(error) => {
-                    window.push_notification(Notification::error(error), app);
+                    window.push_notification(Notification::error(tr_system(&error)), app);
                     window.refresh();
                 }
             });
@@ -2996,7 +3143,7 @@ impl AppView {
             .justify_center()
             .gap_4()
             .child(Icon::new(assets::IconName::Folder).size(px(24.)))
-            .child(title)
+            .child(tr(title))
             .child(
                 div()
                     .flex()
@@ -3004,16 +3151,18 @@ impl AppView {
                     .child(
                         Button::new("project-empty-import")
                             .primary()
-                            .label("导入已配置项目")
+                            .label(tr("导入已配置项目"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.import_configured_project(window, cx)
                             })),
                     )
-                    .child(Button::new("project-empty-add").label("新建项目").on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.open_project_dialog(None, window, cx)
-                        }),
-                    )),
+                    .child(
+                        Button::new("project-empty-add")
+                            .label(tr("新建项目"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_project_dialog(None, window, cx)
+                            })),
+                    ),
             )
     }
 
@@ -3030,13 +3179,13 @@ impl AppView {
             .gap_6()
             .child(
                 self.page_head(
-                    "项目",
+                    tr("项目"),
                     div()
                         .flex()
                         .gap_2()
                         .child(
                             Button::new("project-import-config")
-                                .label("导入已配置项目")
+                                .label(tr("导入已配置项目"))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.import_configured_project(window, cx)
                                 })),
@@ -3044,7 +3193,7 @@ impl AppView {
                         .child(
                             Button::new("project-new")
                                 .primary()
-                                .label("＋ 新建项目")
+                                .label(tr("＋ 新建项目"))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_project_dialog(None, window, cx)
                                 })),
@@ -3061,7 +3210,7 @@ impl AppView {
                     .border_color(self.palette().destructive)
                     .rounded_lg()
                     .text_color(self.palette().destructive)
-                    .child(format!("项目数据读取失败：{error}"))
+                    .child(tfmt!("项目数据读取失败：{error}"))
                     .into_any_element()
             } else if self.projects.is_empty() {
                 self.project_empty("还没有项目", cx).into_any_element()
@@ -3151,8 +3300,8 @@ impl AppView {
                     .child(
                         Button::new(("project-deploy", id as usize))
                             .primary()
-                            .label("发布")
-                            .tooltip("发布执行链尚未完成，暂不可一键发布")
+                            .label(tr("发布"))
+                            .tooltip(tr("发布执行链尚未完成，暂不可一键发布"))
                             .disabled(true),
                     )
                     .child(self.project_actions(id, cx)),
@@ -3174,12 +3323,12 @@ impl AppView {
                     .px_4()
                     .text_color(self.palette().muted)
                     .text_size(px(14.))
-                    .child(div().w(px(135.)).flex_shrink_0().child("项目名"))
-                    .child(div().w(px(215.)).flex_shrink_0().child("本地路径"))
-                    .child(div().w(px(130.)).flex_shrink_0().child("绑定主机数"))
-                    .child(div().w(px(200.)).flex_shrink_0().child("最近发布"))
-                    .child(div().w(px(105.)).flex_shrink_0().child("状态"))
-                    .child("操作"),
+                    .child(div().w(px(135.)).flex_shrink_0().child(tr("项目名")))
+                    .child(div().w(px(215.)).flex_shrink_0().child(tr("本地路径")))
+                    .child(div().w(px(130.)).flex_shrink_0().child(tr("绑定主机数")))
+                    .child(div().w(px(200.)).flex_shrink_0().child(tr("最近发布")))
+                    .child(div().w(px(105.)).flex_shrink_0().child(tr("状态")))
+                    .child(tr("操作")),
             )
             .child(rows)
     }
@@ -3190,7 +3339,7 @@ impl AppView {
             .trigger(
                 Button::new(("project-more", id as usize))
                     .icon(assets::IconName::Ellipsis)
-                    .accessibility_label("更多操作"),
+                    .accessibility_label(tr("更多操作")),
             )
             .content(move |_, _, cx| {
                 let detail_view = view.clone();
@@ -3206,7 +3355,7 @@ impl AppView {
                     .flex_col()
                     .child(
                         Button::new(("project-details", id as usize))
-                            .label("详情")
+                            .label(tr("详情"))
                             .on_click(move |_, window, cx| {
                                 let _ = detail_popover
                                     .update(cx, |state, cx| state.dismiss(window, cx));
@@ -3216,7 +3365,7 @@ impl AppView {
                     )
                     .child(
                         Button::new(("project-edit", id as usize))
-                            .label("编辑")
+                            .label(tr("编辑"))
                             .on_click(move |_, window, cx| {
                                 let _ =
                                     edit_popover.update(cx, |state, cx| state.dismiss(window, cx));
@@ -3228,7 +3377,7 @@ impl AppView {
                     .child(
                         Button::new(("project-delete", id as usize))
                             .danger()
-                            .label("删除")
+                            .label(tr("删除"))
                             .on_click(move |_, window, cx| {
                                 let _ = delete_popover
                                     .update(cx, |state, cx| state.dismiss(window, cx));
@@ -3258,7 +3407,7 @@ impl AppView {
             let cancel_alive = alive.clone();
             let close_alive = alive.clone();
             dialog
-                .title("删除项目")
+                .title(tr("删除项目"))
                 .w(px(480.))
                 .close_button(!submitting.get())
                 .overlay_closable(!submitting.get())
@@ -3269,8 +3418,10 @@ impl AppView {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .child(format!("确定删除「{name}」？"))
-                        .child("只删除本机项目配置及其绑定，不删除远端服务或数据。"),
+                        .child(tfmt!("确定删除「{name}」？"))
+                        .child(tr(
+                            "只删除本机项目配置及其绑定；发布历史、版本材料和远端服务会保留。",
+                        )),
                 )
                 .footer(
                     div()
@@ -3279,7 +3430,7 @@ impl AppView {
                         .gap_2()
                         .child(
                             Button::new("project-delete-cancel")
-                                .label("取消")
+                                .label(tr("取消"))
                                 .disabled(submitting.get())
                                 .on_click(move |_, window, cx| {
                                     if !cancel_submitting.get() {
@@ -3291,7 +3442,7 @@ impl AppView {
                         .child(
                             Button::new("project-delete-confirm")
                                 .danger()
-                                .label("确认删除")
+                                .label(tr("确认删除"))
                                 .disabled(submitting.get())
                                 .on_click(move |_, window, cx| {
                                     if save_submitting.replace(true) {
@@ -3386,14 +3537,14 @@ impl AppView {
                 match result {
                     Ok(warning) => window.push_notification(
                         match warning {
-                            Some(warning) => {
-                                Notification::warning(format!("项目已删除；{warning}"))
-                            }
-                            None => Notification::success("项目本地配置已删除"),
+                            Some(warning) => Notification::warning(tfmt!("项目已删除；{warning}")),
+                            None => Notification::success(tr("项目本地配置已删除")),
                         },
                         app,
                     ),
-                    Err(error) => window.push_notification(Notification::error(error), app),
+                    Err(error) => {
+                        window.push_notification(Notification::error(tr_system(&error)), app)
+                    }
                 }
             });
         })
@@ -3523,8 +3674,12 @@ impl AppView {
                     cx.notify();
                 });
                 match result {
-                    Ok(_) => window.push_notification(Notification::success("部署服务已保存"), app),
-                    Err(error) => window.push_notification(Notification::error(error), app),
+                    Ok(_) => {
+                        window.push_notification(Notification::success(tr("部署服务已保存")), app)
+                    }
+                    Err(error) => {
+                        window.push_notification(Notification::error(tr_system(&error)), app)
+                    }
                 }
             });
         })
@@ -3582,8 +3737,12 @@ impl AppView {
                     cx.notify();
                 });
                 match result {
-                    Ok(_) => window.push_notification(Notification::success("构建配置已保存"), app),
-                    Err(error) => window.push_notification(Notification::error(error), app),
+                    Ok(_) => {
+                        window.push_notification(Notification::success(tr("构建配置已保存")), app)
+                    }
+                    Err(error) => {
+                        window.push_notification(Notification::error(tr_system(&error)), app)
+                    }
                 }
             });
         })
@@ -3626,7 +3785,7 @@ impl AppView {
                 let label = if service.uses_project_image {
                     name.clone()
                 } else {
-                    format!("{} · 未使用项目镜像", service.name)
+                    tfmt!("{} · 未使用项目镜像", service.name)
                 };
                 options = options.child(
                     Button::new(("service-option", index))
@@ -3641,11 +3800,11 @@ impl AppView {
         let label = if !project.service.is_empty() {
             project.service.clone()
         } else if project.compose_files.is_empty() {
-            "请先添加 Compose 文件".into()
+            tr("请先添加 Compose 文件")
         } else if self.service_loading {
-            "正在读取服务…".into()
+            tr("正在读取服务…")
         } else {
-            "请选择部署服务".into()
+            tr("请选择部署服务")
         };
         let stale = matching
             && !self.service_loading
@@ -3688,7 +3847,7 @@ impl AppView {
                         div()
                             .text_size(px(12.))
                             .text_color(self.palette().warning)
-                            .child(error.clone()),
+                            .child(tr_system(error)),
                     )
                 },
             )
@@ -3697,7 +3856,7 @@ impl AppView {
                     div()
                         .text_size(px(12.))
                         .text_color(self.palette().warning)
-                        .child("部署服务已失效，请重新选择。"),
+                        .child(tr("部署服务已失效，请重新选择。")),
                 )
             })
     }
@@ -3746,10 +3905,11 @@ impl AppView {
                     cx.notify();
                 });
                 match result {
-                    Some(Ok(_)) => {
-                        window.push_notification(Notification::success("Compose 文件已保存"), app)
+                    Some(Ok(_)) => window
+                        .push_notification(Notification::success(tr("Compose 文件已保存")), app),
+                    Some(Err(error)) => {
+                        window.push_notification(Notification::error(tr_system(&error)), app)
                     }
-                    Some(Err(error)) => window.push_notification(Notification::error(error), app),
                     None => {}
                 }
             });
@@ -3792,10 +3952,11 @@ impl AppView {
                     cx.notify();
                 });
                 match result {
-                    Ok(_) => {
-                        window.push_notification(Notification::success("Compose 顺序已保存"), app)
+                    Ok(_) => window
+                        .push_notification(Notification::success(tr("Compose 顺序已保存")), app),
+                    Err(error) => {
+                        window.push_notification(Notification::error(tr_system(&error)), app)
                     }
-                    Err(error) => window.push_notification(Notification::error(error), app),
                 }
             });
         })
@@ -3876,7 +4037,7 @@ impl AppView {
                 .panel(
                     "构建配置",
                     "镜像在开发机构建，不占用 VPS 编译资源。",
-                    div().px_6().pb_6().child("正在打开构建配置…"),
+                    div().px_6().pb_6().child(tr("正在打开构建配置…")),
                 )
                 .into_any_element();
         };
@@ -3903,7 +4064,7 @@ impl AppView {
                     .child(
                         Button::new(("build-arg-remove", index))
                             .icon(assets::IconName::Trash)
-                            .accessibility_label("删除行")
+                            .accessibility_label(tr("删除行"))
                             .disabled(self.build_saving)
                             .on_click(
                                 cx.listener(move |view, _, _, cx| view.remove_build_arg(index, cx)),
@@ -3920,7 +4081,7 @@ impl AppView {
                 .flex()
                 .flex_col()
                 .gap_5()
-                .child(div().text_size(px(12.)).text_color(self.palette().muted).child(format!("本地目录：{}  ·  Dockerfile：{}", project.path, project.dockerfile)))
+                .child(div().text_size(px(12.)).text_color(self.palette().muted).child(tfmt!("本地目录：{}  ·  Dockerfile：{}", project.path, project.dockerfile)))
                 .child(
                     div()
                         .flex()
@@ -3937,7 +4098,7 @@ impl AppView {
                                 .when(narrow, |el| el.w_full())
                                 .when(!narrow, |el| el.w(px(520.)))
                                 .child(Self::form_field("Tag 规则", Input::new(&form.tag_rule).w_full().disabled(self.build_saving)))
-                                .child(div().text_size(px(12.)).text_color(self.palette().muted).child("支持 {timestamp} / {git-sha}；发布时附加架构后缀，并检查标识冲突。")),
+                                .child(div().text_size(px(12.)).text_color(self.palette().muted).child(tr("支持 {timestamp} / {git-sha}；发布时附加架构后缀，并检查标识冲突。"))),
                         )
                         .child(
                             div()
@@ -3983,11 +4144,11 @@ impl AppView {
                         .flex_col()
                         .gap_2()
                         .child(div().font_weight(FontWeight::SEMIBOLD).child("Build args"))
-                        .child(div().text_color(self.palette().muted).child("构建参数不是秘密传输机制，请勿填写密码或令牌。"))
+                        .child(div().text_color(self.palette().muted).child(tr("构建参数不是秘密传输机制，请勿填写密码或令牌。")))
                         .child(arg_rows)
-                        .child(div().flex().child(Button::new("build-arg-add").label("＋ 添加变量").disabled(self.build_saving).on_click(cx.listener(|view, _, window, cx| view.add_build_arg(window, cx))))),
+                        .child(div().flex().child(Button::new("build-arg-add").label(tr("＋ 添加变量")).disabled(self.build_saving).on_click(cx.listener(|view, _, window, cx| view.add_build_arg(window, cx))))),
                 )
-                .child(div().flex().child(Button::new("build-save").primary().label("保存").disabled(self.build_saving).on_click(cx.listener(|view, _, window, cx| view.save_build(window, cx))))),
+                .child(div().flex().child(Button::new("build-save").primary().label(tr("保存")).disabled(self.build_saving).on_click(cx.listener(|view, _, window, cx| view.save_build(window, cx))))),
         )
         .into_any_element()
     }
@@ -4017,8 +4178,8 @@ impl AppView {
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(format!("服务 {} · 镜像 {}", service.name, service.image))
-                        .child(format!("端口 {ports} · 卷 {} 项", service.volumes)),
+                        .child(tfmt!("服务 {} · 镜像 {}", service.name, service.image))
+                        .child(tfmt!("端口 {ports} · 卷 {} 项", service.volumes)),
                 );
             }
         }
@@ -4051,14 +4212,14 @@ impl AppView {
                                 el.child(
                                     div()
                                         .text_color(self.palette().warning)
-                                        .child("文件不存在或已移出项目目录"),
+                                        .child(tr("文件不存在或已移出项目目录")),
                                 )
                             }),
                     )
                     .child(
                         Button::new(("compose-up", index))
                             .icon(assets::IconName::ArrowUp)
-                            .accessibility_label("上移")
+                            .accessibility_label(tr("上移"))
                             .disabled(index == 0 || self.compose_saving || self.service_saving)
                             .on_click(cx.listener(move |view, _, window, cx| {
                                 if let Some(project) = view.projects.iter().find(|p| p.id == id) {
@@ -4073,7 +4234,7 @@ impl AppView {
                     .child(
                         Button::new(("compose-down", index))
                             .icon(assets::IconName::ArrowDown)
-                            .accessibility_label("下移")
+                            .accessibility_label(tr("下移"))
                             .disabled(
                                 index + 1 == count || self.compose_saving || self.service_saving,
                             )
@@ -4090,7 +4251,7 @@ impl AppView {
                     .child(
                         Button::new(("compose-remove", index))
                             .icon(assets::IconName::Trash)
-                            .accessibility_label("移除")
+                            .accessibility_label(tr("移除"))
                             .disabled(self.compose_saving || self.service_saving)
                             .on_click(cx.listener(move |view, _, window, cx| {
                                 if let Some(project) = view.projects.iter().find(|p| p.id == id) {
@@ -4113,25 +4274,25 @@ impl AppView {
                 .flex()
                 .flex_col()
                 .gap_4()
-                .when(count == 0, |el| el.child(div().text_color(self.palette().muted).child("尚未添加 Compose 文件")))
+                .when(count == 0, |el| el.child(div().text_color(self.palette().muted).child(tr("尚未添加 Compose 文件"))))
                 .child(rows)
-                .child(div().flex().child(Button::new("compose-add").label("＋ 添加 compose 文件").disabled(self.compose_saving || self.service_saving).on_click(cx.listener(|view, _, window, cx| view.pick_compose_files(window, cx)))))
-                .child(div().text_color(self.palette().muted).child("首个文件须位于项目根目录；目标服务使用 image: ${DEVINGPANEL_IMAGE}。发布前仍须校验合并配置，禁止远端 build。"))
+                .child(div().flex().child(Button::new("compose-add").label(tr("＋ 添加 compose 文件")).disabled(self.compose_saving || self.service_saving).on_click(cx.listener(|view, _, window, cx| view.pick_compose_files(window, cx)))))
+                .child(div().text_color(self.palette().muted).child(tr("首个文件须位于项目根目录；目标服务使用 image: ${DEVINGPANEL_IMAGE}。发布前仍须校验合并配置，禁止远端 build。")))
                 .child(div().flex().child(Button::new("compose-summary")
-                    .label(if self.compose_summary_open { "▾ 查看部署配置摘要" } else { "▸ 查看部署配置摘要" })
+                    .label(if self.compose_summary_open { tr("▾ 查看部署配置摘要") } else { tr("▸ 查看部署配置摘要") })
                     .disabled(count == 0 || self.compose_saving)
                     .on_click(cx.listener(|view, _, _, cx| view.toggle_compose_summary(cx)))))
                 .when(self.compose_summary_open, |el| el.child(
                     div().w_full().rounded_md().bg(self.palette().accent).p_4()
                         .child(if self.compose_summary_loading {
-                            div().child("正在解析本机 Compose 配置…").into_any_element()
+                            div().child(tr("正在解析本机 Compose 配置…")).into_any_element()
                         } else if let Some(Err(error)) = &self.compose_summary {
-                            div().text_color(self.palette().warning).child(error.clone()).into_any_element()
+                            div().text_color(self.palette().warning).child(tr_system(error)).into_any_element()
                         } else {
                             summary_rows.into_any_element()
                         })
                         .child(div().pt_2().text_color(self.palette().muted)
-                    .child("当前解析快照；文件变化后请重新展开。这不是发布预检结果。"))
+                    .child(tr("当前解析快照；文件变化后请重新展开。这不是发布预检结果。")))
                 )),
         )
         .into_any_element()
@@ -4254,7 +4415,9 @@ impl AppView {
             let value = row.value.read(cx).value().to_string();
             if !row.sensitive && row.credential_id.is_some() && value.is_empty() {
                 window.push_notification(
-                    Notification::error("改为非敏感变量时须重新填写值；该值将明文写入 SQLite。"),
+                    Notification::error(tr(
+                        "改为非敏感变量时须重新填写值；该值将明文写入 SQLite。",
+                    )),
                     cx,
                 );
                 return;
@@ -4302,8 +4465,12 @@ impl AppView {
                     cx.notify();
                 });
                 match result {
-                    Ok(_) => window.push_notification(Notification::success("环境变量已保存"), app),
-                    Err(error) => window.push_notification(Notification::error(error), app),
+                    Ok(_) => {
+                        window.push_notification(Notification::success(tr("环境变量已保存")), app)
+                    }
+                    Err(error) => {
+                        window.push_notification(Notification::error(tr_system(&error)), app)
+                    }
                 }
             });
         })
@@ -4372,13 +4539,15 @@ impl AppView {
                     Ok((_, warning)) => window.push_notification(
                         match warning {
                             Some(warning) => {
-                                Notification::warning(format!("目标主机已保存；{warning}"))
+                                Notification::warning(tfmt!("目标主机已保存；{warning}"))
                             }
-                            None => Notification::success("目标主机已保存"),
+                            None => Notification::success(tr("目标主机已保存")),
                         },
                         app,
                     ),
-                    Err(error) => window.push_notification(Notification::error(error), app),
+                    Err(error) => {
+                        window.push_notification(Notification::error(tr_system(&error)), app)
+                    }
                 }
             });
         })
@@ -4404,7 +4573,7 @@ impl AppView {
                 Button::new(("target-group-option", index))
                     .w_full()
                     .label(if option.is_empty() {
-                        "未分组".into()
+                        tr("未分组").into()
                     } else {
                         option.clone()
                     })
@@ -4459,7 +4628,7 @@ impl AppView {
                             .child(
                                 Button::new(("target-up", id as usize))
                                     .icon(assets::IconName::ArrowUp)
-                                    .accessibility_label("上移")
+                                    .accessibility_label(tr("上移"))
                                     .disabled(!checked || index == 0 || self.target_saving)
                                     .on_click(cx.listener(move |view, _, _, cx| {
                                         if let Some(form) = view.target_form.as_mut()
@@ -4475,7 +4644,7 @@ impl AppView {
                             .child(
                                 Button::new(("target-down", id as usize))
                                     .icon(assets::IconName::ArrowDown)
-                                    .accessibility_label("下移")
+                                    .accessibility_label(tr("下移"))
                                     .disabled(
                                         !checked
                                             || index + 1 >= selected.len()
@@ -4497,7 +4666,7 @@ impl AppView {
                         div().w(px(75.)).flex_shrink_0().child(
                             base::Checkbox::new(("target-check", id as usize))
                                 .checked(checked)
-                                .accessibility_label(format!("选择 {name}"))
+                                .accessibility_label(tfmt!("选择 {name}"))
                                 .disabled(self.target_saving)
                                 .on_change(move |_, _, _, app| {
                                     let _ = view.update(app, |view, cx| {
@@ -4560,7 +4729,7 @@ impl AppView {
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .child("主机组")
+                        .child(tr("主机组"))
                         .child(
                             div()
                                 .id("target-group")
@@ -4589,16 +4758,16 @@ impl AppView {
                         .when(self.target_menu_open, |el| el.child(group_options)),
                 )
                 .child(if !self.host_loaded {
-                    div().child("正在读取主机…").into_any_element()
+                    div().child(tr("正在读取主机…")).into_any_element()
                 } else if let Some(error) = &self.host_error {
                     div()
                         .text_color(self.palette().destructive)
-                        .child(error.clone())
+                        .child(tr_system(error))
                         .into_any_element()
                 } else if hosts.is_empty() {
                     div()
                         .text_color(self.palette().muted)
-                        .child("该主机组暂无主机，请先添加主机。")
+                        .child(tr("该主机组暂无主机，请先添加主机。"))
                         .into_any_element()
                 } else {
                     div()
@@ -4615,29 +4784,27 @@ impl AppView {
                                 .flex()
                                 .items_center()
                                 .text_color(self.palette().muted)
-                                .child(div().w(px(145.)).flex_shrink_0().child("顺序"))
-                                .child(div().w(px(75.)).flex_shrink_0().child("选择"))
-                                .child(div().w(px(85.)).flex_shrink_0().child("状态"))
-                                .child(div().w(px(145.)).flex_shrink_0().child("主机名"))
-                                .child(div().w(px(190.)).flex_shrink_0().child("地址"))
-                                .child("分组"),
+                                .child(div().w(px(145.)).flex_shrink_0().child(tr("顺序")))
+                                .child(div().w(px(75.)).flex_shrink_0().child(tr("选择")))
+                                .child(div().w(px(85.)).flex_shrink_0().child(tr("状态")))
+                                .child(div().w(px(145.)).flex_shrink_0().child(tr("主机名")))
+                                .child(div().w(px(190.)).flex_shrink_0().child(tr("地址")))
+                                .child(tr("分组")),
                         )
                         .child(rows)
                         .into_any_element()
                 })
-                .child(div().text_color(self.palette().muted).child(
+                .child(div().text_color(self.palette().muted).child(tr(
                     "发布时按列表顺序逐台部署，健康检查通过后进入下一台；并行度大于 1 时按批处理。",
-                ))
-                .child(
-                    div()
-                        .text_color(self.palette().warning)
-                        .child("取消绑定主机并保存后，该主机的专属环境变量也会从本机配置中移除。"),
-                )
+                )))
+                .child(div().text_color(self.palette().warning).child(tr(
+                    "取消绑定主机并保存后，该主机的专属环境变量也会从本机配置中移除。",
+                )))
                 .child(
                     div().flex().child(
                         Button::new("targets-save")
                             .primary()
-                            .label("保存")
+                            .label(tr("保存"))
                             .disabled(
                                 self.target_saving
                                     || !self.host_loaded
@@ -4662,15 +4829,17 @@ impl AppView {
         window.open_dialog(cx, move |dialog, _, _| {
             let view = view.clone();
             dialog
-                .title("关闭敏感存储？")
+                .title(tr("关闭敏感存储？"))
                 .w(px(480.))
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .child("此变量的新值会以明文写入本机 SQLite。")
-                        .child("已安全保存的旧值不会自动回填；请重新填写要保存的非敏感值。"),
+                        .child(tr("此变量的新值会以明文写入本机 SQLite。"))
+                        .child(tr(
+                            "已安全保存的旧值不会自动回填；请重新填写要保存的非敏感值。",
+                        )),
                 )
                 .footer(
                     div()
@@ -4679,13 +4848,13 @@ impl AppView {
                         .gap_2()
                         .child(
                             Button::new("env-plain-cancel")
-                                .label("取消")
+                                .label(tr("取消"))
                                 .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
                         .child(
                             Button::new("env-plain-confirm")
                                 .danger()
-                                .label("关闭敏感")
+                                .label(tr("关闭敏感"))
                                 .on_click(move |_, window, cx| {
                                     let _ = view.update(cx, |view, cx| {
                                         if let Some(form) = view.env_form.as_mut()
@@ -4770,7 +4939,7 @@ impl AppView {
                                 .child(
                                     base::Checkbox::new(("env-sensitive", row_id as usize))
                                         .checked(checked)
-                                        .accessibility_label("敏感")
+                                        .accessibility_label(tr("敏感"))
                                         .disabled(self.env_saving)
                                         .on_change(move |_, _, window, app| {
                                             let _ = view.update(app, |view, cx| {
@@ -4790,12 +4959,12 @@ impl AppView {
                                             });
                                         }),
                                 )
-                                .child("敏感"),
+                                .child(tr("敏感")),
                         )
                         .child(
                             Button::new(("env-remove", row_id as usize))
                                 .icon(assets::IconName::Trash)
-                                .accessibility_label("删除行")
+                                .accessibility_label(tr("删除行"))
                                 .disabled(self.env_saving)
                                 .on_click(cx.listener(move |view, _, _, cx| {
                                     if let Some(form) = view.env_form.as_mut() {
@@ -4809,7 +4978,7 @@ impl AppView {
         }
         self.panel("环境变量", "主机专属值覆盖项目通用值；敏感值不写入 SQLite。",
             div().px_6().pb_6().flex().flex_col().gap_4()
-                .child(div().flex().flex_col().gap_2().child("配置范围")
+                .child(div().flex().flex_col().gap_2().child(tr("配置范围"))
                     .child(div().id("env-scope").h(px(36.)).w_full().border_1()
                         .border_color(self.palette().border).rounded_md().px_3().flex()
                         .items_center().justify_between()
@@ -4820,17 +4989,17 @@ impl AppView {
                             })))
                         .child(scope).child("⌄"))
                     .when(self.env_scope_menu_open, |el| el.child(scope_options)))
-                .child(if self.env_loading { div().child("正在读取环境变量…").into_any_element() }
+                .child(if self.env_loading { div().child(tr("正在读取环境变量…")).into_any_element() }
                     else if let Some(error) = &self.env_error {
-                        div().text_color(self.palette().destructive).child(error.clone()).into_any_element()
+                        div().text_color(self.palette().destructive).child(tr_system(error)).into_any_element()
                     } else { div().id("env-rows-scroll").overflow_x_scroll().child(rows).into_any_element() })
-                .child(div().flex().child(Button::new("env-add").label("＋ 添加变量")
+                .child(div().flex().child(Button::new("env-add").label(tr("＋ 添加变量"))
                     .disabled(self.env_loading || self.env_saving || self.env_error.is_some())
                     .on_click(cx.listener(|view, _, window, cx| view.add_environment_row(window, cx)))))
                 .child(div().rounded_md().bg(self.palette().accent).p_3()
                     .text_color(self.palette().muted)
-                    .child("部署时写入远端 .env（权限 600），不纳入镜像。关闭“敏感”后，新值会以非秘密配置写入 SQLite；已保存的秘密需重新填写。"))
-                .child(div().flex().child(Button::new("env-save").primary().label("保存")
+                    .child(tr("部署时写入远端 .env（权限 600），不纳入镜像。关闭“敏感”后，新值会以非秘密配置写入 SQLite；已保存的秘密需重新填写。")))
+                .child(div().flex().child(Button::new("env-save").primary().label(tr("保存"))
                     .disabled(self.env_loading || self.env_saving || self.env_error.is_some() || form.is_none())
                     .on_click(cx.listener(|view, _, window, cx| view.save_environment(window, cx))))))
     }
@@ -4865,7 +5034,7 @@ impl AppView {
             })
             .collect();
         let Some(first) = builds.first() else {
-            window.push_notification(Notification::error("至少需要一个构建服务"), cx);
+            window.push_notification(Notification::error(tr("至少需要一个构建服务")), cx);
             return;
         };
         let manifest = crate::project_config::Manifest {
@@ -4916,12 +5085,16 @@ impl AppView {
                 });
                 match result {
                     Ok(project) if project.config_error.is_some() => window.push_notification(
-                        Notification::warning("配置已保存；目标主机变更需管理员确认绑定"),
+                        Notification::warning(tr("配置已保存；目标主机变更需管理员确认绑定")),
                         app,
                     ),
-                    Ok(_) => window
-                        .push_notification(Notification::success("devingpanel.yaml 已保存"), app),
-                    Err(error) => window.push_notification(Notification::error(error), app),
+                    Ok(_) => window.push_notification(
+                        Notification::success(tr("devingpanel.yaml 已保存")),
+                        app,
+                    ),
+                    Err(error) => {
+                        window.push_notification(Notification::error(tr_system(&error)), app)
+                    }
                 }
             });
         })
@@ -4986,7 +5159,7 @@ impl AppView {
                                 .child(
                                     Button::new(("yaml-arg-delete", index * 1000 + arg_index))
                                         .icon(assets::IconName::Trash)
-                                        .accessibility_label("删除参数")
+                                        .accessibility_label(tr("删除参数"))
                                         .disabled(busy)
                                         .on_click(cx.listener(move |view, _, _, cx| {
                                             if let Some(row) = view
@@ -5016,7 +5189,7 @@ impl AppView {
                                     .flex()
                                     .items_center()
                                     .justify_between()
-                                    .child(format!("构建 {}", index + 1))
+                                    .child(tfmt!("构建 {}", index + 1))
                                     .child(
                                         div()
                                             .flex()
@@ -5024,7 +5197,7 @@ impl AppView {
                                             .child(
                                                 Button::new(("yaml-build-up", index))
                                                     .icon(assets::IconName::ArrowUp)
-                                                    .accessibility_label("上移构建")
+                                                    .accessibility_label(tr("上移构建"))
                                                     .disabled(busy || index == 0)
                                                     .on_click(cx.listener(
                                                         move |view, _, _, cx| {
@@ -5040,7 +5213,7 @@ impl AppView {
                                             .child(
                                                 Button::new(("yaml-build-down", index))
                                                     .icon(assets::IconName::ArrowDown)
-                                                    .accessibility_label("下移构建")
+                                                    .accessibility_label(tr("下移构建"))
                                                     .disabled(
                                                         busy || index + 1 == form.builds.len(),
                                                     )
@@ -5058,7 +5231,7 @@ impl AppView {
                                             .child(
                                                 Button::new(("yaml-build-delete", index))
                                                     .icon(assets::IconName::Trash)
-                                                    .accessibility_label("删除构建")
+                                                    .accessibility_label(tr("删除构建"))
                                                     .disabled(busy || form.builds.len() == 1)
                                                     .on_click(cx.listener(
                                                         move |view, _, _, cx| {
@@ -5106,11 +5279,11 @@ impl AppView {
                                         }
                                     })),
                             ))
-                            .child("Build args（明文）")
+                            .child(tr("Build args（明文）"))
                             .child(args)
                             .child(
                                 Button::new(("yaml-arg-add", index))
-                                    .label("添加参数")
+                                    .label(tr("添加参数"))
                                     .disabled(busy)
                                     .on_click(cx.listener(move |view, _, window, cx| {
                                         if let Some(row) = view
@@ -5134,19 +5307,19 @@ impl AppView {
                 }
                 content = content.child(
                     Button::new("yaml-build-add")
-                        .label("添加构建")
+                        .label(tr("添加构建"))
                         .disabled(busy || form.builds.len() >= 16)
                         .on_click(cx.listener(|view, _, window, cx| {
                             if let Some(form) = view.manifest_form.as_mut() {
                                 form.builds.push(ManifestBuildRow {
                                     service: cx.new(|cx| {
-                                        InputState::new(window, cx).placeholder("服务名")
+                                        InputState::new(window, cx).placeholder(tr("服务名"))
                                     }),
                                     dockerfile: cx.new(|cx| {
                                         InputState::new(window, cx).default_value("Dockerfile")
                                     }),
                                     image: cx.new(|cx| {
-                                        InputState::new(window, cx).placeholder("镜像名")
+                                        InputState::new(window, cx).placeholder(tr("镜像名"))
                                     }),
                                     platform: "auto".into(),
                                     args: Vec::new(),
@@ -5174,7 +5347,7 @@ impl AppView {
                             .child(
                                 Button::new(("yaml-compose-up", index))
                                     .icon(assets::IconName::ArrowUp)
-                                    .accessibility_label("上移")
+                                    .accessibility_label(tr("上移"))
                                     .disabled(busy || index == 0)
                                     .on_click(cx.listener(move |view, _, _, cx| {
                                         if let Some(form) = view.manifest_form.as_mut() {
@@ -5186,7 +5359,7 @@ impl AppView {
                             .child(
                                 Button::new(("yaml-compose-down", index))
                                     .icon(assets::IconName::ArrowDown)
-                                    .accessibility_label("下移")
+                                    .accessibility_label(tr("下移"))
                                     .disabled(busy || index + 1 == form.compose.len())
                                     .on_click(cx.listener(move |view, _, _, cx| {
                                         if let Some(form) = view.manifest_form.as_mut() {
@@ -5198,7 +5371,7 @@ impl AppView {
                             .child(
                                 Button::new(("yaml-compose-delete", index))
                                     .icon(assets::IconName::Trash)
-                                    .accessibility_label("删除")
+                                    .accessibility_label(tr("删除"))
                                     .disabled(busy)
                                     .on_click(cx.listener(move |view, _, _, cx| {
                                         if let Some(form) = view.manifest_form.as_mut() {
@@ -5211,7 +5384,7 @@ impl AppView {
                 }
                 content = content.child(
                     Button::new("yaml-compose-add")
-                        .label("添加 Compose 文件")
+                        .label(tr("添加 Compose 文件"))
                         .disabled(busy)
                         .on_click(cx.listener(|view, _, window, cx| {
                             if let Some(form) = view.manifest_form.as_mut() {
@@ -5243,7 +5416,7 @@ impl AppView {
                             .child(
                                 Button::new(("yaml-target-up", index))
                                     .icon(assets::IconName::ArrowUp)
-                                    .accessibility_label("上移")
+                                    .accessibility_label(tr("上移"))
                                     .disabled(busy || index == 0)
                                     .on_click(cx.listener(move |view, _, _, cx| {
                                         if let Some(form) = view.manifest_form.as_mut() {
@@ -5255,7 +5428,7 @@ impl AppView {
                             .child(
                                 Button::new(("yaml-target-down", index))
                                     .icon(assets::IconName::ArrowDown)
-                                    .accessibility_label("下移")
+                                    .accessibility_label(tr("下移"))
                                     .disabled(busy || index + 1 == form.targets.len())
                                     .on_click(cx.listener(move |view, _, _, cx| {
                                         if let Some(form) = view.manifest_form.as_mut() {
@@ -5267,7 +5440,7 @@ impl AppView {
                             .child(
                                 Button::new(("yaml-target-delete", index))
                                     .icon(assets::IconName::Trash)
-                                    .accessibility_label("删除")
+                                    .accessibility_label(tr("删除"))
                                     .disabled(busy)
                                     .on_click(cx.listener(move |view, _, _, cx| {
                                         if let Some(form) = view.manifest_form.as_mut() {
@@ -5280,16 +5453,16 @@ impl AppView {
                 }
                 content = content.child(
                     Button::new("yaml-target-add")
-                        .label("添加目标主机")
+                        .label(tr("添加目标主机"))
                         .disabled(busy)
                         .on_click(cx.listener(|view, _, window, cx| {
                             if let Some(form) = view.manifest_form.as_mut() {
                                 form.targets.push(ManifestTargetRow {
                                     group: cx.new(|cx| {
-                                        InputState::new(window, cx).placeholder("主机组")
+                                        InputState::new(window, cx).placeholder(tr("主机组"))
                                     }),
                                     host: cx.new(|cx| {
-                                        InputState::new(window, cx).placeholder("主机别名")
+                                        InputState::new(window, cx).placeholder(tr("主机别名"))
                                     }),
                                 });
                                 cx.notify();
@@ -5303,7 +5476,7 @@ impl AppView {
         content = content.child(
             Button::new("yaml-save")
                 .primary()
-                .label("保存到 devingpanel.yaml")
+                .label(tr("保存到 devingpanel.yaml"))
                 .disabled(busy)
                 .on_click(cx.listener(|view, _, window, cx| view.save_manifest_form(window, cx))),
         );
@@ -5635,14 +5808,14 @@ impl AppView {
             let confirm_view = view.clone();
             let batch = batch_id.clone();
             let task = task_id.clone();
-            dialog.title("确认断点续传当前主机").w(px(560.))
+            dialog.title(tr("确认断点续传当前主机")).w(px(560.))
                 .child(div().flex().flex_col().gap_3()
-                    .child("将重新核对 YAML、目标主机与 Docker daemon、版本材料、远端容器和镜像；部分 tar 必须与本机归档前缀 SHA-256 一致，否则不写入。")
-                    .child("只续传当前主机并继续加载与整栈健康检查；成功后仍须人工确认健康，不会自动部署下一台。网络中断时继续保留结果待核实和远端 tar，不自动重试。"))
+                    .child(tr("将重新核对 YAML、目标主机与 Docker daemon、版本材料、远端容器和镜像；部分 tar 必须与本机归档前缀 SHA-256 一致，否则不写入。"))
+                    .child(tr("只续传当前主机并继续加载与整栈健康检查；成功后仍须人工确认健康，不会自动部署下一台。网络中断时继续保留结果待核实和远端 tar，不自动重试。")))
                 .footer(div().flex().justify_end().gap_2()
-                    .child(Button::new("batch-resume-cancel").debug_selector(|| "batch-resume-cancel".into()).label("取消")
+                    .child(Button::new("batch-resume-cancel").debug_selector(|| "batch-resume-cancel".into()).label(tr("取消"))
                         .on_click(|_, window, cx| window.close_dialog(cx)))
-                    .child(Button::new("batch-resume-confirm").primary().debug_selector(|| "batch-resume-confirm".into()).label("确认核对并续传")
+                    .child(Button::new("batch-resume-confirm").primary().debug_selector(|| "batch-resume-confirm".into()).label(tr("确认核对并续传"))
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let batch = batch.clone();
@@ -5746,14 +5919,14 @@ impl AppView {
                 window.push_notification(
                     match result {
                         Ok(stack_release::BatchProgress::AwaitingConfirmation { .. }) => {
-                            Notification::success(
+                            Notification::success(tr(
                                 "当前主机已通过健康检查；请在历史中人工确认后再继续",
-                            )
+                            ))
                         }
                         Ok(stack_release::BatchProgress::Complete { .. }) => {
-                            Notification::success("批次已完成")
+                            Notification::success(tr("批次已完成"))
                         }
-                        Err(error) => Notification::warning(format!(
+                        Err(error) => Notification::warning(tfmt!(
                             "批次 {}：{}",
                             batch_id.chars().take(8).collect::<String>(),
                             error.message
@@ -5806,17 +5979,17 @@ impl AppView {
         window.open_dialog(cx, move |dialog, _, _| {
             let confirm_view = view.clone();
             let id = batch_id.clone();
-            dialog.title(if parallel { "确认继续下一波目标" } else if retrying { "确认继续重试当前主机" } else { "确认继续下一台主机" }).w(px(560.))
+            dialog.title(if parallel { tr("确认继续下一波目标") } else if retrying { tr("确认继续重试当前主机") } else { tr("确认继续下一台主机") }).w(px(560.))
                 .child(div().flex().flex_col().gap_3()
-                    .child(format!("首个目标：{host_name}。此前已健康的主机不会重建或回滚。"))
-                    .child("将重新核对 YAML、逐主机环境、共享归档、可信 SSH 与 Docker daemon；然后上传镜像、启动完整 Compose 栈并核实全部服务。若出现失败或未知结果会暂停，不自动推进。"))
+                    .child(tfmt!("首个目标：{host_name}。此前已健康的主机不会重建或回滚。"))
+                    .child(tr("将重新核对 YAML、逐主机环境、共享归档、可信 SSH 与 Docker daemon；然后上传镜像、启动完整 Compose 栈并核实全部服务。若出现失败或未知结果会暂停，不自动推进。")))
                 .footer(div().flex().justify_end().gap_2()
                     .child(Button::new("batch-continue-cancel")
-                        .debug_selector(|| "batch-continue-cancel".into()).label("取消")
+                        .debug_selector(|| "batch-continue-cancel".into()).label(tr("取消"))
                         .on_click(|_, window, cx| window.close_dialog(cx)))
                     .child(Button::new("batch-continue-confirm")
                         .debug_selector(|| "batch-continue-confirm".into())
-                        .primary().label("确认继续")
+                        .primary().label(tr("确认继续"))
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let id = id.clone();
@@ -5864,17 +6037,17 @@ impl AppView {
             let confirm_view = view.clone();
             let id = batch_id.clone();
             let task_id = expected_task_id.clone();
-            dialog.title("确认重试失败主机").w(px(560.))
+            dialog.title(tr("确认重试失败主机")).w(px(560.))
                 .child(div().flex().flex_col().gap_3()
-                    .child(format!("目标：{host_name}。旧失败任务将保留在本批次历史中。"))
-                    .child("将重新核对 YAML、环境、归档、可信主机与 Docker daemon，并确认该项目在目标主机没有容器。核对通过后才创建新任务；结果不明时仍会阻断。"))
+                    .child(tfmt!("目标：{host_name}。旧失败任务将保留在本批次历史中。"))
+                    .child(tr("将重新核对 YAML、环境、归档、可信主机与 Docker daemon，并确认该项目在目标主机没有容器。核对通过后才创建新任务；结果不明时仍会阻断。")))
                 .footer(div().flex().justify_end().gap_2()
                     .child(Button::new("batch-retry-cancel")
-                        .debug_selector(|| "batch-retry-cancel".into()).label("取消")
+                        .debug_selector(|| "batch-retry-cancel".into()).label(tr("取消"))
                         .on_click(|_, window, cx| window.close_dialog(cx)))
                     .child(Button::new("batch-retry-confirm")
                         .debug_selector(|| "batch-retry-confirm".into())
-                        .primary().label("确认重试")
+                        .primary().label(tr("确认重试"))
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let id = id.clone();
@@ -5998,9 +6171,9 @@ impl AppView {
                             })
                         }
                         Ok(stack_release::BatchProgress::Complete { .. }) => {
-                            Notification::success("批次全部目标已处理完毕")
+                            Notification::success(tr("批次全部目标已处理完毕"))
                         }
-                        Err(error) => Notification::warning(format!(
+                        Err(error) => Notification::warning(tfmt!(
                             "批次 {}：{}",
                             batch_id.chars().take(8).collect::<String>(),
                             error.message
@@ -6058,9 +6231,9 @@ impl AppView {
                 window.push_notification(
                     match result {
                         Ok(count) => {
-                            Notification::success(format!("已清理 {count} 条构建前中断任务"))
+                            Notification::success(tfmt!("已清理 {count} 条构建前中断任务"))
                         }
-                        Err(error) => Notification::warning(error),
+                        Err(error) => Notification::warning(tr_system(&error)),
                     },
                     app,
                 );
@@ -6092,10 +6265,10 @@ impl AppView {
                 });
                 window.push_notification(
                     match result {
-                        Ok(count) => Notification::success(format!(
+                        Ok(count) => Notification::success(tfmt!(
                             "{count} 条无执行锁的中断批次已标为待核实；未操作 VPS"
                         )),
-                        Err(error) => Notification::warning(error),
+                        Err(error) => Notification::warning(tr_system(&error)),
                     },
                     app,
                 );
@@ -6138,16 +6311,16 @@ impl AppView {
         window.open_dialog(cx, move |dialog, _, _| {
             let confirm_view = view.clone();
             let task_id = id.clone();
-            dialog.title("确认关闭待核实任务").w(px(520.))
+            dialog.title(tr("确认关闭待核实任务")).w(px(520.))
                 .child(div().flex().flex_col().gap_3()
-                    .child("只读核实未发现该 Compose 项目的容器。确认后会再次连接并核实；仅在仍无容器、任务阶段未变化时记录人工决定并解除项目锁定。")
-                    .child("这不会删除远端镜像或部署文件，不会执行 Compose，也不代表先前部署成功。"))
+                    .child(tr("只读核实未发现该 Compose 项目的容器。确认后会再次连接并核实；仅在仍无容器、任务阶段未变化时记录人工决定并解除项目锁定。"))
+                    .child(tr("这不会删除远端镜像或部署文件，不会执行 Compose，也不代表先前部署成功。")))
                 .footer(div().flex().justify_end().gap_2()
-                    .child(Button::new("release-absence-cancel").label("取消")
+                    .child(Button::new("release-absence-cancel").label(tr("取消"))
                         .on_click(|_, window, cx| window.close_dialog(cx)))
                     .child(Button::new("release-absence-confirm")
                         .debug_selector(|| "release-absence-confirm-button".into())
-                        .danger().label("确认无容器并关闭")
+                        .danger().label(tr("确认无容器并关闭"))
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let id = task_id.clone();
@@ -6192,8 +6365,8 @@ impl AppView {
                 });
                 window.push_notification(
                     match result {
-                        Ok(()) => Notification::success("已记录人工核实并解除项目锁定"),
-                        Err(error) => Notification::error(error),
+                        Ok(()) => Notification::success(tr("已记录人工核实并解除项目锁定")),
+                        Err(error) => Notification::error(tr_system(&error)),
                     },
                     app,
                 );
@@ -6228,14 +6401,14 @@ impl AppView {
         window.open_dialog(cx, move |dialog, _, _| {
             let confirm_view = view.clone();
             let task_id = id.clone();
-            dialog.title("核实并关闭上传中断任务").w(px(540.))
+            dialog.title(tr("核实并关闭上传中断任务")).w(px(540.))
                 .child(div().flex().flex_col().gap_3()
-                    .child("该任务停在镜像传输阶段，尚未进入远端镜像加载或 Compose 启动。将重新核对当前版本指针、可信 Docker daemon、历史 Compose/.env 与逐服务配置哈希、镜像 ID 和健康状态。")
-                    .child("请在无外部 Docker 修改的维护窗口确认。仅全部匹配时，才将本次任务标记失败并解除阻断；不会重试发布、执行 Compose、删除镜像或清理可能残留的远端临时 tar。临时文件仍需人工排查。"))
+                    .child(tr("该任务停在镜像传输阶段，尚未进入远端镜像加载或 Compose 启动。将重新核对当前版本指针、可信 Docker daemon、历史 Compose/.env 与逐服务配置哈希、镜像 ID 和健康状态。"))
+                    .child(tr("请在无外部 Docker 修改的维护窗口确认。仅全部匹配时，才将本次任务标记失败并解除阻断；不会重试发布、执行 Compose、删除镜像或清理可能残留的远端临时 tar。临时文件仍需人工排查。")))
                 .footer(div().flex().justify_end().gap_2()
-                    .child(Button::new("predeploy-close-cancel").label("取消")
+                    .child(Button::new("predeploy-close-cancel").label(tr("取消"))
                         .on_click(|_, window, cx| window.close_dialog(cx)))
-                    .child(Button::new("predeploy-close-confirm").danger().label("重新核实并关闭")
+                    .child(Button::new("predeploy-close-confirm").danger().label(tr("重新核实并关闭"))
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let id = task_id.clone();
@@ -6276,8 +6449,8 @@ impl AppView {
                     cx.notify();
                 });
                 window.push_notification(match result {
-                    Ok(count) => Notification::success(format!("已核实旧版本 {count} 个服务健康；上传中断任务已关闭，临时 tar 待人工检查")),
-                    Err(error) => Notification::error(format!("{error}；仍保持发布阻断。")),
+                    Ok(count) => Notification::success(tfmt!("已核实旧版本 {count} 个服务健康；上传中断任务已关闭，临时 tar 待人工检查")),
+                    Err(error) => Notification::error(tfmt!("{error}；仍保持发布阻断。")),
                 }, app);
             });
         }).detach();
@@ -6305,16 +6478,16 @@ impl AppView {
         window.open_dialog(cx, move |dialog, _, _| {
             let confirm_view = view.clone();
             let task_id = id.clone();
-            dialog.title("确认健康发布完成").w(px(520.))
+            dialog.title(tr("确认健康发布完成")).w(px(520.))
                 .child(div().flex().flex_col().gap_3()
-                    .child("将重新检查本机版本材料、远端自有镜像及整个 Compose 项目的容器和健康状态。只有身份和所有服务均匹配时才记录完成并解除项目阻断。")
-                    .child("首次发布不要求已有上一版本；确认不会部署、重启或清理任何容器，也不会启用回滚按钮。旧任务或缺少服务计划的任务不能确认完成。"))
+                    .child(tr("将重新检查本机版本材料、远端自有镜像及整个 Compose 项目的容器和健康状态。只有身份和所有服务均匹配时才记录完成并解除项目阻断。"))
+                    .child(tr("首次发布不要求已有上一版本；确认不会部署、重启或清理任何容器，也不会启用回滚按钮。旧任务或缺少服务计划的任务不能确认完成。")))
                 .footer(div().flex().justify_end().gap_2()
-                    .child(Button::new("release-complete-cancel").label("取消")
+                    .child(Button::new("release-complete-cancel").label(tr("取消"))
                         .on_click(|_, window, cx| window.close_dialog(cx)))
                     .child(Button::new("release-complete-confirm")
                         .debug_selector(|| "release-complete-confirm-button".into())
-                        .label("重新核实并确认完成")
+                        .label(tr("重新核实并确认完成"))
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let id = task_id.clone();
@@ -6359,10 +6532,10 @@ impl AppView {
                 });
                 window.push_notification(
                     match result {
-                        Ok(count) => Notification::success(format!(
+                        Ok(count) => Notification::success(tfmt!(
                             "已确认 {count} 个服务健康，发布记录已完成"
                         )),
-                        Err(error) => Notification::error(error),
+                        Err(error) => Notification::error(tr_system(&error)),
                     },
                     app,
                 );
@@ -6404,9 +6577,9 @@ impl AppView {
             let confirm_view = view.clone();
             let task_id = id.clone();
             dialog.title(if start_unknown {
-                "核实启动响应不明的远端状态"
+                tr("核实启动响应不明的远端状态")
             } else {
-                "重新核实未确认的健康结果"
+                tr("重新核实未确认的健康结果")
             }).w(px(520.))
                 .child(div().flex().flex_col().gap_3()
                     .child(if start_unknown {
@@ -6414,15 +6587,15 @@ impl AppView {
                     } else {
                         "启动已确认，但健康核实结果不明。将重新只读核实全部版本材料、镜像、容器和健康状态；仅全部服务 healthy 时恢复记录。"
                     })
-                    .child("不会重新执行 Compose、自动确认发布完成或继续下一台；恢复后仍须单独确认健康发布完成。"))
+                    .child(tr("不会重新执行 Compose、自动确认发布完成或继续下一台；恢复后仍须单独确认健康发布完成。")))
                 .footer(div().flex().justify_end().gap_2()
                     .child(Button::new("release-reconcile-cancel")
                         .debug_selector(|| "release-reconcile-cancel".into())
-                        .label("取消")
+                        .label(tr("取消"))
                         .on_click(|_, window, cx| window.close_dialog(cx)))
                     .child(Button::new("release-reconcile-confirm")
                         .debug_selector(|| "release-reconcile-confirm-button".into())
-                        .label("只读核实并恢复记录")
+                        .label(tr("只读核实并恢复记录"))
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let id = task_id.clone();
@@ -6465,10 +6638,10 @@ impl AppView {
                 });
                 window.push_notification(
                     match result {
-                        Ok(count) => Notification::success(format!(
+                        Ok(count) => Notification::success(tfmt!(
                             "已重新核实 {count} 个服务健康；仍需确认发布完成"
                         )),
-                        Err(error) => Notification::warning(error),
+                        Err(error) => Notification::warning(tr_system(&error)),
                     },
                     app,
                 );
@@ -6505,14 +6678,14 @@ impl AppView {
         window.open_dialog(cx, move |dialog, _, _| {
             let confirm_view = view.clone();
             let task_id = id.clone();
-            dialog.title("只读核实回滚结果").w(px(520.))
+            dialog.title(tr("只读核实回滚结果")).w(px(520.))
                 .child(div().flex().flex_col().gap_3()
-                    .child("将重新核验目标历史材料、远端自有镜像和完整 Compose 项目容器；只有全部服务使用目标镜像且 healthy，才更新当前版本指针并解除阻断。")
-                    .child("不会重新执行 Compose、上传镜像或清理临时归档；正在部署或镜像加载结果不明的任务不能使用。"))
+                    .child(tr("将重新核验目标历史材料、远端自有镜像和完整 Compose 项目容器；只有全部服务使用目标镜像且 healthy，才更新当前版本指针并解除阻断。"))
+                    .child(tr("不会重新执行 Compose、上传镜像或清理临时归档；正在部署或镜像加载结果不明的任务不能使用。")))
                 .footer(div().flex().justify_end().gap_2()
-                    .child(Button::new("rollback-reconcile-cancel").label("取消")
+                    .child(Button::new("rollback-reconcile-cancel").label(tr("取消"))
                         .on_click(|_, window, cx| window.close_dialog(cx)))
-                    .child(Button::new("rollback-reconcile-confirm").label("重新核实")
+                    .child(Button::new("rollback-reconcile-confirm").label(tr("重新核实"))
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let id = task_id.clone();
@@ -6554,10 +6727,10 @@ impl AppView {
                 });
                 window.push_notification(
                     match result {
-                        Ok(count) => Notification::success(format!(
+                        Ok(count) => Notification::success(tfmt!(
                             "已只读确认 {count} 个服务恢复目标健康版本"
                         )),
-                        Err(error) => Notification::warning(error),
+                        Err(error) => Notification::warning(tr_system(&error)),
                     },
                     app,
                 );
@@ -6588,7 +6761,7 @@ impl AppView {
                     if let Ok(preview) = result {
                         view.confirm_rollback(preview, window, cx);
                     } else if let Err(error) = result {
-                        window.push_notification(Notification::error(error), cx);
+                        window.push_notification(Notification::error(tr_system(&error)), cx);
                     }
                     cx.notify();
                 });
@@ -6615,18 +6788,18 @@ impl AppView {
         window.open_dialog(cx, move |dialog, _, _| {
             let approved = preview.clone();
             let confirm_view = view.clone();
-            dialog.title("确认回滚整个 Compose 项目").w(px(600.))
+            dialog.title(tr("确认回滚整个 Compose 项目")).w(px(600.))
                 .child(div().flex().flex_col().gap_3()
-                    .child(format!("项目：{} · 主机：{} ({})", preview.project_name, preview.host_name, preview.host_endpoint))
-                    .child(format!("源版本 {} → 健康目标版本 {}", preview.source_id, preview.target_id))
-                    .child(format!("当前服务：{}", preview.source_services.join(" · ")))
-                    .child(format!("目标服务：{}", preview.target_services.join(" · ")))
-                    .child(format!("{} 份目标镜像 tag 缺失，将从本机已校验归档恢复。", preview.missing_images.len()))
-                    .child("执行前会重新检查版本、归档、镜像和容器；Compose 可能重建或移除源版本的服务。结果不确定时保持阻断，绝不自动重试。"))
+                    .child(tfmt!("项目：{} · 主机：{} ({})", preview.project_name, preview.host_name, preview.host_endpoint))
+                    .child(tfmt!("源版本 {} → 健康目标版本 {}", preview.source_id, preview.target_id))
+                    .child(tfmt!("当前服务：{}", preview.source_services.join(" · ")))
+                    .child(tfmt!("目标服务：{}", preview.target_services.join(" · ")))
+                    .child(tfmt!("{} 份目标镜像 tag 缺失，将从本机已校验归档恢复。", preview.missing_images.len()))
+                    .child(tr("执行前会重新检查版本、归档、镜像和容器；Compose 可能重建或移除源版本的服务。结果不确定时保持阻断，绝不自动重试。")))
                 .footer(div().flex().justify_end().gap_2()
-                    .child(Button::new("rollback-cancel").label("取消")
+                    .child(Button::new("rollback-cancel").label(tr("取消"))
                         .on_click(|_, window, cx| window.close_dialog(cx)))
-                    .child(Button::new("rollback-confirm").danger().debug_selector(|| "rollback-confirm-button".into()).label("确认执行回滚")
+                    .child(Button::new("rollback-confirm").danger().debug_selector(|| "rollback-confirm-button".into()).label(tr("确认执行回滚"))
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let preview = approved.clone();
@@ -6688,10 +6861,10 @@ impl AppView {
                             });
                             window.push_notification(
                                 match result {
-                                    Ok(id) => Notification::success(format!(
+                                    Ok(id) => Notification::success(tfmt!(
                                         "回滚 {id} 完成，目标服务全部健康"
                                     )),
-                                    Err(error) => Notification::error(format!(
+                                    Err(error) => Notification::error(tfmt!(
                                         "{error}；请在历史页核实，勿重复执行。"
                                     )),
                                 },
@@ -6710,9 +6883,9 @@ impl AppView {
                                 cx.notify();
                             });
                             window.push_notification(
-                                Notification::error(
+                                Notification::error(tr(
                                     "回滚执行异常中断，请先在历史页核实，不得重试。",
-                                ),
+                                )),
                                 app,
                             );
                         });
@@ -6826,14 +6999,16 @@ impl AppView {
         let batch = self.history_batch(project_id, &batch_id).filter(|batch| {
             matches!(
                 batch.state.as_str(),
-                "prepared" | "building" | "ready" | "paused" | "running"
+                "prepared" | "building" | "ready" | "paused" | "running" | "unknown"
             )
         });
         let Some(batch) = batch else { return };
         if self.batch_resolving.contains(&batch_id) {
             return;
         }
-        let unstarted = matches!(batch.state.as_str(), "prepared" | "building" | "ready");
+        let review_push = batch.state == "unknown" && batch.registry_mode;
+        let unstarted =
+            matches!(batch.state.as_str(), "prepared" | "building" | "ready") || review_push;
         if unstarted
             && (host_id.is_some()
                 || batch
@@ -6865,22 +7040,28 @@ impl AppView {
             let title = if host_id.is_some() { "跳过失败主机" } else { "终止批次" };
             let detail = if host_id.is_some() {
                 format!("将 {host_name} 标记为已跳过；该主机不会变成健康成功。若后面还有目标，本次只解除暂停，不会自动部署下一台。")
+            } else if review_push {
+                "镜像仓库推送结果不确定。请先在 Registry 核对本批次全部镜像 tag；确认后仅结束本机批次，不删除远端 tag、镜像或归档。".into()
             } else if unstarted {
                 "终止尚未开始远端发布的批次；可能残留的本机镜像和共享归档需人工核对。".into()
             } else {
                 "终止剩余目标；此前已健康的主机保持现状，不执行回滚。".into()
             };
-            dialog.title(title).w(px(520.))
+            dialog.title(tr(title)).w(px(520.))
                 .child(div().flex().flex_col().gap_3()
-                    .child(detail)
-                    .child("确认时会重新核对数据库中的批次和任务状态。不会操作远端 Docker、删除镜像或归档；若有待核实结果则拒绝。"))
+                    .child(tr_system(&detail))
+                    .child(if review_push {
+                        tr("确认表示你已独立核对远端 Registry。仍可能有未使用的 tag，需自行清理。")
+                    } else {
+                        tr("确认时会重新核对数据库中的批次和任务状态。不会操作远端 Docker、删除镜像或归档；若有待核实结果则拒绝。")
+                    }))
                 .footer(div().flex().justify_end().gap_2()
                     .child(Button::new("batch-resolution-cancel")
-                        .debug_selector(|| "batch-resolution-cancel".into()).label("取消")
+                        .debug_selector(|| "batch-resolution-cancel".into()).label(tr("取消"))
                         .on_click(|_, window, cx| window.close_dialog(cx)))
                     .child(Button::new("batch-resolution-confirm")
                         .debug_selector(|| "batch-resolution-confirm".into())
-                        .danger().label("确认处置")
+                        .danger().label(tr("确认处置"))
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let id = id.clone();
@@ -6905,13 +7086,16 @@ impl AppView {
             .filter(|batch| {
                 matches!(
                     batch.state.as_str(),
-                    "prepared" | "building" | "ready" | "paused" | "running"
+                    "prepared" | "building" | "ready" | "paused" | "running" | "unknown"
                 )
             })
         else {
             return;
         };
-        if unstarted != matches!(batch.state.as_str(), "prepared" | "building" | "ready") {
+        let review_push = batch.state == "unknown" && batch.registry_mode;
+        if unstarted
+            != (matches!(batch.state.as_str(), "prepared" | "building" | "ready") || review_push)
+        {
             return;
         }
         let project_id = batch.project_id;
@@ -6926,6 +7110,9 @@ impl AppView {
                 .spawn(async move {
                     match host_id {
                         Some(host_id) => batch_store::skip_failed(&operation_id, host_id),
+                        None if review_push => {
+                            batch_store::acknowledge_unknown_registry_push(&operation_id)
+                        }
                         None if unstarted => batch_store::terminate_unstarted(&operation_id),
                         None => batch_store::terminate_resolved(&operation_id),
                     }
@@ -6941,13 +7128,16 @@ impl AppView {
                 window.push_notification(
                     match result {
                         Ok(()) if host_id.is_some() => {
-                            Notification::success("已跳过失败主机；后续目标须重新确认后继续")
+                            Notification::success(tr("已跳过失败主机；后续目标须重新确认后继续"))
+                        }
+                        Ok(()) if review_push => {
+                            Notification::success(tr("镜像仓库推送待核实批次已人工确认结束"))
                         }
                         Ok(()) if unstarted => {
-                            Notification::success("未启动批次已终止；请人工核对本机残留")
+                            Notification::success(tr("未启动批次已终止；请人工核对本机残留"))
                         }
-                        Ok(()) => Notification::success("批次已终止；已健康主机保持现状"),
-                        Err(error) => Notification::warning(error),
+                        Ok(()) => Notification::success(tr("批次已终止；已健康主机保持现状")),
+                        Err(error) => Notification::warning(tr_system(&error)),
                     },
                     app,
                 );
@@ -6974,7 +7164,7 @@ impl AppView {
         if batches.is_empty() {
             return content.into_any_element();
         }
-        content = content.child(div().text_color(self.palette().muted).child(format!(
+        content = content.child(div().text_color(self.palette().muted).child(tfmt!(
             "批次记录 {} 条 · 仅已核实失败可跳过；未知结果不得自动重试",
             batches.len()
         )));
@@ -6996,17 +7186,17 @@ impl AppView {
                 .count();
             let (status, color) = match batch.state.as_str() {
                 "complete" if !batch.targets.is_empty() && healthy == batch.targets.len() => {
-                    ("全部完成", self.palette().success)
+                    (tr("全部完成"), self.palette().success)
                 }
-                "complete" => ("部分完成", self.palette().warning),
-                "paused" => ("已暂停", self.palette().warning),
-                "unknown" => ("结果待核实", self.palette().destructive),
-                "terminated" => ("已终止", self.palette().muted),
-                "ready" => ("等待分发", self.palette().foreground),
-                "running" => ("进行中", self.palette().foreground),
-                "prepared" => ("等待构建", self.palette().muted),
-                "building" => ("本机构建中", self.palette().foreground),
-                _ => ("状态待核实", self.palette().warning),
+                "complete" => (tr("部分完成"), self.palette().warning),
+                "paused" => (tr("已暂停"), self.palette().warning),
+                "unknown" => (tr("结果待核实"), self.palette().destructive),
+                "terminated" => (tr("已终止"), self.palette().muted),
+                "ready" => (tr("等待分发"), self.palette().foreground),
+                "running" => (tr("进行中"), self.palette().foreground),
+                "prepared" => (tr("等待构建"), self.palette().muted),
+                "building" => (tr("本机构建中"), self.palette().foreground),
+                _ => (tr("状态待核实"), self.palette().warning),
             };
             let resolving = self.batch_resolving.contains(&batch.id);
             let next_host_id = if resolving || self.deploy_run_busy {
@@ -7032,7 +7222,8 @@ impl AppView {
                     && target.task_outcome.is_none()
             });
             let can_terminate = !resolving
-                && ((matches!(batch.state.as_str(), "prepared" | "building" | "ready")
+                && (((matches!(batch.state.as_str(), "prepared" | "building" | "ready")
+                    || (batch.state == "unknown" && batch.registry_mode))
                     && all_waiting)
                     || (matches!(batch.state.as_str(), "paused" | "running")
                         && batch
@@ -7062,15 +7253,15 @@ impl AppView {
                     .items_center()
                     .bg(self.palette().accent)
                     .text_color(self.palette().muted)
-                    .child(div().w(px(65.)).flex_shrink_0().child("顺序"))
-                    .child(div().w(px(160.)).flex_shrink_0().child("主机"))
-                    .child(div().w(px(135.)).flex_shrink_0().child("架构"))
-                    .child(div().w(px(145.)).flex_shrink_0().child("阶段"))
-                    .child(div().w(px(105.)).flex_shrink_0().child("健康"))
-                    .child(div().w(px(170.)).flex_shrink_0().child("结果"))
-                    .child(div().w(px(90.)).flex_shrink_0().child("耗时"))
-                    .child(div().w(px(125.)).flex_shrink_0().child("任务 ID"))
-                    .child("操作"),
+                    .child(div().w(px(65.)).flex_shrink_0().child(tr("顺序")))
+                    .child(div().w(px(160.)).flex_shrink_0().child(tr("主机")))
+                    .child(div().w(px(135.)).flex_shrink_0().child(tr("架构")))
+                    .child(div().w(px(145.)).flex_shrink_0().child(tr("阶段")))
+                    .child(div().w(px(105.)).flex_shrink_0().child(tr("健康")))
+                    .child(div().w(px(170.)).flex_shrink_0().child(tr("结果")))
+                    .child(div().w(px(90.)).flex_shrink_0().child(tr("耗时")))
+                    .child(div().w(px(125.)).flex_shrink_0().child(tr("任务 ID")))
+                    .child(tr("操作")),
             );
             for target in &batch.targets {
                 let task = target
@@ -7151,9 +7342,9 @@ impl AppView {
                                 .flex_shrink_0()
                                 .child(target.platform.clone()),
                         )
-                        .child(div().w(px(145.)).flex_shrink_0().child(phase))
-                        .child(div().w(px(105.)).flex_shrink_0().child(health))
-                        .child(div().w(px(170.)).flex_shrink_0().child(state))
+                        .child(div().w(px(145.)).flex_shrink_0().child(tr(phase)))
+                        .child(div().w(px(105.)).flex_shrink_0().child(tr(health)))
+                        .child(div().w(px(170.)).flex_shrink_0().child(tr(state)))
                         .child(div().w(px(90.)).flex_shrink_0().child(elapsed))
                         .child(
                             div()
@@ -7181,9 +7372,9 @@ impl AppView {
                                         Button::new(format!("batch-task-{task_id}"))
                                             .debug_selector(|| "batch-task-detail-button".into())
                                             .label(if loading {
-                                                "读取中…"
+                                                tr("读取中…")
                                             } else {
-                                                "查看任务详情"
+                                                tr("查看任务详情")
                                             })
                                             .disabled(loading)
                                             .on_click(cx.listener(move |view, _, _, cx| {
@@ -7206,7 +7397,7 @@ impl AppView {
                                                 .debug_selector(|| {
                                                     "batch-attempt-detail-button".into()
                                                 })
-                                                .label(format!("第 {} 次详情", attempt + 1))
+                                                .label(tfmt!("第 {} 次详情", attempt + 1))
                                                 .on_click(cx.listener(move |view, _, _, cx| {
                                                     view.open_batch_task_detail(
                                                         project_id, &batch_id, host_id, &lookup_id,
@@ -7220,7 +7411,7 @@ impl AppView {
                                     actions.child(
                                         Button::new(format!("batch-skip-{batch_id}-{host_id}"))
                                             .debug_selector(|| "batch-skip-button".into())
-                                            .label("跳过失败主机")
+                                            .label(tr("跳过失败主机"))
                                             .on_click(cx.listener(move |view, _, window, cx| {
                                                 view.confirm_batch_resolution(
                                                     project_id,
@@ -7238,7 +7429,7 @@ impl AppView {
                                             "batch-retry-{retry_batch_id}-{host_id}"
                                         ))
                                         .debug_selector(|| "batch-retry-button".into())
-                                        .label("重试失败主机")
+                                        .label(tr("重试失败主机"))
                                         .on_click(
                                             cx.listener(move |view, _, window, cx| {
                                                 view.confirm_retry_batch(
@@ -7287,7 +7478,7 @@ impl AppView {
                                     .flex_col()
                                     .items_start()
                                     .gap_1()
-                                    .child(div().font_family(mono_font()).child(format!(
+                                    .child(div().font_family(mono_font()).child(tfmt!(
                                         "批次 {} · {}",
                                         batch.id.chars().take(8).collect::<String>(),
                                         batch.created_at
@@ -7300,11 +7491,11 @@ impl AppView {
                                             .font_family(mono_font())
                                             .child(project_name),
                                     )
-                                    .child(div().text_color(self.palette().muted).child(format!(
+                                    .child(div().text_color(self.palette().muted).child(tfmt!(
                                         "健康 {healthy}/{} · 待核实 {unknown} · 未开始 {waiting}",
                                         batch.targets.len()
                                     )))
-                                    .child(div().text_color(self.palette().muted).child(format!(
+                                    .child(div().text_color(self.palette().muted).child(tfmt!(
                                         "并行度 {} · 共享镜像 {} 份",
                                         batch.parallelism,
                                         batch.images.len()
@@ -7321,11 +7512,11 @@ impl AppView {
                                                 .debug_selector(|| "batch-continue-button".into())
                                                 .primary()
                                                 .label(if batch.parallelism > 1 {
-                                                    "继续下一波"
+                                                    tr("继续下一波")
                                                 } else if retrying {
-                                                    "继续重试当前主机"
+                                                    tr("继续重试当前主机")
                                                 } else {
-                                                    "继续下一台"
+                                                    tr("继续下一台")
                                                 })
                                                 .on_click(cx.listener(
                                                     move |view, _, window, cx| {
@@ -7353,7 +7544,15 @@ impl AppView {
                                             Button::new(format!("batch-terminate-{batch_id}"))
                                                 .debug_selector(|| "batch-terminate-button".into())
                                                 .danger()
-                                                .label("终止批次")
+                                                .label(
+                                                    if batch.state == "unknown"
+                                                        && batch.registry_mode
+                                                    {
+                                                        tr("确认推送并结束")
+                                                    } else {
+                                                        tr("终止批次")
+                                                    },
+                                                )
                                                 .on_click(cx.listener(
                                                     move |view, _, window, cx| {
                                                         view.confirm_batch_resolution(
@@ -7375,7 +7574,7 @@ impl AppView {
                                 .px_4()
                                 .pb_3()
                                 .text_color(self.palette().warning)
-                                .child(format!("批次操作中：{stage}")),
+                                .child(tfmt!("批次操作中：{stage}")),
                         )
                     })
                     .child(
@@ -7401,9 +7600,9 @@ impl AppView {
                     .child(
                         Button::new(("release-retention", id as u64))
                             .label(if self.retention_loading.contains(&id) {
-                                "检查中…"
+                                tr("检查中…")
                             } else {
-                                "检查版本保留"
+                                tr("检查版本保留")
                             })
                             .disabled(self.retention_loading.contains(&id))
                             .on_click(cx.listener(move |view, _, _, cx| {
@@ -7413,9 +7612,9 @@ impl AppView {
                     .child(
                         Button::new(("local-archive-preview", id as u64))
                             .label(if self.local_archive_preview_loading.contains(&id) {
-                                "核验中…"
+                                tr("核验中…")
                             } else {
-                                "预览本机旧版归档"
+                                tr("预览本机旧版归档")
                             })
                             .disabled(self.local_archive_preview_loading.contains(&id))
                             .on_click(cx.listener(move |view, _, _, cx| {
@@ -7456,7 +7655,11 @@ impl AppView {
                     }
                     Err(error) => format!("保留策略检查失败：{error}"),
                 };
-                rows = rows.child(div().text_color(self.palette().muted).child(text));
+                rows = rows.child(
+                    div()
+                        .text_color(self.palette().muted)
+                        .child(tr_system(&text)),
+                );
             }
             if let Some(result) = self.local_archive_previews.get(&id) {
                 match result {
@@ -7464,20 +7667,20 @@ impl AppView {
                         rows = rows.child(
                             div()
                                 .text_color(self.palette().warning)
-                                .child(format!("本机归档预览失败：{error}")),
+                                .child(tfmt!("本机归档预览失败：{error}")),
                         )
                     }
                     Ok(preview) if preview.blocked => {
-                        rows = rows.child(div().text_color(self.palette().warning).child(format!(
+                        rows = rows.child(div().text_color(self.palette().warning).child(tfmt!(
                             "存在待核实任务；{} 条发布任务的归档全部保留，不计算清理候选。",
                             preview.total_tasks
                         )))
                     }
                     Ok(preview) => {
                         rows = rows.child(div().text_color(self.palette().muted)
-                            .child(format!("上次点击时只读核验：{} 条更早历史的本机 tar 齐全；文件可能已变化，清理前须重新核验。仅显示占用，不代表允许删除或远端可释放空间。", preview.candidates.len())));
+                            .child(tfmt!("上次点击时只读核验：{} 条更早历史的本机 tar 齐全；文件可能已变化，清理前须重新核验。仅显示占用，不代表允许删除或远端可释放空间。", preview.candidates.len())));
                         for candidate in &preview.candidates {
-                            rows = rows.child(div().font_family(mono_font()).child(format!(
+                            rows = rows.child(div().font_family(mono_font()).child(tfmt!(
                                 "{} · {} 份镜像归档 · {:.1} MiB（{} 字节）",
                                 candidate.task_id.chars().take(8).collect::<String>(),
                                 candidate.services,
@@ -7486,8 +7689,8 @@ impl AppView {
                             )));
                         }
                         if !preview.unavailable.is_empty() {
-                            rows = rows.child(div().text_color(self.palette().warning).child(
-                                format!(
+                            rows =
+                                rows.child(div().text_color(self.palette().warning).child(tfmt!(
                                     "{} 条历史的本机归档缺失或校验失败，不作为清理候选：{}",
                                     preview.unavailable.len(),
                                     preview
@@ -7496,8 +7699,7 @@ impl AppView {
                                         .map(|id| id.chars().take(8).collect::<String>())
                                         .collect::<Vec<_>>()
                                         .join("、"),
-                                ),
-                            ));
+                                )));
                         }
                     }
                 }
@@ -7512,9 +7714,9 @@ impl AppView {
                 .child(
                     Button::new("release-recover-prepared")
                         .label(if self.release_recovery_busy {
-                            "清理中…"
+                            tr("清理中…")
                         } else {
-                            "重试构建前中断清理"
+                            tr("重试构建前中断清理")
                         })
                         .disabled(self.release_recovery_busy)
                         .on_click(cx.listener(|view, _, window, cx| {
@@ -7524,9 +7726,9 @@ impl AppView {
                 .child(
                     Button::new("release-recover-batches")
                         .label(if self.release_recovery_busy {
-                            "核对中…"
+                            tr("核对中…")
                         } else {
-                            "核对中断批次"
+                            tr("核对中断批次")
                         })
                         .disabled(self.release_recovery_busy)
                         .on_click(cx.listener(|view, _, window, cx| {
@@ -7538,7 +7740,7 @@ impl AppView {
             rows = rows.child(
                 div()
                     .text_color(self.palette().warning)
-                    .child(format!("中断恢复待处理：{error}")),
+                    .child(tfmt!("中断恢复待处理：{error}")),
             );
         }
         let error = match project_id {
@@ -7549,14 +7751,14 @@ impl AppView {
             rows = rows.child(
                 div()
                     .text_color(self.palette().destructive)
-                    .child(error.clone()),
+                    .child(tr_system(error)),
             );
         }
         if let Some(error) = &self.release_history_load_error {
             rows = rows.child(
                 div()
                     .text_color(self.palette().destructive)
-                    .child(format!("任务详情读取失败：{error}")),
+                    .child(tfmt!("任务详情读取失败：{error}")),
             );
         }
         let tasks = match project_id {
@@ -7606,12 +7808,12 @@ impl AppView {
                 .items_center()
                 .bg(self.palette().accent)
                 .text_color(self.palette().muted)
-                .child(div().w(px(155.)).flex_shrink_0().child("时间"));
+                .child(div().w(px(155.)).flex_shrink_0().child(tr("时间")));
             if project_id.is_none() {
-                header = header.child(div().w(px(135.)).flex_shrink_0().child("项目"));
+                header = header.child(div().w(px(135.)).flex_shrink_0().child(tr("项目")));
             }
             header = header
-                .child(div().w(px(175.)).flex_shrink_0().child("发布标识"))
+                .child(div().w(px(175.)).flex_shrink_0().child(tr("发布标识")))
                 .child(
                     div()
                         .w(px(135.))
@@ -7622,21 +7824,21 @@ impl AppView {
                             "目标主机"
                         }),
                 )
-                .child(div().w(px(155.)).flex_shrink_0().child("结果"))
-                .child(div().w(px(90.)).flex_shrink_0().child("耗时"))
-                .child(div().w(px(145.)).flex_shrink_0().child("操作"));
+                .child(div().w(px(155.)).flex_shrink_0().child(tr("结果")))
+                .child(div().w(px(90.)).flex_shrink_0().child(tr("耗时")))
+                .child(div().w(px(145.)).flex_shrink_0().child(tr("操作")));
             table = table.child(header);
             for (index, task) in tasks.iter().enumerate() {
                 let (status, color) = match (task.outcome.as_str(), task.health_result.as_deref()) {
-                    ("complete", Some("healthy")) => ("成功", self.palette().success),
-                    ("blocked", Some("healthy")) => ("待确认", self.palette().warning),
+                    ("complete", Some("healthy")) => (tr("成功"), self.palette().success),
+                    ("blocked", Some("healthy")) => (tr("待确认"), self.palette().warning),
                     ("blocked", Some("running_unverified")) => {
-                        ("运行中，未验证就绪", self.palette().warning)
+                        (tr("运行中，未验证就绪"), self.palette().warning)
                     }
-                    ("blocked", _) => ("失败待处理", self.palette().destructive),
-                    ("unknown", _) => ("待核实", self.palette().warning),
-                    ("failed", _) => ("失败", self.palette().destructive),
-                    _ => ("进行中", self.palette().muted),
+                    ("blocked", _) => (tr("失败待处理"), self.palette().destructive),
+                    ("unknown", _) => (tr("待核实"), self.palette().warning),
+                    ("failed", _) => (tr("失败"), self.palette().destructive),
+                    _ => (tr("进行中"), self.palette().muted),
                 };
                 let can_rollback = task.phase == "checked"
                     && task.docker_daemon_id.is_some()
@@ -7676,7 +7878,7 @@ impl AppView {
                             .font_family(mono_font())
                             .child(history_tag(&task.image_reference)),
                     )
-                    .child(div().w(px(135.)).flex_shrink_0().child("1 台"))
+                    .child(div().w(px(135.)).flex_shrink_0().child(tr("1 台")))
                     .child(
                         div()
                             .w(px(155.))
@@ -7697,7 +7899,7 @@ impl AppView {
                             .child(
                                 Button::new(("history-detail", index))
                                     .debug_selector(|| "history-detail-button".into())
-                                    .label(if selected { "收起" } else { "详情" })
+                                    .label(if selected { tr("收起") } else { tr("详情") })
                                     .on_click(cx.listener({
                                         let id = task.id.clone();
                                         move |view, _, _, cx| {
@@ -7719,7 +7921,7 @@ impl AppView {
                                 actions.child(
                                     Button::new(("history-rollback", index))
                                         .debug_selector(|| "release-rollback-button".into())
-                                        .label("回滚")
+                                        .label(tr("回滚"))
                                         .disabled(
                                             self.deploy_run_busy
                                                 || self.rollback_running.is_some()
@@ -7862,12 +8064,12 @@ impl AppView {
                                 "running_unverified" => ("发布时核实：运行中，未验证就绪", self.palette().warning),
                                 _ => ("发布时核实：未健康", self.palette().destructive),
                             };
-                            row.child(div().text_color(color).child(label))
+                            row.child(div().text_color(color).child(tr(label)))
                         })
-                        .child(div().whitespace_normal().child(detail))
+                        .child(div().whitespace_normal().child(tr_system(&detail)))
                         .when(self.rollback_running.as_deref() == Some(id.as_str()), |row| {
                             row.child(div().text_color(self.palette().warning)
-                                .child(format!("回滚执行中：{}", self.rollback_stage)))
+                                .child(tfmt!("回滚执行中：{}", self.rollback_stage)))
                         })
                         .when_some(self.release_material_checks.get(&id), |row, material| {
                             row.child(div().text_color(self.palette().muted).child(
@@ -7885,20 +8087,20 @@ impl AppView {
                         })
                         .when_some(self.release_image_checks.get(&id), |row, result| {
                             row.child(div().text_color(self.palette().muted).child(match result {
-                                Ok(images) => format!(
+                                Ok(images) => tfmt!(
                                     "远端历史镜像：{}（只读，不代表可回滚）",
-                                    images.iter().map(|(service, available)| format!(
-                                        "{service} {}", if *available { "ID/架构匹配" } else { "缺失或已变化" }
+                                    images.iter().map(|(service, available)| tfmt!(
+                                        "{service} {}", if *available { tr("ID/架构匹配") } else { tr("缺失或已变化") }
                                     )).collect::<Vec<_>>().join("  ·  ")
                                 ),
-                                Err(error) => format!("远端镜像核实失败：{error}"),
+                                Err(error) => tfmt!("远端镜像核实失败：{error}"),
                             }))
                         })
                         .when_some(self.release_upload_inspections.get(&id), |row, result| {
                             let mut details = div().flex().flex_col().gap_1().whitespace_normal();
                             match result {
                                 Ok(check) => {
-                                    details = details.child(format!(
+                                    details = details.child(tfmt!(
                                         "上次只读核实：该项目容器 {} 个；镜像 tag 尚未核实。此结果不授权续传或解除阻断。",
                                         check.containers.len()
                                     ));
@@ -7917,35 +8119,35 @@ impl AppView {
                                         details = details.child(format!("{} · {} · {status}", archive.service, archive.directory));
                                     }
                                 }
-                                Err(error) => details = details.child(format!("远端归档核实失败：{error}")),
+                                Err(error) => details = details.child(tfmt!("远端归档核实失败：{error}")),
                             }
                             row.child(div().text_color(self.palette().warning).child(details))
                         })
                         .when_some(resume_batch.and_then(|batch_id| self.batch_operation_stage.get(batch_id)), |row, stage| {
-                            row.child(div().text_color(self.palette().warning).child(format!("批次操作中：{stage}")))
+                            row.child(div().text_color(self.palette().warning).child(tfmt!("批次操作中：{stage}")))
                         })
                         .when_some(self.previous_version_checks.get(&id), |row, result| {
                             row.child(div().text_color(self.palette().muted).child(match result {
-                                Ok(check) => format!(
+                                Ok(check) => tfmt!(
                                     "上一健康版本 {}：{} 份镜像及本机快照在核查时齐全；尚不可回滚",
                                     check.task_id.chars().take(8).collect::<String>(), check.images
                                 ),
-                                Err(error) => format!("上一版本预检不可用：{error}"),
+                                Err(error) => tfmt!("上一版本预检不可用：{error}"),
                             }))
                         })
                         .when_some(self.current_version_checks.get(&id), |row, result| {
                             row.child(div().text_color(self.palette().muted).child(match result {
-                                Ok(check) if check.containers == 0 => "远端当前无该项目容器；不能判定运行版本。".into(),
+                                Ok(check) if check.containers == 0 => tr("远端当前无该项目容器；不能判定运行版本。"),
                                 Ok(check) if check.running_containers != check.containers =>
-                                    format!("项目有 {} 个容器，其中 {} 个运行；不能确认完整运行版本，全部材料继续保留。",
+                                    tfmt!("项目有 {} 个容器，其中 {} 个运行；不能确认完整运行版本，全部材料继续保留。",
                                         check.containers, check.running_containers),
                                 Ok(check) => match &check.matched_task_id {
-                                    Some(version) => format!("检查时容器对应已完成版本 {}；当前{}。外部变化后须重新核实。",
+                                    Some(version) => tfmt!("检查时容器对应已完成版本 {}；当前{}。外部变化后须重新核实。",
                                         version.chars().take(8).collect::<String>(),
-                                        if check.all_healthy { "全部健康" } else { "存在未健康服务" }),
-                                    None => "当前容器与任何已完成版本均不完全匹配；可能是部分发布或外部漂移，全部材料继续保留。".into(),
+                                        if check.all_healthy { tr("全部健康") } else { tr("存在未健康服务") }),
+                                    None => tr("当前容器与任何已完成版本均不完全匹配；可能是部分发布或外部漂移，全部材料继续保留。"),
                                 },
-                                Err(error) => format!("当前运行版本核实失败：{error}"),
+                                Err(error) => tfmt!("当前运行版本核实失败：{error}"),
                             }))
                         })
                         .child(
@@ -7957,9 +8159,9 @@ impl AppView {
                                     Button::new(("release-inspect", index))
                                         .debug_selector(|| "release-inspect-button".into())
                                         .label(if checking {
-                                            "核实中…"
+                                            tr("核实中…")
                                         } else {
-                                            "重新核实状态"
+                                            tr("重新核实状态")
                                         })
                                         .disabled(checking || resolving || !active)
                                         .on_click(cx.listener({
@@ -7972,9 +8174,9 @@ impl AppView {
                                 .child(
                                     Button::new(("release-materials", index))
                                         .label(if material_checking {
-                                            "检查中…"
+                                            tr("检查中…")
                                         } else {
-                                            "检查本机材料"
+                                            tr("检查本机材料")
                                         })
                                         .disabled(material_checking)
                                         .on_click(cx.listener({
@@ -7986,7 +8188,7 @@ impl AppView {
                                 )
                                 .child(
                                     Button::new(("release-images", index))
-                                        .label(if image_checking { "核实中…" } else { "核实远端镜像" })
+                                        .label(if image_checking { tr("核实中…") } else { tr("核实远端镜像") })
                                         .disabled(image_checking)
                                         .on_click(cx.listener({
                                             let id = id.clone();
@@ -7996,7 +8198,7 @@ impl AppView {
                                 .when(task.phase == "uploading" && task.outcome == "unknown", |actions| {
                                     actions.child(Button::new(("release-upload-inspect", index))
                                         .debug_selector(|| "release-upload-inspect-button".into())
-                                        .label(if upload_inspecting { "核对中…" } else { "只读核对临时 tar" })
+                                        .label(if upload_inspecting { tr("核对中…") } else { tr("只读核对临时 tar") })
                                         .disabled(upload_inspecting)
                                         .on_click(cx.listener({
                                             let id = id.clone();
@@ -8006,7 +8208,7 @@ impl AppView {
                                 .when(task.phase == "uploading" && task.outcome == "unknown" && resume_batch.is_some(), |actions| {
                                     actions.child(Button::new(("release-upload-resume", index))
                                         .debug_selector(|| "release-upload-resume-button".into())
-                                        .label("确认断点续传")
+                                        .label(tr("确认断点续传"))
                                         .disabled(!can_resume)
                                         .on_click(cx.listener({
                                             let id = id.clone();
@@ -8015,7 +8217,7 @@ impl AppView {
                                 })
                                 .child(
                                     Button::new(("previous-version", index))
-                                        .label(if previous_checking { "预检中…" } else { "检查上一版本" })
+                                        .label(if previous_checking { tr("预检中…") } else { tr("检查上一版本") })
                                         .disabled(previous_checking)
                                         .on_click(cx.listener({
                                             let id = id.clone();
@@ -8023,7 +8225,7 @@ impl AppView {
                                         })),
                                 )
                                 .child(Button::new(("current-version", index))
-                                    .label(if current_checking { "核实中…" } else { "核实当前运行版本" })
+                                    .label(if current_checking { tr("核实中…") } else { tr("核实当前运行版本") })
                                     .disabled(current_checking || task.docker_daemon_id.is_none())
                                     .on_click(cx.listener({
                                         let id = id.clone();
@@ -8035,9 +8237,9 @@ impl AppView {
                                             .debug_selector(|| "release-confirm-absence-button".into())
                                             .danger()
                                             .label(if resolving {
-                                                "处理中…"
+                                                tr("处理中…")
                                             } else {
-                                                "确认无容器，解除阻断"
+                                                tr("确认无容器，解除阻断")
                                             })
                                             .disabled(resolving || checking)
                                             .on_click(cx.listener({
@@ -8054,7 +8256,7 @@ impl AppView {
                                 })
                                 .when(task.phase == "uploading" && task.outcome == "unknown", |row| {
                                     row.child(Button::new(("release-close-predeploy", index)).outline()
-                                        .label(if resolving { "核实中…" } else { "核实旧版本并关闭上传中断" })
+                                        .label(if resolving { tr("核实中…") } else { tr("核实旧版本并关闭上传中断") })
                                         .disabled(resolving || self.deploy_run_busy || self.rollback_running.is_some())
                                         .on_click(cx.listener({
                                             let id = id.clone();
@@ -8064,7 +8266,7 @@ impl AppView {
                                 .when(can_complete, |row| {
                                     row.child(Button::new(("release-confirm-healthy", index))
                                         .debug_selector(|| "release-confirm-healthy-button".into())
-                                        .label(if resolving { "处理中…" } else { "确认健康发布完成" })
+                                        .label(if resolving { tr("处理中…") } else { tr("确认健康发布完成") })
                                         .disabled(resolving || checking)
                                         .on_click(cx.listener({
                                             let id = id.clone();
@@ -8075,11 +8277,11 @@ impl AppView {
                                     row.child(Button::new(("release-reconcile-health", index))
                                         .debug_selector(|| "release-reconcile-health-button".into())
                                          .label(if resolving {
-                                             "核实中…"
+                                             tr("核实中…")
                                          } else if task.phase == "deploying" {
-                                             "核实启动结果并恢复记录"
+                                             tr("核实启动结果并恢复记录")
                                          } else {
-                                             "恢复中断的健康核实"
+                                             tr("恢复中断的健康核实")
                                          })
                                         .disabled(resolving || checking)
                                         .on_click(cx.listener({
@@ -8120,7 +8322,7 @@ impl AppView {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .child(div().font_family(mono_font()).child(format!(
+                    .child(div().font_family(mono_font()).child(tfmt!(
                         "回滚 {} · 项目 {} · {} → {}",
                         rollback.id.chars().take(8).collect::<String>(),
                         rollback.project_id,
@@ -8145,7 +8347,7 @@ impl AppView {
                             row.child(
                                 div()
                                     .text_color(self.palette().warning)
-                                    .child(format!("远端临时镜像归档待人工核对：{directories}")),
+                                    .child(tfmt!("远端临时镜像归档待人工核对：{directories}")),
                             )
                         },
                     )
@@ -8153,9 +8355,9 @@ impl AppView {
                         row.child(
                             Button::new(format!("rollback-reconcile-{}", rollback.id))
                                 .label(if resolving {
-                                    "核实中…"
+                                    tr("核实中…")
                                 } else {
-                                    "只读核实回滚结果"
+                                    tr("只读核实回滚结果")
                                 })
                                 .disabled(resolving)
                                 .on_click(cx.listener({
@@ -8182,6 +8384,7 @@ impl AppView {
         narrow: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let restore_pending = backup::needs_review(project.id).unwrap_or(true);
         let tabs = [
             (ProjectTab::Build, "构建配置", "build"),
             (ProjectTab::Compose, "Compose", "compose"),
@@ -8250,8 +8453,8 @@ impl AppView {
                     project.name.clone(),
                     Button::new("project-release")
                         .primary()
-                        .label("发布")
-                        .disabled(project.config_error.is_some())
+                        .label(tr("发布"))
+                        .disabled(project.config_error.is_some() || restore_pending)
                         .on_click(cx.listener(move |view, _, window, cx| {
                             view.navigate(Page::Deploy, window, cx);
                             if view.deploy_project_id != Some(release_project_id) {
@@ -8260,6 +8463,21 @@ impl AppView {
                         })),
                 ),
             )
+            .when(restore_pending, |el| {
+                let id = project.id;
+                el.child(div().px_6().py_4().border_1().border_color(self.palette().warning)
+                    .flex().flex_wrap().items_center().gap_3()
+                    .child(tr("该项目由备份恢复。请核对本地路径、构建参数与环境变量，并重配主机凭据。"))
+                    .child(Button::new("confirm-restored-project").outline()
+                        .label(tr("已核对配置，允许发布"))
+                        .on_click(cx.listener(move |_, _, window, cx| {
+                            match backup::confirm_project(id) {
+                                Ok(()) => window.push_notification(Notification::success(tr("项目配置已确认")), cx),
+                                Err(error) => window.push_notification(Notification::error(tr_system(&error)), cx),
+                            }
+                            cx.notify();
+                        }))))
+            })
             .child(
                 self.panel(
                     if project.manifest_mode {
@@ -8291,14 +8509,14 @@ impl AppView {
                         })
                         .child(if project.manifest_mode {
                             Button::new("manifest-reload")
-                                .label("重新读取配置")
+                                .label(tr("重新读取配置"))
                                 .on_click(cx.listener(|view, _, window, cx| {
                                     view.reload_project_configs(window, cx)
                                 }))
                         } else {
                             let id = project.id;
                             Button::new("manifest-adopt")
-                                .label("改用 devingpanel.yaml")
+                                .label(tr("改用 devingpanel.yaml"))
                                 .on_click(cx.listener(move |view, _, window, cx| {
                                     view.confirm_adopt_manifest(id, window, cx)
                                 }))
@@ -8309,7 +8527,7 @@ impl AppView {
                                 let id = project.id;
                                 el.child(
                                     Button::new("manifest-targets-confirm")
-                                        .label("管理员确认目标绑定")
+                                        .label(tr("管理员确认目标绑定"))
                                         .on_click(cx.listener(move |view, _, window, cx| {
                                             view.confirm_manifest_targets(id, window, cx)
                                         })),
@@ -8338,7 +8556,10 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         if self.deploy_run_busy && self.deploy_run_project_id != Some(id) {
-            window.push_notification(Notification::warning("发布进行中，暂不能切换项目。"), cx);
+            window.push_notification(
+                Notification::warning(tr("发布进行中，暂不能切换项目。")),
+                cx,
+            );
             return;
         }
         if let Some(project) = self
@@ -8756,7 +8977,7 @@ impl AppView {
         let ids = self.deploy_host_ids.clone();
         if !self.batch_start_ready(project, &ids) {
             window.push_notification(
-                Notification::warning("批次预检已失效，请重新核对目标。"),
+                Notification::warning(tr("批次预检已失效，请重新核对目标。")),
                 cx,
             );
             return;
@@ -8785,16 +9006,16 @@ impl AppView {
         window.open_dialog(cx, move |dialog, _, _| {
             let confirm_view = view.clone();
             let confirmation = confirmation.clone();
-            dialog.title("确认多主机批次发布").w(px(560.))
+            dialog.title(tr("确认多主机批次发布")).w(px(560.))
                 .child(div().flex().flex_col().gap_3()
-                    .child(format!("项目：{name} · 发布标识：{}", confirmation.tag))
-                    .child(format!("目标：{targets} · 并行度 {parallelism} · 共享镜像 {images} 份"))
-                    .child("执行前会重新核对完整预检快照；每波目标同时部署。健康目标逐一确认，已核实失败目标显式跳过后，才能继续下一波；结果未知会阻断，不会自动重试或回滚。"))
+                    .child(tfmt!("项目：{name} · 发布标识：{}", confirmation.tag))
+                    .child(tfmt!("目标：{targets} · 并行度 {parallelism} · 共享镜像 {images} 份"))
+                    .child(tr("执行前会重新核对完整预检快照；每波目标同时部署。健康目标逐一确认，已核实失败目标显式跳过后，才能继续下一波；结果未知会阻断，不会自动重试或回滚。")))
                 .footer(div().flex().justify_end().gap_2()
                     .child(Button::new("batch-start-cancel").debug_selector(|| "batch-start-cancel".into())
-                        .label("取消").on_click(|_, window, cx| window.close_dialog(cx)))
+                        .label(tr("取消")).on_click(|_, window, cx| window.close_dialog(cx)))
                     .child(Button::new("batch-start-confirm").primary()
-                        .debug_selector(|| "batch-start-confirm".into()).label("确认开始批次")
+                        .debug_selector(|| "batch-start-confirm".into()).label(tr("确认开始批次"))
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let _ = confirm_view.update(cx, |view, cx| {
@@ -8827,7 +9048,7 @@ impl AppView {
             || !matches!(&self.deploy_batch_check, Some(Ok(current)) if Arc::ptr_eq(current, &snapshot))
         {
             window.push_notification(
-                Notification::warning("批次确认期间配置已变化，请重新预检。"),
+                Notification::warning(tr("批次确认期间配置已变化，请重新预检。")),
                 cx,
             );
             return;
@@ -8912,7 +9133,7 @@ impl AppView {
                                     Ok(stack_release::BatchProgress::AwaitingConfirmation {
                                         batch_id,
                                         ..
-                                    }) => Notification::success(format!(
+                                    }) => Notification::success(tfmt!(
                                         "批次 {} {}",
                                         &batch_id[..8],
                                         if parallelism > 1 {
@@ -8922,12 +9143,12 @@ impl AppView {
                                         }
                                     )),
                                     Ok(stack_release::BatchProgress::Complete { batch_id }) => {
-                                        Notification::success(format!(
+                                        Notification::success(tfmt!(
                                             "批次 {} 全部完成",
                                             &batch_id[..8]
                                         ))
                                     }
-                                    Err(error) => Notification::warning(format!(
+                                    Err(error) => Notification::warning(tfmt!(
                                         "批次 {}：{}；请核实历史，勿重复开始。",
                                         error.batch_id.as_deref().unwrap_or("未创建"),
                                         error.message
@@ -8949,7 +9170,9 @@ impl AppView {
                                 cx.notify();
                             });
                             window.push_notification(
-                                Notification::error("批次执行通道中断；结果待核实，不得重新开始。"),
+                                Notification::error(tr(
+                                    "批次执行通道中断；结果待核实，不得重新开始。",
+                                )),
                                 app,
                             );
                         });
@@ -8989,7 +9212,7 @@ impl AppView {
         }
         if !self.deploy_ready(project, &ids) {
             window.push_notification(
-                Notification::warning("仅支持预检通过的 YAML v2 单主机发布。"),
+                Notification::warning(tr("仅支持预检通过的 YAML v2 单主机发布。")),
                 cx,
             );
             return;
@@ -8999,7 +9222,7 @@ impl AppView {
         let name = project.name.clone();
         let Some(confirmed_host) = self.hosts.iter().find(|host| host.id == host_id).cloned()
         else {
-            window.push_notification(Notification::warning("目标主机资料尚未读取。"), cx);
+            window.push_notification(Notification::warning(tr("目标主机资料尚未读取。")), cx);
             return;
         };
         let host_name = confirmed_host.name.clone();
@@ -9034,7 +9257,7 @@ impl AppView {
         }) {
             Ok(digest) => digest,
             Err(error) => {
-                window.push_notification(Notification::warning(error), cx);
+                window.push_notification(Notification::warning(tr_system(&error)), cx);
                 self.refresh_deploy_environment(cx);
                 return;
             }
@@ -9046,16 +9269,16 @@ impl AppView {
             let tag = tag.clone();
             let source_digest = source_digest.clone();
             let confirmed_host = confirmed_host.clone();
-            dialog.title("确认发布整个 Compose 项目").w(px(540.))
+            dialog.title(tr("确认发布整个 Compose 项目")).w(px(540.))
                 .child(div().flex().flex_col().gap_3()
-                    .child(format!("项目：{name} · 主机：{host_name}"))
-                    .child(format!("本次镜像：{images}"))
-                    .child("将逐个构建并传输自有镜像，在目标主机启动 Compose 中的全部服务。执行前会重新预检项目文件和主机；运行期间请勿关闭程序。")
-                    .child("仅全部服务健康且材料及远端身份再次核实通过，才记录完成；失败或连接不确定会阻断后续发布，不自动重试。"))
+                    .child(tfmt!("项目：{name} · 主机：{host_name}"))
+                    .child(tfmt!("本次镜像：{images}"))
+                    .child(tr("将逐个构建并传输自有镜像，在目标主机启动 Compose 中的全部服务。执行前会重新预检项目文件和主机；运行期间请勿关闭程序。"))
+                    .child(tr("仅全部服务健康且材料及远端身份再次核实通过，才记录完成；失败或连接不确定会阻断后续发布，不自动重试。")))
                 .footer(div().flex().justify_end().gap_2()
-                    .child(Button::new("deploy-cancel").debug_selector(|| "deploy-cancel-button".into()).label("取消")
+                    .child(Button::new("deploy-cancel").debug_selector(|| "deploy-cancel-button".into()).label(tr("取消"))
                         .on_click(|_, window, cx| window.close_dialog(cx)))
-                    .child(Button::new("deploy-confirm").primary().debug_selector(|| "deploy-confirm-button".into()).label("确认开始发布")
+                    .child(Button::new("deploy-confirm").primary().debug_selector(|| "deploy-confirm-button".into()).label(tr("确认开始发布"))
                         .on_click(move |_, window, cx| {
                             window.close_dialog(cx);
                             let tag = tag.clone();
@@ -9088,7 +9311,7 @@ impl AppView {
             || self.deploy_tag.read(cx).value() != tag
         {
             window.push_notification(
-                Notification::warning("发布配置已变化，请重新检查并确认。"),
+                Notification::warning(tr("发布配置已变化，请重新检查并确认。")),
                 cx,
             );
             return;
@@ -9097,7 +9320,7 @@ impl AppView {
             .and_then(|current| release::source_digest(&current));
         if current_digest.as_deref() != Ok(confirmed_digest.as_str()) {
             window.push_notification(
-                Notification::warning("项目配置在确认期间变化；请重新检查并确认。"),
+                Notification::warning(tr("项目配置在确认期间变化；请重新检查并确认。")),
                 cx,
             );
             self.refresh_deploy_environment(cx);
@@ -9110,7 +9333,7 @@ impl AppView {
         });
         if !host_unchanged {
             window.push_notification(
-                Notification::warning("目标主机在确认期间变化，请重新检查。"),
+                Notification::warning(tr("目标主机在确认期间变化，请重新检查。")),
                 cx,
             );
             self.refresh_deploy_environment(cx);
@@ -9209,10 +9432,10 @@ impl AppView {
                             });
                             window.push_notification(
                                 match result {
-                                    Ok((id, count)) => Notification::success(format!(
+                                    Ok((id, count)) => Notification::success(tfmt!(
                                         "发布 {id} 完成，{count} 个服务健康"
                                     )),
-                                    Err(error) => Notification::error(format!(
+                                    Err(error) => Notification::error(tfmt!(
                                         "{error}；请到发布历史核实，勿重复点击。"
                                     )),
                                 },
@@ -9236,9 +9459,9 @@ impl AppView {
                                 cx.notify();
                             });
                             window.push_notification(
-                                Notification::error(
+                                Notification::error(tr(
                                     "发布执行异常中断，请先在历史页核实，不得重试。",
-                                ),
+                                )),
                                 app,
                             );
                         });
@@ -9269,7 +9492,7 @@ impl AppView {
             .flex()
             .flex_col()
             .gap_6()
-            .child(self.page_head("发布", div()))
+            .child(self.page_head(tr("发布"), div()))
             .child(
                 div().flex().child(
                     div()
@@ -9315,7 +9538,7 @@ impl AppView {
                     self.panel(
                         "项目数据读取失败",
                         "",
-                        div().px_6().pb_6().child(error.clone()),
+                        div().px_6().pb_6().child(tr_system(error)),
                     )
                     .into_any_element()
                 } else {
@@ -9335,7 +9558,7 @@ impl AppView {
         };
         if project.manifest_mode {
             window.push_notification(
-                Notification::warning("YAML 项目的目标顺序由开发者预设。"),
+                Notification::warning(tr("YAML 项目的目标顺序由开发者预设。")),
                 cx,
             );
             return;
@@ -9382,7 +9605,7 @@ impl AppView {
                                 .child(
                                     Button::new(("deploy-target-up", id as usize))
                                         .icon(assets::IconName::ArrowUp)
-                                        .accessibility_label("上移")
+                                        .accessibility_label(tr("上移"))
                                         .disabled(!checked || index == 0)
                                         .on_click(move |_, window, _| {
                                             let mut ids = up_draft.borrow_mut();
@@ -9398,7 +9621,7 @@ impl AppView {
                                 .child(
                                     Button::new(("deploy-target-down", id as usize))
                                         .icon(assets::IconName::ArrowDown)
-                                        .accessibility_label("下移")
+                                        .accessibility_label(tr("下移"))
                                         .disabled(!checked || index + 1 >= selected.len())
                                         .on_click(move |_, window, _| {
                                             let mut ids = down_draft.borrow_mut();
@@ -9416,7 +9639,7 @@ impl AppView {
                             div().w(px(70.)).flex_shrink_0().child(
                                 base::Checkbox::new(("deploy-target-check", id as usize))
                                     .checked(checked)
-                                    .accessibility_label(format!(
+                                    .accessibility_label(tfmt!(
                                         "选择 {}",
                                         host.map_or("主机", |host| host.name.as_str())
                                     ))
@@ -9438,7 +9661,7 @@ impl AppView {
                                 .w(px(95.))
                                 .flex_shrink_0()
                                 .text_color(muted)
-                                .child("未连接"),
+                                .child(tr("未连接")),
                         )
                         .child(
                             div()
@@ -9458,7 +9681,7 @@ impl AppView {
             let save_view = view.clone();
             let save_draft = draft.clone();
             dialog
-                .title("更改目标主机")
+                .title(tr("更改目标主机"))
                 .w(px(760.))
                 .child(
                     div()
@@ -9468,7 +9691,7 @@ impl AppView {
                         .child(
                             div()
                                 .text_color(muted)
-                                .child("仅可选择该项目绑定的主机，可调整发布顺序。"),
+                                .child(tr("仅可选择该项目绑定的主机，可调整发布顺序。")),
                         )
                         .child(
                             div()
@@ -9485,12 +9708,14 @@ impl AppView {
                                         .flex()
                                         .items_center()
                                         .text_color(muted)
-                                        .child(div().w(px(145.)).flex_shrink_0().child("顺序"))
-                                        .child(div().w(px(70.)).flex_shrink_0().child("选择"))
-                                        .child(div().w(px(95.)).flex_shrink_0().child("状态"))
-                                        .child(div().w(px(130.)).flex_shrink_0().child("主机名"))
-                                        .child(div().w(px(180.)).flex_shrink_0().child("地址"))
-                                        .child("分组"),
+                                        .child(div().w(px(145.)).flex_shrink_0().child(tr("顺序")))
+                                        .child(div().w(px(70.)).flex_shrink_0().child(tr("选择")))
+                                        .child(div().w(px(95.)).flex_shrink_0().child(tr("状态")))
+                                        .child(
+                                            div().w(px(130.)).flex_shrink_0().child(tr("主机名")),
+                                        )
+                                        .child(div().w(px(180.)).flex_shrink_0().child(tr("地址")))
+                                        .child(tr("分组")),
                                 )
                                 .child(rows),
                         ),
@@ -9502,13 +9727,13 @@ impl AppView {
                         .gap_2()
                         .child(
                             Button::new("deploy-target-cancel")
-                                .label("取消")
+                                .label(tr("取消"))
                                 .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
                         .child(
                             Button::new("deploy-target-confirm")
                                 .primary()
-                                .label("确认")
+                                .label(tr("确认"))
                                 .on_click(move |_, window, cx| {
                                     let ids = save_draft.borrow().clone();
                                     let _ = save_view.update(cx, |view, cx| {
@@ -9772,7 +9997,7 @@ impl AppView {
                             .w(px(115.))
                             .flex_shrink_0()
                             .text_color(self.palette().muted)
-                            .child(
+                            .child(tr(
                                 if self.deploy_run_project_id == Some(project.id)
                                     && self.deploy_run_host_id == Some(*id)
                                 {
@@ -9786,7 +10011,7 @@ impl AppView {
                                 } else {
                                     "等待"
                                 },
-                            ),
+                            )),
                     )
                     .child(
                         div()
@@ -9798,7 +10023,7 @@ impl AppView {
                                 if self.deploy_run_project_id == Some(project.id)
                                     && self.deploy_run_host_id == Some(*id)
                                 {
-                                    self.deploy_run_stage.clone()
+                                    tr(&self.deploy_run_stage)
                                 } else {
                                     "—".into()
                                 },
@@ -9841,34 +10066,43 @@ impl AppView {
                     .gap_6()
                     .child(div().w(px(180.)).child(Self::form_field("项目", project_selector)))
                     .child(div().w(px(200.)).flex().flex_col().gap_2()
-                        .child("发布标识")
+                        .child(tr("发布标识"))
                         .child(Input::new(&self.deploy_tag).w_full().disabled(self.deploy_tag_loading || self.deploy_run_busy))
                         .when_some(self.deploy_tag_error.as_ref(), |el, error| el.child(
-                            div().text_size(px(12.)).text_color(self.palette().warning).child(error.clone())
+                            div().text_size(px(12.)).text_color(self.palette().warning).child(tr_system(error))
                         )))
                     .child(div().w(px(130.)).flex().flex_col().gap_2()
-                        .child("目标主机")
+                        .child(tr("目标主机"))
                         .child(div().h(px(36.)).flex().items_center().gap_2()
-                            .child(format!("已选 {} 台", ids.len()))
-                            .when(project.manifest_mode, |el| el.child("YAML 预设"))
-                            .when(!project.manifest_mode, |el| el.child(Button::new("deploy-targets-change").label("更改")
+                            .child(tfmt!("已选 {} 台", ids.len()))
+                            .when(project.manifest_mode, |el| el.child(tr("YAML 预设")))
+                            .when(!project.manifest_mode, |el| el.child(Button::new("deploy-targets-change").label(tr("更改"))
                                 .disabled(project.host_ids.is_empty() || self.deploy_run_busy)
                                 .on_click(cx.listener(|view, _, window, cx| view.open_deploy_targets_dialog(window, cx)))))))
                     .child(div().w(px(75.)).child(Self::form_field("并行度", parallel_selector)))
+                    .child(div().text_color(self.palette().muted).child(if self.registry_config.as_ref().is_some_and(|config| config.enabled) {
+                        tr("Registry 推送 / 远端拉取")
+                    } else {
+                        tr("SSH 直连传输")
+                    }))
                     .child(Button::new("start-deploy").primary()
                         .debug_selector(|| "start-deploy-button".into())
-                        .label(if self.deploy_run_busy { "发布中…" } else { "开始发布" })
+                        .label(if self.deploy_run_busy { tr("发布中…") } else { tr("开始发布") })
                         .tooltip(if project.manifest_mode && ids.len() > 1 {
-                            "将按 YAML 目标顺序分波次发布；每台健康后都须人工确认"
+                            tr("将按 YAML 目标顺序分波次发布；每台健康后都须人工确认")
                         } else {
-                            "当前支持 YAML v2 单主机整栈发布；开始前将再次预检"
+                            tr("当前支持 YAML v2 单主机整栈发布；开始前将再次预检")
                         })
                         .disabled(!can_start)
                         .on_click(cx.listener(|view, _, window, cx| view.confirm_deploy(window, cx)))),
             )
             .child(self.panel(
                 "发布进度总览",
-                "SSH 直连 · save → SFTP → load",
+                if self.registry_config.as_ref().is_some_and(|config| config.enabled) {
+                    "Registry 推送 · VPS 拉取"
+                } else {
+                    "SSH 直连 · save → SFTP → load"
+                },
                 div()
                     .px_6()
                     .pb_6()
@@ -9881,16 +10115,16 @@ impl AppView {
                     .child(div().text_color(tag_color).child(tag_status))
                     .when_some(self.deploy_batch_plan.as_ref(), |el, batch| el.child(
                         div().whitespace_normal().text_color(self.palette().muted).child(match batch {
-                            Ok(plan) => format!(
+                            Ok(plan) => tfmt!(
                                 "只读批次矩阵 · {} 份唯一服务/架构镜像 → {} 台目标：{}。发布前需完成目标/材料预检。",
                                 plan.builds.len(), plan.hosts.len(),
                                 plan.hosts.iter().map(|target| {
                                     let name = self.hosts.iter().find(|host| host.id == target.host_id)
                                         .map_or_else(|| target.host_id.to_string(), |host| host.name.clone());
-                                    format!("{name} {} / {} 份镜像", target.platform, target.images.len())
+                                    tfmt!("{name} {} / {} 份镜像", target.platform, target.images.len())
                                 }).collect::<Vec<_>>().join(" · "),
                             ),
-                            Err(error) => format!("批次镜像矩阵不可用：{error}"),
+                            Err(error) => tfmt!("批次镜像矩阵不可用：{error}"),
                         })
                     ))
                     .child(div().text_color(env_color).child(env_status))
@@ -9898,7 +10132,7 @@ impl AppView {
                         div().flex().flex_col().items_start().gap_2()
                             .child(Button::new("batch-preflight-check")
                                 .debug_selector(|| "batch-preflight-check-button".into())
-                                .label(if self.deploy_batch_check_loading { "正在核对批次目标…" } else { "核对批次目标" })
+                                .label(if self.deploy_batch_check_loading { tr("正在核对批次目标…") } else { tr("核对批次目标") })
                                 .disabled(!can_batch_check)
                                 .on_click(cx.listener(|view, _, _, cx| view.start_batch_preflight(cx))))
                             .child(div().whitespace_normal().text_color(match &self.deploy_batch_check {
@@ -9906,20 +10140,20 @@ impl AppView {
                                 Some(Err(_)) => self.palette().warning,
                                 None => self.palette().muted,
                             }).child(match &self.deploy_batch_check {
-                                Some(Ok(snapshot)) => format!(
+                                Some(Ok(snapshot)) => tfmt!(
                                     "批次目标/材料预检通过 · {} 台可信目标 / {} 份共享镜像；尚未构建，HEALTHCHECK 将在构建后核对。仅核实，不创建任务或部署。",
                                     snapshot.targets.len(), snapshot.plan.builds.len(),
                                 ),
-                                Some(Err(error)) => format!("批次预检未通过：{error}"),
-                                None => "批次目标尚未完整预检；当前仍不能开始多主机发布。".into(),
+                                Some(Err(error)) => tfmt!("批次预检未通过：{error}"),
+                                None => tr("批次目标尚未完整预检；当前仍不能开始多主机发布。"),
                             }))
                     ))
                     .child(div().text_color(self.palette().muted).child(if self.deploy_run_busy && self.deploy_run_project_id == Some(project.id) {
-                        format!("正在执行：{}；传输百分比按当前镜像计算，多镜像时会重置。离开页面不会取消任务，请勿关闭程序。", self.deploy_run_stage)
+                        tfmt!("正在执行：{}；传输百分比按当前镜像计算，多镜像时会重置。离开页面不会取消任务，请勿关闭程序。", tr(&self.deploy_run_stage))
                     } else if project.manifest_mode && ids.len() > 1 {
-                        "YAML v2 多主机按并行度分波次发布；每台健康后须人工确认。传输百分比按当前镜像计算，多镜像时会重置。".into()
+                        tr("YAML v2 多主机按并行度分波次发布；每台健康后须人工确认。传输百分比按当前镜像计算，多镜像时会重置。")
                     } else {
-                        "当前仅支持 YAML v2 单主机整栈发布；传输百分比按当前镜像计算，多镜像时会重置。全部服务健康后再次核实材料与远端状态。".into()
+                        tr("当前仅支持 YAML v2 单主机整栈发布；传输百分比按当前镜像计算，多镜像时会重置。全部服务健康后再次核实材料与远端状态。")
                     })),
             ))
             .child(self.panel(
@@ -9927,17 +10161,17 @@ impl AppView {
                 "顺序  ·  主机  ·  状态  ·  阶段  ·  进度  ·  耗时  ·  操作",
                 div().px_6().pb_6()
                     .child(if ids.is_empty() {
-                        div().text_color(self.palette().muted).child("尚未选择目标主机").into_any_element()
+                        div().text_color(self.palette().muted).child(tr("尚未选择目标主机")).into_any_element()
                     } else {
                         div().id("deploy-host-table-scroll").overflow_x_scroll().border_1().border_color(self.palette().border).rounded_md()
                             .child(div().min_w(px(770.)).h(px(40.)).px_4().flex().items_center().text_color(self.palette().muted)
-                                .child(div().w(px(70.)).flex_shrink_0().child("顺序"))
-                                .child(div().w(px(155.)).flex_shrink_0().child("主机"))
-                                .child(div().w(px(115.)).flex_shrink_0().child("状态"))
-                                .child(div().w(px(130.)).flex_shrink_0().child("阶段"))
-                                .child(div().w(px(90.)).flex_shrink_0().child("进度"))
-                                .child(div().w(px(85.)).flex_shrink_0().child("耗时"))
-                                .child("操作"))
+                                .child(div().w(px(70.)).flex_shrink_0().child(tr("顺序")))
+                                .child(div().w(px(155.)).flex_shrink_0().child(tr("主机")))
+                                .child(div().w(px(115.)).flex_shrink_0().child(tr("状态")))
+                                .child(div().w(px(130.)).flex_shrink_0().child(tr("阶段")))
+                                .child(div().w(px(90.)).flex_shrink_0().child(tr("进度")))
+                                .child(div().w(px(85.)).flex_shrink_0().child(tr("耗时")))
+                                .child(tr("操作")))
                             .child(host_rows).into_any_element()
                     }),
             ))
@@ -10090,8 +10324,8 @@ impl AppView {
                 }
                 window.push_notification(
                     match result {
-                        Ok(()) => Notification::success(format!("容器已{}", action.label())),
-                        Err(error) => Notification::error(error),
+                        Ok(()) => Notification::success(tfmt!("容器已{}", action.label())),
+                        Err(error) => Notification::error(tr_system(&error)),
                     },
                     app,
                 );
@@ -10118,7 +10352,9 @@ impl AppView {
                     if view.page == Page::Containers && view.container_host_id == Some(host.id) {
                         match result {
                             Ok(preview) => view.show_disk_preview(host, preview, window, cx),
-                            Err(error) => window.push_notification(Notification::error(error), cx),
+                            Err(error) => {
+                                window.push_notification(Notification::error(tr_system(&error)), cx)
+                            }
                         }
                     }
                     cx.notify();
@@ -10148,7 +10384,7 @@ impl AppView {
                         div()
                             .flex()
                             .justify_between()
-                            .child(format!("{label} · 总数 {}", row.total))
+                            .child(tfmt!("{label} · 总数 {}", row.total))
                             .child(row.reclaimable.clone()),
                     );
                 }
@@ -10157,27 +10393,27 @@ impl AppView {
                 div()
                     .flex()
                     .justify_between()
-                    .child("未使用网络")
-                    .child(format!("{} 个 · 空间未知", preview.unused_networks)),
+                    .child(tr("未使用网络"))
+                    .child(tfmt!("{} 个 · 空间未知", preview.unused_networks)),
             );
             dialog
-                .title("Docker 磁盘占用 · 只读")
+                .title(tr("Docker 磁盘占用 · 只读"))
                 .w(px(520.))
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .gap_4()
-                        .child(format!("目标主机：{} ({}:{})", host.name, host.address, host.port))
+                        .child(tfmt!("目标主机：{} ({}:{})", host.name, host.address, host.port))
                         .child(rows)
-                        .child(div().text_color(palette.muted).child("悬空镜像大小因共享层可能高于实际可释放量。为保护发布历史，全局 Docker 清理暂不可用；此处只读，不删除镜像、容器、网络或数据卷。")),
+                        .child(div().text_color(palette.muted).child(tr("悬空镜像大小因共享层可能高于实际可释放量。为保护发布历史，全局 Docker 清理暂不可用；此处只读，不删除镜像、容器、网络或数据卷。"))),
                 )
                 .footer(
                     div()
                         .flex()
                         .justify_end()
                         .gap_2()
-                        .child(Button::new("disk-preview-close").label("关闭").on_click(
+                        .child(Button::new("disk-preview-close").label(tr("关闭")).on_click(
                             |_, window, cx| window.close_dialog(cx),
                         )),
                 )
@@ -10200,7 +10436,7 @@ impl AppView {
             let save_host = host.clone();
             let title = format!("{}容器？", action.label());
             let confirm =
-                Button::new("container-action-confirm").label(format!("确认{}", action.label()));
+                Button::new("container-action-confirm").label(tfmt!("确认{}", action.label()));
             dialog
                 .title(title)
                 .w(px(480.))
@@ -10209,14 +10445,16 @@ impl AppView {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .child(format!("目标容器：{name}"))
-                        .child(format!(
+                        .child(tfmt!("目标容器：{name}"))
+                        .child(tfmt!(
                             "目标主机：{} ({}:{})",
-                            host.name, host.address, host.port
+                            host.name,
+                            host.address,
+                            host.port
                         ))
-                        .child(
+                        .child(tr(
                             "这会直接操作远端 Docker，可能影响项目服务。删除容器不会清理其数据卷。",
-                        ),
+                        )),
                 )
                 .footer(
                     div()
@@ -10225,7 +10463,7 @@ impl AppView {
                         .gap_2()
                         .child(
                             Button::new("container-action-cancel")
-                                .label("取消")
+                                .label(tr("取消"))
                                 .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
                         .child(
@@ -10273,7 +10511,7 @@ impl AppView {
             .trigger(
                 Button::new(("container-more", index))
                     .icon(assets::IconName::Ellipsis)
-                    .accessibility_label(format!("{} 的操作", item.name))
+                    .accessibility_label(tfmt!("{} 的操作", item.name))
                     .disabled(busy),
             )
             .content(move |_, _, cx| {
@@ -10447,7 +10685,7 @@ impl AppView {
                                 .child(
                                     base::Checkbox::new("container-log-follow")
                                         .checked(follow)
-                                        .accessibility_label("跟随日志")
+                                        .accessibility_label(tr("跟随日志"))
                                         .on_change(move |_, _, window, _| {
                                             let mut state = follow_state.borrow_mut();
                                             state.follow = !state.follow;
@@ -10457,10 +10695,10 @@ impl AppView {
                                             window.refresh();
                                         }),
                                 )
-                                .child("跟随")
+                                .child(tr("跟随"))
                                 .child(
                                     Button::new("log-stop-container")
-                                        .label("停止")
+                                        .label(tr("停止"))
                                         .disabled(!running_now || busy)
                                         .on_click(move |_, window, cx| {
                                             let _ = stop_view.update(cx, |view, cx| {
@@ -10477,7 +10715,7 @@ impl AppView {
                                 )
                                 .child(
                                     Button::new("log-restart-container")
-                                        .label("重启")
+                                        .label(tr("重启"))
                                         .disabled(!running_now || busy)
                                         .on_click(move |_, window, cx| {
                                             let _ = restart_view.update(cx, |view, cx| {
@@ -10529,7 +10767,7 @@ impl AppView {
                                         .map(|line| div().whitespace_nowrap().child(line)),
                                 ),
                         )
-                        .child(div().text_color(hsl(240., 0.04, 0.6)).child(message)),
+                        .child(div().text_color(hsl(240., 0.04, 0.6)).child(tr(&message))),
                 )
                 .footer(
                     div()
@@ -10537,10 +10775,10 @@ impl AppView {
                         .flex()
                         .items_center()
                         .justify_between()
-                        .child("仅显示最近 1000 行 (docker logs)")
+                        .child(tr("仅显示最近 1000 行 (docker logs)"))
                         .child(
                             Button::new("log-bottom")
-                                .label("回到底部")
+                                .label(tr("回到底部"))
                                 .disabled(follow)
                                 .on_click(move |_, window, _| {
                                     footer_state.borrow_mut().follow = true;
@@ -10685,7 +10923,7 @@ impl AppView {
                             .gap_1()
                             .child(
                                 Button::new(("container-logs", index))
-                                    .label("日志")
+                                    .label(tr("日志"))
                                     .on_click(cx.listener(move |view, _, window, cx| {
                                         view.open_container_logs(
                                             log_id.clone(),
@@ -10714,13 +10952,13 @@ impl AppView {
                     .flex()
                     .items_center()
                     .text_color(self.palette().muted)
-                    .child(div().w(px(125.)).flex_shrink_0().child("状态"))
-                    .child(div().w(px(155.)).flex_shrink_0().child("名称"))
-                    .child(div().w(px(170.)).flex_shrink_0().child("镜像"))
-                    .child(div().w(px(205.)).flex_shrink_0().child("端口"))
+                    .child(div().w(px(125.)).flex_shrink_0().child(tr("状态")))
+                    .child(div().w(px(155.)).flex_shrink_0().child(tr("名称")))
+                    .child(div().w(px(170.)).flex_shrink_0().child(tr("镜像")))
+                    .child(div().w(px(205.)).flex_shrink_0().child(tr("端口")))
                     .child(div().w(px(75.)).flex_shrink_0().child("CPU"))
-                    .child(div().w(px(135.)).flex_shrink_0().child("内存"))
-                    .child("操作"),
+                    .child(div().w(px(135.)).flex_shrink_0().child(tr("内存")))
+                    .child(tr("操作")),
             )
             .child(rows)
     }
@@ -10757,19 +10995,19 @@ impl AppView {
                             .w(px(145.))
                             .flex_shrink_0()
                             .text_color(self.palette().muted)
-                            .child(match item.container_refs {
+                            .child(tr(match item.container_refs {
                                 Some(0) if item.dangling => "悬空，未被引用",
                                 Some(0) => "未被容器引用",
                                 Some(_) => "容器引用，受保护",
                                 None if item.dangling => "悬空，引用待核实",
                                 None => "使用情况待核实",
-                            }),
+                            })),
                     )
                     .child(
                         Button::new(("image-delete", index))
-                            .label("删除")
+                            .label(tr("删除"))
                             .disabled(true)
-                            .tooltip("发布保留保护与删除确认尚未接入"),
+                            .tooltip(tr("发布保留保护与删除确认尚未接入")),
                     ),
             );
         }
@@ -10784,11 +11022,11 @@ impl AppView {
                     .flex()
                     .items_center()
                     .text_color(self.palette().muted)
-                    .child(div().w(px(260.)).flex_shrink_0().child("仓库名:tag"))
-                    .child(div().w(px(115.)).flex_shrink_0().child("大小"))
-                    .child(div().w(px(125.)).flex_shrink_0().child("创建时间"))
-                    .child(div().w(px(145.)).flex_shrink_0().child("未使用标记"))
-                    .child("操作"),
+                    .child(div().w(px(260.)).flex_shrink_0().child(tr("仓库名:tag")))
+                    .child(div().w(px(115.)).flex_shrink_0().child(tr("大小")))
+                    .child(div().w(px(125.)).flex_shrink_0().child(tr("创建时间")))
+                    .child(div().w(px(145.)).flex_shrink_0().child(tr("未使用标记")))
+                    .child(tr("操作")),
             )
             .child(rows)
     }
@@ -10810,7 +11048,7 @@ impl AppView {
             .trigger(
                 Button::new("container-host")
                     .outline()
-                    .label(format!("主机：{host_name}  ▾"))
+                    .label(tfmt!("主机：{host_name}  ▾"))
                     .disabled(self.hosts.is_empty()),
             )
             .content(move |_, _, cx| {
@@ -10853,13 +11091,13 @@ impl AppView {
                     .child(
                         div()
                             .text_color(self.palette().destructive)
-                            .child(error.clone()),
+                            .child(tr_system(error)),
                     )
                     .child(
                         div()
                             .flex()
                             .gap_2()
-                            .child(Button::new("container-retry").label("重试").on_click(
+                            .child(Button::new("container-retry").label(tr("重试")).on_click(
                                 cx.listener(|view, _, _, cx| {
                                     if let Some(id) = view.container_host_id {
                                         view.select_container_host(id, cx);
@@ -10868,7 +11106,7 @@ impl AppView {
                             ))
                             .child(
                                 Button::new("container-go-host")
-                                    .label("前往主机核对")
+                                    .label(tr("前往主机核对"))
                                     .on_click(cx.listener(|view, _, window, cx| {
                                         let id = view.container_host_id;
                                         view.navigate(Page::Hosts, window, cx);
@@ -10890,7 +11128,7 @@ impl AppView {
                             .px_6()
                             .pb_6()
                             .text_color(self.palette().muted)
-                            .child("暂无容器")
+                            .child(tr("暂无容器"))
                             .into_any_element()
                     } else {
                         div()
@@ -10919,13 +11157,13 @@ impl AppView {
                                 div()
                                     .text_size(px(18.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("镜像"),
+                                    .child(tr("镜像")),
                             )
                             .child(
                                 Button::new("image-prune")
-                                    .label("清理悬空镜像")
+                                    .label(tr("清理悬空镜像"))
                                     .disabled(true)
-                                    .tooltip("待接入发布历史保护，避免删除需回滚的悬空镜像"),
+                                    .tooltip(tr("待接入发布历史保护，避免删除需回滚的悬空镜像")),
                             ),
                     )
                     .child(if inventory.images.is_empty() {
@@ -10933,7 +11171,7 @@ impl AppView {
                             .px_6()
                             .pb_6()
                             .text_color(self.palette().muted)
-                            .child("暂无镜像")
+                            .child(tr("暂无镜像"))
                             .into_any_element()
                     } else {
                         self.image_table(inventory).into_any_element()
@@ -10950,13 +11188,13 @@ impl AppView {
             .gap_6()
             .child(
                 self.page_head(
-                    "容器",
+                    tr("容器"),
                     Button::new("disk-prune")
                         .outline()
                         .label(if self.prune_busy {
-                            "正在读取…"
+                            tr("正在读取…")
                         } else {
-                            "磁盘占用"
+                            tr("磁盘占用")
                         })
                         .disabled(self.prune_busy || self.container_host_id.is_none())
                         .on_click(cx.listener(|view, _, window, cx| {
@@ -10974,7 +11212,7 @@ impl AppView {
                 div().flex().items_center().gap_4().child(selector).child(
                     div()
                         .text_color(self.palette().muted)
-                        .child("每 10 秒刷新 · SSH 直连"),
+                        .child(tr("每 10 秒刷新 · SSH 直连")),
                 ),
             )
             .child(
@@ -11034,6 +11272,14 @@ impl AppView {
                     })
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.settings_section == SettingsSection::Backup
+                            && section != SettingsSection::Backup
+                        {
+                            this.backup_epoch = this.backup_epoch.wrapping_add(1);
+                            this.backup_preview = None;
+                            this.backup_replace_confirmed = false;
+                            this.backup_export_ready = false;
+                        }
                         this.settings_section = section;
                         this.settings_menu_open = false;
                         cx.notify();
@@ -11056,65 +11302,1277 @@ impl AppView {
             } else {
                 "xdg-open"
             };
-            Command::new(program)
+            crate::local_process::command(program)
                 .arg(path)
                 .spawn()
                 .map_err(|err| format!("无法打开数据目录：{err}"))?;
             Ok(())
         })();
         if let Err(error) = result {
-            window.push_notification(Notification::error(error), cx);
+            window.push_notification(Notification::error(tr_system(&error)), cx);
         }
+    }
+
+    fn open_audit_folder(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let result = (|| -> Result<(), String> {
+            let path = crate::audit::directory()?;
+            std::fs::create_dir_all(&path).map_err(|_| "无法创建审计目录。")?;
+            let program = if cfg!(target_os = "windows") {
+                "explorer.exe"
+            } else if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            };
+            crate::local_process::command(program)
+                .arg(path)
+                .spawn()
+                .map_err(|_| "无法打开审计目录。")?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            window.push_notification(Notification::error(tr_system(&error)), cx);
+        }
+    }
+
+    fn save_retention_policy(
+        &mut self,
+        keep_count: u8,
+        auto_enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let policy = crate::retention::Policy {
+            keep_count,
+            auto_enabled,
+        };
+        match crate::retention::save(policy) {
+            Ok(()) => {
+                self.retention_policy = policy;
+                self.retention_policy_error = None;
+                self.retention_count_menu_open = false;
+                self.retention_custom_open = false;
+                self.retention_preview = None;
+                self.retention_check_schedule = crate::retention::check_schedule().ok().flatten();
+                window.push_notification(Notification::success(tr("发布保留策略已保存")), cx);
+            }
+            Err(error) => {
+                self.retention_policy_error = Some(error.clone());
+                window.push_notification(Notification::error(tr_system(&error)), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn preview_retention_cleanup(&mut self, cx: &mut Context<Self>) {
+        if self.retention_preview_loading || self.retention_running {
+            return;
+        }
+        self.retention_preview_loading = true;
+        self.retention_preview = None;
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async { crate::retention::preview() })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.retention_preview_loading = false;
+                view.retention_preview = Some(result);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn run_retention_cleanup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.retention_running {
+            return;
+        }
+        let Some(Ok(preview)) = self.retention_preview.as_ref() else {
+            return;
+        };
+        let ids = preview
+            .candidates
+            .iter()
+            .map(|candidate| candidate.task_id.clone())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return;
+        }
+        self.retention_running = true;
+        self.retention_preview = None;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::retention::execute(&ids, false) })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.retention_running = false;
+                    match result {
+                        Ok(summary) => {
+                            let message = tfmt!(
+                                "清理完成 {} 个版本，删除 {} 个镜像 tag，共享 tag 跳过 {} 个，释放本机 {:.1} MiB；失败 {} 个。",
+                                summary.completed,
+                                summary.removed_tags,
+                                summary.skipped_shared_tags,
+                                summary.reclaimed_local_bytes as f64 / (1024. * 1024.),
+                                summary.failed.len()
+                            );
+                            window.push_notification(
+                                if summary.failed.is_empty() {
+                                    Notification::success(message)
+                                } else {
+                                    Notification::warning(message)
+                                },
+                                cx,
+                            );
+                            view.retention_last_summary = Some(summary);
+                        }
+                        Err(error) => {
+                            view.retention_policy_error = Some(error.clone());
+                            window.push_notification(Notification::error(tr_system(&error)), cx);
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn registry_input(&self, cx: &App) -> (String, String, String) {
+        (
+            self.registry_address.read(cx).value().to_string(),
+            self.registry_username.read(cx).value().to_string(),
+            self.registry_token.read(cx).value().to_string(),
+        )
+    }
+
+    fn test_registry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.registry_busy {
+            return;
+        }
+        let (address, username, token) = self.registry_input(cx);
+        self.registry_busy = true;
+        self.registry_error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { registry::test_login(&address, &username, &token) })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.registry_busy = false;
+                    if let Err(error) = &result {
+                        view.registry_error = Some(error.clone());
+                    }
+                    window.push_notification(
+                        match result {
+                            Ok(()) => Notification::success(tr("登录成功")),
+                            Err(error) => Notification::error(tr_system(&error)),
+                        },
+                        cx,
+                    );
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn save_registry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.registry_busy {
+            return;
+        }
+        let (address, username, token) = self.registry_input(cx);
+        self.registry_busy = true;
+        self.registry_error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { registry::save_retaining(&address, &username, &token) })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.registry_busy = false;
+                    match result {
+                        Ok(config) => {
+                            view.registry_config = Some(config);
+                            view.registry_token
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                            window.push_notification(Notification::success(tr("已保存")), cx);
+                        }
+                        Err(error) => {
+                            view.registry_config = registry::load().ok().flatten();
+                            view.registry_error = Some(error.clone());
+                            window.push_notification(Notification::error(tr_system(&error)), cx);
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn remove_registry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.registry_busy {
+            return;
+        }
+        self.registry_busy = true;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async { registry::remove() })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.registry_busy = false;
+                    view.registry_config = registry::load().ok().flatten();
+                    match result {
+                        Ok(()) => {
+                            view.registry_address
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                            view.registry_username
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                            view.registry_token
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                            window.push_notification(Notification::success(tr("已删除")), cx);
+                        }
+                        Err(error) => {
+                            view.registry_error = Some(error.clone());
+                            window.push_notification(Notification::error(tr_system(&error)), cx);
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_registry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.registry_busy {
+            return;
+        }
+        let enabled = !self
+            .registry_config
+            .as_ref()
+            .is_some_and(|config| config.enabled);
+        self.registry_busy = true;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { registry::set_enabled(enabled) })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.registry_busy = false;
+                    match result {
+                        Ok(config) => {
+                            view.registry_config = Some(config);
+                            view.registry_error = None;
+                        }
+                        Err(error) => {
+                            view.registry_error = Some(error.clone());
+                            window.push_notification(Notification::error(tr_system(&error)), cx);
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn set_backup_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let password = self.backup_password_input.read(cx).value().to_string();
+        let confirmed = self.backup_confirm_input.read(cx).value().to_string();
+        if !(8..=1024).contains(&password.chars().count()) || password != confirmed {
+            self.backup_error = Some("密码须为 8～1024 个字符，且两次输入一致。".into());
+            cx.notify();
+            return;
+        }
+        self.backup_password = Some(password);
+        self.backup_password_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.backup_confirm_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.backup_error = None;
+        window.push_notification(Notification::success(tr("本次会话的备份密码已设置")), cx);
+        cx.notify();
+    }
+
+    fn backup_output_directory() -> std::path::PathBuf {
+        std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+    }
+
+    fn export_local_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(password) = self.backup_password.clone() else {
+            self.backup_error = Some("请先设置本次会话的备份密码。".into());
+            cx.notify();
+            return;
+        };
+        if !self.backup_export_ready {
+            self.backup_export_ready = true;
+            cx.notify();
+            return;
+        }
+        if self.backup_busy {
+            return;
+        }
+        self.backup_busy = true;
+        self.backup_export_ready = false;
+        let epoch = self.backup_epoch;
+        let suggested = format!(
+            "devingpanel-{}.dpbackup",
+            Local::now().format("%Y%m%d-%H%M%S")
+        );
+        let picker = cx.prompt_for_new_path(&Self::backup_output_directory(), Some(&suggested));
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let path = match picker.await {
+                Ok(Ok(Some(path))) => path,
+                Ok(Ok(None)) => {
+                    let _ = view.update(cx, |view, cx| {
+                        view.backup_busy = false;
+                        cx.notify();
+                    });
+                    return;
+                }
+                _ => {
+                    let _ = view.update(cx, |view, cx| {
+                        view.backup_busy = false;
+                        view.backup_error = Some("无法选择备份文件路径。".into());
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let result = cx
+                .background_executor()
+                .spawn(async move { backup::encrypt_current(&password) })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.backup_busy = false;
+                    if view.backup_epoch != epoch
+                        || view.settings_section != SettingsSection::Backup
+                    {
+                        return;
+                    }
+                    match result {
+                        Ok(bytes) => match std::fs::write(&path, bytes) {
+                            Ok(()) => window
+                                .push_notification(Notification::success(tr("加密备份已导出")), cx),
+                            Err(_) => view.backup_error = Some("无法写入备份文件。".into()),
+                        },
+                        Err(error) => view.backup_error = Some(error),
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn import_local_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.backup_busy {
+            return;
+        }
+        let password = self.backup_import_input.read(cx).value().to_string();
+        if password.is_empty() {
+            self.backup_error = Some("请输入所选备份文件的密码。".into());
+            cx.notify();
+            return;
+        }
+        self.backup_import_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.backup_busy = true;
+        self.backup_preview = None;
+        self.backup_replace_confirmed = false;
+        let epoch = self.backup_epoch;
+        let picker = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(tr("选择加密备份文件").into()),
+        });
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let path = match picker.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            let Some(path) = path else {
+                let _ = view.update(cx, |view, cx| {
+                    view.backup_busy = false;
+                    cx.notify();
+                });
+                return;
+            };
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let size = std::fs::metadata(&path)
+                        .map_err(|_| "无法读取备份文件。")?
+                        .len();
+                    if size > 8 * 1024 * 1024 {
+                        return Err("备份文件超过 8 MiB 上限。".into());
+                    }
+                    let bytes = std::fs::read(&path).map_err(|_| "无法读取备份文件。")?;
+                    backup::preview(&bytes, &password, &path.to_string_lossy())
+                })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.backup_busy = false;
+                if view.backup_epoch != epoch || view.settings_section != SettingsSection::Backup {
+                    return;
+                }
+                match result {
+                    Ok(preview) => {
+                        view.backup_preview = Some(preview);
+                        view.backup_error = None;
+                    }
+                    Err(error) => view.backup_error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn save_s3_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.backup_busy {
+            return;
+        }
+        let config = backup::S3Config {
+            endpoint: self
+                .s3_endpoint
+                .read(cx)
+                .value()
+                .trim()
+                .trim_end_matches('/')
+                .to_string(),
+            region: self.s3_region.read(cx).value().trim().to_string(),
+            bucket: self.s3_bucket.read(cx).value().trim().to_string(),
+            prefix: self.s3_prefix.read(cx).value().trim().to_string(),
+            path_style: self.s3_path_style,
+            access_key: self.s3_access_key.read(cx).value().trim().to_string(),
+        };
+        let secret = self.s3_secret.read(cx).value().to_string();
+        self.backup_busy = true;
+        self.backup_error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { backup::save_s3(config, &secret) })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.backup_busy = false;
+                    match result {
+                        Ok(()) => {
+                            view.s3_config = backup::load_s3().ok().flatten();
+                            view.s3_objects.clear();
+                            view.s3_delete_key = None;
+                            view.backup_preview = None;
+                            view.backup_replace_confirmed = false;
+                            view.s3_secret
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                            window
+                                .push_notification(Notification::success(tr("S3 配置已保存")), cx);
+                        }
+                        Err(error) => view.backup_error = Some(error),
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn run_s3_action(
+        &mut self,
+        action: &'static str,
+        key: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.backup_busy {
+            return;
+        }
+        if action == "upload" && self.backup_password.is_none() {
+            self.backup_error = Some("请先设置本次会话的备份密码。".into());
+            cx.notify();
+            return;
+        }
+        if action == "upload" && !self.backup_export_ready {
+            self.backup_export_ready = true;
+            cx.notify();
+            return;
+        }
+        let password = self.backup_password.clone();
+        let import_password = self.backup_import_input.read(cx).value().to_string();
+        if action == "preview" && import_password.is_empty() {
+            self.backup_error = Some("请输入该备份的密码。".into());
+            cx.notify();
+            return;
+        }
+        if action == "preview" {
+            self.backup_import_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.backup_busy = true;
+        self.backup_export_ready = false;
+        self.backup_error = None;
+        let epoch = self.backup_epoch;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    match action {
+                        "test" => {
+                            backup::test_s3()?;
+                            Ok((None, None, None))
+                        }
+                        "list" => Ok((Some(backup::list_s3()?), None, None)),
+                        "upload" => {
+                            let bytes = backup::encrypt_current(password.as_deref().unwrap())?;
+                            let key = backup::upload_s3(&bytes)?;
+                            Ok((Some(backup::list_s3()?), None, Some(key)))
+                        }
+                        "preview" => {
+                            let key = key.ok_or("请选择 S3 备份。")?;
+                            let bytes = backup::download_s3(&key)?;
+                            let preview = backup::preview(&bytes, &import_password, &key)?;
+                            Ok((None, Some(preview), None))
+                        }
+                        "delete" => {
+                            backup::delete_s3(&key.ok_or("请选择 S3 备份。")?)?;
+                            Ok((Some(backup::list_s3()?), None, None))
+                        }
+                        "remove" => {
+                            backup::remove_s3()?;
+                            Ok((Some(Vec::new()), None, None))
+                        }
+                        _ => Err("未知 S3 操作。".into()),
+                    }
+                })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.backup_busy = false;
+                    if view.backup_epoch != epoch
+                        || view.settings_section != SettingsSection::Backup
+                    {
+                        return;
+                    }
+                    match result {
+                        Ok((objects, preview, _)) => {
+                            if let Some(objects) = objects {
+                                view.s3_objects = objects;
+                            }
+                            if let Some(preview) = preview {
+                                view.backup_preview = Some(preview);
+                                view.backup_replace_confirmed = false;
+                            }
+                            if action == "delete" {
+                                view.s3_delete_key = None;
+                            }
+                            if action == "remove" {
+                                view.s3_config = None;
+                                view.backup_preview = None;
+                                view.backup_replace_confirmed = false;
+                            }
+                            let message = match action {
+                                "test" => tr("S3 连接成功"),
+                                "upload" => tr("加密备份已上传"),
+                                "delete" => tr("S3 备份已删除"),
+                                "remove" => tr("S3 配置已删除"),
+                                _ => String::new(),
+                            };
+                            if !message.is_empty() {
+                                window.push_notification(Notification::success(message), cx);
+                            }
+                        }
+                        Err(error) => view.backup_error = Some(error),
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn download_s3_backup(&mut self, key: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.backup_busy {
+            return;
+        }
+        self.backup_busy = true;
+        let epoch = self.backup_epoch;
+        let suggested = key
+            .rsplit('/')
+            .next()
+            .unwrap_or("devingpanel.dpbackup")
+            .to_string();
+        let picker = cx.prompt_for_new_path(&Self::backup_output_directory(), Some(&suggested));
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let path = match picker.await {
+                Ok(Ok(Some(path))) => path,
+                _ => {
+                    let _ = view.update(cx, |view, cx| {
+                        view.backup_busy = false;
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let result = cx
+                .background_executor()
+                .spawn(async move { backup::download_s3(&key) })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.backup_busy = false;
+                    if view.backup_epoch != epoch
+                        || view.settings_section != SettingsSection::Backup
+                    {
+                        return;
+                    }
+                    match result {
+                        Ok(bytes) => match std::fs::write(&path, bytes) {
+                            Ok(()) => window
+                                .push_notification(Notification::success(tr("加密备份已下载")), cx),
+                            Err(_) => view.backup_error = Some("无法写入下载文件。".into()),
+                        },
+                        Err(error) => view.backup_error = Some(error),
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn restore_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.backup_busy || !self.backup_replace_confirmed {
+            return;
+        }
+        let Some(preview) = self.backup_preview.take() else {
+            return;
+        };
+        self.backup_busy = true;
+        self.backup_replace_confirmed = false;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let cleanup_warning = backup::restore(&preview)?;
+                    let projects = project_store::list()?;
+                    let (hosts, warning) = host_store::list()?;
+                    let policy = retention::load()?;
+                    Ok::<_, String>((projects, hosts, warning, policy, cleanup_warning))
+                })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.backup_busy = false;
+                    match result {
+                        Ok((projects, hosts, warning, policy, cleanup_warning)) => {
+                            view.projects = projects;
+                            view.hosts = hosts;
+                            view.retention_policy = policy;
+                            view.project_id = None;
+                            view.host_id = None;
+                            view.dashboard_metrics.clear();
+                            view.host_tests.clear();
+                            view.host_monitor = None;
+                            view.container_inventory = None;
+                            view.container_host_id = None;
+                            view.deploy_project_id = None;
+                            view.backup_preview = None;
+                            view.registry_config = None;
+                            view.refresh_release_tasks(None, cx);
+                            window.push_notification(
+                                Notification::warning(tr("配置已恢复；请逐一复核项目与主机凭据")),
+                                cx,
+                            );
+                            if let Some(warning) = warning {
+                                view.credential_warning = Some(warning);
+                            }
+                            if !cleanup_warning.is_empty() {
+                                let message = cleanup_warning
+                                    .iter()
+                                    .map(|warning| tr_system(warning))
+                                    .collect::<Vec<_>>()
+                                    .join("; ");
+                                window.push_notification(Notification::warning(message), cx);
+                            }
+                        }
+                        Err(error) => view.backup_error = Some(error),
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn backup_settings(&self, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut content = div().px_6().pb_6().flex().flex_col().gap_4();
+        content = content
+            .child(div().text_color(self.palette().muted).child(tr(
+                "仅备份本机主机、项目和保留策略；不含 SSH、Registry、S3 凭据，环境变量值、构建参数值、发布历史、镜像和卷。忘记密码无法恢复。",
+            )))
+            .child(div().flex().items_center().gap_2()
+                .child(if self.backup_password.is_some() { tr("会话密码已设置") } else { tr("会话密码未设置") })
+                .when(self.backup_password.is_some(), |el| el.child(
+                    Button::new("backup-clear-password").outline().label(tr("清除密码"))
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.backup_password = None;
+                            view.backup_export_ready = false;
+                            cx.notify();
+                        }))
+                )))
+            .child(div().flex().flex_wrap().gap_3()
+                .child(Self::form_field("设置/更改加密密码", Input::new(&self.backup_password_input).mask_toggle().w(px(220.))))
+                .child(Self::form_field("确认密码", Input::new(&self.backup_confirm_input).mask_toggle().w(px(220.))))
+                .child(Button::new("backup-set-password").primary().label(tr("设置密码"))
+                    .on_click(cx.listener(|view, _, window, cx| view.set_backup_password(window, cx)))))
+            .child(div().flex().gap_1().p_1().rounded_md().bg(self.palette().accent)
+                .child(self.tab("backup-local", "本地备份", self.backup_tab == BackupTab::Local,
+                    cx, |view, _, cx| { view.backup_tab = BackupTab::Local; cx.notify(); }))
+                .child(self.tab("backup-s3", "S3 备份", self.backup_tab == BackupTab::S3,
+                    cx, |view, _, cx| { view.backup_tab = BackupTab::S3; cx.notify(); })))
+            .when_some(self.backup_error.as_ref(), |el, error| {
+                el.child(div().text_color(self.palette().destructive).child(tr_system(error)))
+            });
+
+        if self.backup_tab == BackupTab::Local {
+            content = content
+                .child(tfmt!(
+                    "将备份 {} 台主机、{} 个项目。",
+                    self.hosts.len(),
+                    self.projects.len()
+                ))
+                .when(self.backup_export_ready, |el| {
+                    el.child(div().text_color(self.palette().warning).child(tr(
+                        "确认导出？文件只含加密配置，密码丢失无法恢复。请再次点击导出。",
+                    )))
+                })
+                .child(
+                    div().flex().gap_2().child(
+                        Button::new("backup-export-local")
+                            .primary()
+                            .label(tr("导出加密配置"))
+                            .disabled(self.backup_busy)
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.export_local_backup(window, cx)
+                            })),
+                    ),
+                )
+                .child(
+                    div()
+                        .border_t_1()
+                        .border_color(self.palette().border)
+                        .pt_4()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .gap_3()
+                        .child(Self::form_field(
+                            "备份文件密码",
+                            Input::new(&self.backup_import_input)
+                                .mask_toggle()
+                                .w(px(280.)),
+                        ))
+                        .child(
+                            Button::new("backup-import-local")
+                                .outline()
+                                .label(tr("选择文件并预览"))
+                                .disabled(self.backup_busy)
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.import_local_backup(window, cx)
+                                })),
+                        ),
+                );
+        } else {
+            content = content
+                .when_some(self.s3_config.as_ref(), |el, config| {
+                    el.child(tfmt!(
+                        "已保存 S3：{} / {}",
+                        display_path(Path::new(&config.endpoint), narrow, 28),
+                        config.bucket
+                    ))
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_3()
+                        .child(Self::form_field(
+                            "HTTPS Endpoint",
+                            Input::new(&self.s3_endpoint).w(px(350.)),
+                        ))
+                        .child(Self::form_field(
+                            "Region",
+                            Input::new(&self.s3_region).w(px(180.)),
+                        ))
+                        .child(Self::form_field(
+                            "Bucket",
+                            Input::new(&self.s3_bucket).w(px(220.)),
+                        ))
+                        .child(Self::form_field(
+                            "Prefix",
+                            Input::new(&self.s3_prefix).w(px(220.)),
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_3()
+                        .child(Self::form_field(
+                            "Access Key ID",
+                            Input::new(&self.s3_access_key).w(px(250.)),
+                        ))
+                        .child(Self::form_field(
+                            "Secret Access Key",
+                            Input::new(&self.s3_secret).mask_toggle().w(px(250.)),
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            base::Checkbox::new("s3-path-style")
+                                .checked(self.s3_path_style)
+                                .accessibility_label(tr("Path-style"))
+                                .on_change({
+                                    let view = cx.weak_entity();
+                                    move |_, _, _, app| {
+                                        let _ = view.update(app, |view, cx| {
+                                            view.s3_path_style = !view.s3_path_style;
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(tr("Path-style")),
+                )
+                .child(div().text_color(self.palette().muted).child(tr(
+                    "Secret Key 仅存入系统凭据管理器；留空可保留同一 Access Key 的已保存密钥。",
+                )))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            Button::new("s3-save")
+                                .primary()
+                                .label(tr("保存配置"))
+                                .disabled(self.backup_busy)
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.save_s3_config(window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("s3-test")
+                                .outline()
+                                .label(tr("测试连接"))
+                                .disabled(self.backup_busy || self.s3_config.is_none())
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.run_s3_action("test", None, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("s3-refresh")
+                                .outline()
+                                .label(tr("刷新记录"))
+                                .disabled(self.backup_busy || self.s3_config.is_none())
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.run_s3_action("list", None, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("s3-upload")
+                                .outline()
+                                .label(tr("创建加密备份"))
+                                .disabled(self.backup_busy || self.s3_config.is_none())
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.run_s3_action("upload", None, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("s3-remove")
+                                .outline()
+                                .label(tr("删除 S3 配置"))
+                                .disabled(self.backup_busy || self.s3_config.is_none())
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.run_s3_action("remove", None, window, cx)
+                                })),
+                        ),
+                )
+                .when(self.backup_export_ready, |el| {
+                    el.child(
+                        div()
+                            .text_color(self.palette().warning)
+                            .child(tr("确认创建 S3 加密备份？请再次点击创建。")),
+                    )
+                })
+                .child(Self::form_field(
+                    "备份文件密码",
+                    Input::new(&self.backup_import_input)
+                        .mask_toggle()
+                        .w(px(280.)),
+                ));
+            let mut rows = div().flex().flex_col();
+            for (index, object) in self.s3_objects.iter().enumerate() {
+                let preview_key = object.key.clone();
+                let download_key = object.key.clone();
+                let delete_key = object.key.clone();
+                let confirm_delete = self.s3_delete_key.as_deref() == Some(&object.key);
+                rows = rows.child(
+                    div()
+                        .border_t_1()
+                        .border_color(self.palette().border)
+                        .py_2()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .whitespace_normal()
+                                .child(display_path(
+                                    Path::new(&object.key),
+                                    true,
+                                    if narrow { 28 } else { 56 },
+                                ))
+                                .child(format!(
+                                    "{} · {:.1} KiB",
+                                    object.modified,
+                                    object.bytes as f64 / 1024.0
+                                )),
+                        )
+                        .child(
+                            Button::new(("s3-preview", index))
+                                .outline()
+                                .label(tr("预览恢复"))
+                                .disabled(self.backup_busy)
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    view.run_s3_action(
+                                        "preview",
+                                        Some(preview_key.clone()),
+                                        window,
+                                        cx,
+                                    )
+                                })),
+                        )
+                        .child(
+                            Button::new(("s3-download", index))
+                                .outline()
+                                .label(tr("下载"))
+                                .disabled(self.backup_busy)
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    view.download_s3_backup(download_key.clone(), window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new(("s3-delete", index))
+                                .outline()
+                                .label(if confirm_delete {
+                                    tr("确认删除")
+                                } else {
+                                    tr("删除")
+                                })
+                                .disabled(self.backup_busy)
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    if view.s3_delete_key.as_deref() == Some(&delete_key) {
+                                        view.run_s3_action(
+                                            "delete",
+                                            Some(delete_key.clone()),
+                                            window,
+                                            cx,
+                                        );
+                                    } else {
+                                        view.s3_delete_key = Some(delete_key.clone());
+                                        cx.notify();
+                                    }
+                                })),
+                        ),
+                );
+            }
+            content = content.child(rows);
+        }
+        if let Some(preview) = &self.backup_preview {
+            content = content.child(div().border_t_1().border_color(self.palette().border).pt_4()
+                .flex().flex_col().items_start().gap_3()
+                .child(tfmt!("恢复预览：{} · {} 台主机 · {} 个项目 · {}", preview.created_at,
+                    preview.hosts, preview.projects, display_path(Path::new(&preview.source), narrow, 28)))
+                .child(div().text_color(self.palette().warning).child(tr(
+                    "恢复将替换本机主机、项目和保留策略并清空本机发布历史。主机凭据、SSH 指纹、环境变量值和构建参数值须重新配置；不修改 VPS。",
+                )))
+                .child(div().flex().items_center().gap_2()
+                    .child(base::Checkbox::new("backup-confirm-replace")
+                        .checked(self.backup_replace_confirmed)
+                        .accessibility_label(tr("确认覆盖本机配置"))
+                        .on_change({ let view = cx.weak_entity(); move |_, _, _, app| {
+                            let _ = view.update(app, |view, cx| {
+                                view.backup_replace_confirmed = !view.backup_replace_confirmed;
+                                cx.notify();
+                            });
+                        }}))
+                    .child(tr("确认覆盖本机配置")))
+                .child(Button::new("backup-restore").primary().label(tr("恢复配置"))
+                    .disabled(self.backup_busy || !self.backup_replace_confirmed)
+                    .on_click(cx.listener(|view, _, window, cx| view.restore_backup(window, cx)))));
+        }
+        self.panel(
+            "备份与恢复",
+            "配置备份必须先设置加密密码，敏感凭据不包含在备份中。",
+            content,
+        )
     }
 
     fn settings_content(&self, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
         match self.settings_section {
-            SettingsSection::Retention => self
-                .panel(
-                    "发布保留策略",
-                    "按每项目 / 每主机计算已完成版本，保护当前运行与可回滚版本。",
+            SettingsSection::Retention => {
+                let retention_view = cx.weak_entity();
+                let mut options = div().w_full().flex().flex_col().gap_1();
+                for count in [1u8, 2, 3, 5, 10] {
+                    options = options.child(
+                        div()
+                            .id(format!("retention-count-{count}"))
+                            .h(px(36.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(self.retention_policy.keep_count == count, |el| {
+                                el.bg(self.palette().accent)
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.save_retention_policy(
+                                    count,
+                                    this.retention_policy.auto_enabled,
+                                    window,
+                                    cx,
+                                );
+                            }))
+                            .child(tfmt!("{count} 个版本")),
+                    );
+                }
+                options = options.child(
                     div()
-                        .w_full()
-                        .min_w_0()
-                        .px_6()
-                        .pb_6()
+                        .id("retention-count-custom")
+                        .h(px(36.))
+                        .px_3()
                         .flex()
-                        .flex_col()
-                        .items_start()
-                        .gap_4()
-                        .child("已完成版本保留数（尚未启用自动清理）")
-                        .child(
+                        .items_center()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.retention_custom_open = true;
+                            this.retention_count_menu_open = false;
+                            cx.notify();
+                        }))
+                        .child(tr("自定义…")),
+                );
+                let mut body = div()
+                    .w_full()
+                    .min_w_0()
+                    .px_6()
+                    .pb_6()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .gap_4()
+                    .child(tr("已完成版本保留数"))
+                    .child(
+                        div()
+                            .id("retention-count-toggle")
+                            .w_full()
+                            .h(px(36.))
+                            .border_1()
+                            .border_color(self.palette().border)
+                            .rounded_md()
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.retention_count_menu_open = !this.retention_count_menu_open;
+                                cx.notify();
+                            }))
+                            .child(tfmt!("{} 个版本", self.retention_policy.keep_count))
+                            .child("⌄"),
+                    )
+                    .when(self.retention_count_menu_open, |el| el.child(options))
+                    .when(self.retention_custom_open, |el| {
+                        el.child(
                             div()
                                 .w_full()
-                                .h(px(36.))
-                                .border_1()
-                                .border_color(self.palette().border)
-                                .rounded_md()
-                                .px_3()
                                 .flex()
                                 .items_center()
-                                .justify_between()
-                                .text_color(self.palette().muted)
-                                .child("尚未生效")
-                                .child("⌄"),
+                                .gap_2()
+                                .child(div().flex_1().child(Input::new(&self.retention_custom).w_full()))
+                                .child(Button::new("retention-custom-save").label(tr("应用")).on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        let value = this.retention_custom.read(cx).value().trim().parse::<u8>();
+                                        match value {
+                                            Ok(count) if (1..=100).contains(&count) => this.save_retention_policy(
+                                                count,
+                                                this.retention_policy.auto_enabled,
+                                                window,
+                                                cx,
+                                            ),
+                                            _ => window.push_notification(Notification::error(tr("保留数须为 1～100。")), cx),
+                                        }
+                                    }),
+                                )),
                         )
-                        .child("自动清理未启用")
-                        .child(
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .whitespace_normal()
-                                .text_color(self.palette().muted)
-                                .child("可在项目发布历史只读预览本机旧版 tar 占用；当前不会删除本机归档、远端镜像或数据卷。"),
-                        )
-                        .child(
-                            Button::new("cleanup-now")
-                                .outline()
-                                .label("立即清理托管的历史镜像")
-                                .disabled(true),
-                        ),
+                    })
+                    .when(self.retention_policy.keep_count == 1, |el| {
+                        el.child(div().text_color(self.palette().warning).child(
+                            tr("只保留当前确认版本；旧版材料清理后将无法从本机回滚。"),
+                        ))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                base::Checkbox::new("retention-auto-enabled")
+                                    .checked(self.retention_policy.auto_enabled)
+                                    .accessibility_label(tr("每日自动检查并清理"))
+                                    .on_change(move |_, _, window, app| {
+                                        let _ = retention_view.update(app, |this, cx| {
+                                            this.save_retention_policy(
+                                                this.retention_policy.keep_count,
+                                                !this.retention_policy.auto_enabled,
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                            )
+                            .child(tr("客户端运行期间每日自动检查并清理")),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .whitespace_normal()
+                            .text_color(self.palette().muted)
+                            .child(tr("仅处理已确认版本链中超出保留数的历史版本；每项清理前重新核对 SSH 指纹、Docker daemon、镜像及容器引用。不执行全局 prune，不删除数据卷。")),
+                    )
+                    .child(match &self.retention_check_schedule {
+                        Some((last, next)) => tfmt!("最近自动检查：{last}；下次检查：{next}"),
+                        None => tr("尚未自动检查；启用后将在客户端运行期间检查。"),
+                    })
+                    .child(
+                        Button::new("cleanup-preview")
+                            .outline()
+                            .label(if self.retention_preview_loading {
+                                tr("正在预览…")
+                            } else {
+                                tr("预览可清理版本")
+                            })
+                            .disabled(self.retention_preview_loading || self.retention_running)
+                            .on_click(cx.listener(|this, _, _, cx| this.preview_retention_cleanup(cx))),
+                    );
+                if let Some(result) = &self.retention_preview {
+                    match result {
+                        Ok(preview) => {
+                            body = body.child(tfmt!(
+                                "按每项目/daemon 保留 {} 个版本；候选 {} 个，受保护/待核对 {} 个，暂缓 {} 项。",
+                                preview.keep_count,
+                                preview.candidates.len(),
+                                preview.protected,
+                                preview.skipped.len()
+                            ));
+                            for candidate in &preview.candidates {
+                                body = body.child(
+                                    div().w_full().whitespace_normal().child(tfmt!(
+                                        "{} / {} · {} · {} 个镜像 · 本机归档记录 {:.1} MiB{}",
+                                        candidate.project_name,
+                                        candidate.host_name,
+                                        &candidate.task_id[..8],
+                                        candidate.image_count,
+                                        candidate.local_bytes as f64 / (1024. * 1024.),
+                                        if candidate.needs_review { " · 上次结果待核对" } else { "" }
+                                    )),
+                                );
+                            }
+                            for reason in &preview.skipped {
+                                body = body.child(div().text_color(self.palette().muted).child(reason.clone()));
+                            }
+                            if !preview.candidates.is_empty() {
+                                body = body.child(
+                                    Button::new("cleanup-confirm")
+                                        .danger()
+                                        .label(tr("确认清理以上版本"))
+                                        .disabled(self.retention_running)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.run_retention_cleanup(window, cx)
+                                        })),
+                                );
+                            }
+                        }
+                        Err(error) => body = body.child(div().text_color(self.palette().destructive).child(tr_system(error))),
+                    }
+                }
+                if self.retention_running {
+                    body = body.child(tr("清理中，请保持客户端运行…"));
+                }
+                if let Some(summary) = &self.retention_last_summary {
+                    body = body.child(tfmt!(
+                        "最近一次清理：完成 {} 个版本，删除 {} 个镜像 tag，共享 tag 跳过 {} 个，释放本机 {:.1} MiB，待核对跳过 {} 个。",
+                        summary.completed,
+                        summary.removed_tags,
+                        summary.skipped_shared_tags,
+                        summary.reclaimed_local_bytes as f64 / (1024. * 1024.),
+                        summary.skipped
+                    ));
+                    for error in &summary.failed {
+                        body = body.child(div().text_color(self.palette().warning).child(tr_system(error)));
+                    }
+                }
+                if let Some(error) = &self.retention_policy_error {
+                    body = body.child(div().text_color(self.palette().destructive).child(tr_system(error)));
+                }
+                self.panel(
+                    "发布保留策略",
+                    "按每项目 / 每个 Docker daemon 的确认版本链计算保留数。",
+                    body,
                 )
-                .into_any_element(),
+                .into_any_element()
+            }
             SettingsSection::Appearance => self
                 .panel(
                     "外观",
@@ -11162,9 +12620,10 @@ impl AppView {
                                         .child(choice.label())
                                 })),
                         )
-                        .child("语言")
+                        .child(tr("语言"))
                         .child(
                             div()
+                                .id("language-select")
                                 .w_full()
                                 .h(px(36.))
                                 .border_1()
@@ -11174,16 +12633,45 @@ impl AppView {
                                 .flex()
                                 .items_center()
                                 .justify_between()
-                                .text_color(self.palette().muted)
-                                .child("简体中文")
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.language_menu_open = !this.language_menu_open;
+                                    cx.notify();
+                                }))
+                                .child(self.language.label())
                                 .child("⌄"),
                         )
+                        .when(self.language_menu_open, |el| {
+                            el.child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .children([Language::Chinese, Language::English].map(|language| {
+                                        div()
+                                            .id(language.saved())
+                                            .h(px(36.))
+                                            .px_3()
+                                            .flex()
+                                            .items_center()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .when(self.language == language, |el| el.bg(self.palette().accent))
+                                            .on_click(cx.listener(move |this, _, window, cx| this.set_language(language, window, cx)))
+                                            .child(language.label())
+                                    })),
+                            )
+                        })
                         .when_some(self.theme_error.as_ref(), |el, error| {
                             el.child(
                                 div()
                                     .text_color(self.palette().destructive)
-                                    .child(error.clone()),
+                                    .child(tr_system(error)),
                             )
+                        })
+                        .when_some(self.language_error.as_ref(), |el, error| {
+                            el.child(div().text_color(self.palette().destructive).child(tr_system(error)))
                         }),
                 )
                 .into_any_element(),
@@ -11194,21 +12682,45 @@ impl AppView {
                     div()
                         .px_6()
                         .pb_6()
-                        .text_color(self.palette().muted)
-                        .child("尚未配置镜像仓库；凭据只能保存至操作系统凭据管理器。"),
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .child(Self::form_field("Registry 地址", Input::new(&self.registry_address).w_full().disabled(self.registry_busy)))
+                        .child(Self::form_field("用户名", Input::new(&self.registry_username).w_full().disabled(self.registry_busy)))
+                        .child(Self::form_field("令牌", Input::new(&self.registry_token).w_full().mask_toggle().disabled(self.registry_busy)))
+                        .child(div().text_color(self.palette().muted).child(tr("令牌仅保存在系统凭据管理器；留空保留已保存令牌。镜像名须以 Registry 地址开头。")))
+                        .when_some(self.registry_config.as_ref(), |el, config| {
+                            el.child(tfmt!("已配置：{} / {}", config.address, config.username))
+                        })
+                        .child(div().flex().items_center().gap_2()
+                            .child(base::Checkbox::new("registry-enabled")
+                                .checked(self.registry_config.as_ref().is_some_and(|config| config.enabled))
+                                .accessibility_label(tr("发布使用镜像仓库"))
+                                .on_change({
+                                    let view = cx.weak_entity();
+                                    move |_, _, window, app| {
+                                        let _ = view.update(app, |view, cx| view.toggle_registry(window, cx));
+                                    }
+                                }))
+                            .child(tr("发布使用镜像仓库")))
+                        .when_some(self.registry_error.as_ref(), |el, error| {
+                            el.child(div().text_color(self.palette().destructive).child(tr_system(error)))
+                        })
+                        .child(div().flex().gap_2()
+                            .child(Button::new("registry-test").outline().label(tr("测试登录"))
+                                .disabled(self.registry_busy)
+                                .on_click(cx.listener(|this, _, window, cx| this.test_registry(window, cx))))
+                            .child(Button::new("registry-save").primary().label(tr("保存"))
+                                .disabled(self.registry_busy)
+                                .on_click(cx.listener(|this, _, window, cx| this.save_registry(window, cx))))
+                            .when(self.registry_config.is_some(), |el| el.child(
+                                Button::new("registry-remove").outline().label(tr("删除配置"))
+                                    .disabled(self.registry_busy)
+                                    .on_click(cx.listener(|this, _, window, cx| this.remove_registry(window, cx)))
+                            ))),
                 )
                 .into_any_element(),
-            SettingsSection::Backup => self
-                .panel(
-                    "备份与恢复",
-                    "配置备份必须先设置加密密码，敏感凭据不包含在备份中。",
-                    div()
-                        .px_6()
-                        .pb_6()
-                        .text_color(self.palette().muted)
-                        .child("本地加密备份及 S3 连接尚未接入桌面端。"),
-                )
-                .into_any_element(),
+            SettingsSection::Backup => self.backup_settings(narrow, cx).into_any_element(),
             SettingsSection::Environment => self
                 .panel(
                     "本地环境",
@@ -11255,7 +12767,7 @@ impl AppView {
                                 .child(
                                     Button::new("environment-recheck")
                                         .outline()
-                                        .label("重新检测")
+                                        .label(tr("重新检测"))
                                         .disabled(matches!(self.docker, DockerStatus::Checking))
                                         .on_click(cx.listener(|view, _, _, cx| view.refresh_docker(cx))),
                                 ),
@@ -11280,7 +12792,7 @@ impl AppView {
                                 .child(
                                     Button::new("environment-open-folder")
                                         .outline()
-                                        .label("打开所在文件夹")
+                                        .label(tr("打开所在文件夹"))
                                         .disabled(preferences::data_dir().is_none())
                                         .on_click(cx.listener(|view, _, window, cx| view.open_data_folder(window, cx))),
                                 ),
@@ -11291,9 +12803,38 @@ impl AppView {
                 .panel(
                     "安全",
                     "凭据、锁屏与审计日志。",
-                    div().px_6().pb_6().text_color(self.palette().muted).child(
-                        "SSH 密码和私钥仅写入系统凭据管理器；私钥口令、本机锁屏与审计日志尚未接入。",
-                    ),
+                    div().px_6().pb_6().flex().flex_col().items_start().gap_4()
+                        .child(div().text_color(self.palette().muted).child(
+                            tr("SSH 密码和私钥保存在系统凭据管理器。")))
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(tr("本机锁屏")))
+                        .child(div().text_color(self.palette().muted).child(if self.lock_settings.is_some() {
+                            tr("已启用；应用启动时需要解锁。")
+                        } else { tr("未启用") }))
+                        .child(Self::form_field("无操作自动锁屏（分钟）",
+                            Input::new(&self.lock_interval).w_full().disabled(self.lock_busy)))
+                        .when(self.lock_settings.is_some(), |el| el.child(
+                            Self::form_field("当前锁屏密码",
+                                Input::new(&self.lock_current).w_full().disabled(self.lock_busy))))
+                        .child(Self::form_field(if self.lock_settings.is_some() { "新锁屏密码（留空则不修改）" } else { "新锁屏密码" },
+                            Input::new(&self.lock_new).w_full().disabled(self.lock_busy)))
+                        .child(Self::form_field("确认新密码",
+                            Input::new(&self.lock_confirm).w_full().disabled(self.lock_busy)))
+                        .when_some(self.lock_error.clone(), |el, error| el.child(
+                            div().text_color(self.palette().destructive).child(error)))
+                        .child(div().flex().flex_wrap().gap_2()
+                            .child(Button::new("screen-lock-save").label(if self.lock_settings.is_some() {
+                                tr("保存锁屏设置")
+                            } else { tr("启用锁屏") }).disabled(self.lock_busy)
+                                .on_click(cx.listener(|view, _, window, cx| view.save_screen_lock(window, cx))))
+                            .when(self.lock_settings.is_some(), |el| el
+                                .child(Button::new("screen-lock-now").outline().label(tr("立即锁屏"))
+                                    .on_click(cx.listener(|view, _, window, cx| view.lock_now(window, cx))))
+                                .child(Button::new("screen-lock-disable").outline().label(tr("关闭锁屏"))
+                                    .disabled(self.lock_busy)
+                                    .on_click(cx.listener(|view, _, window, cx| view.disable_screen_lock(window, cx))))),
+                        )
+                        .child(Button::new("audit-open-folder").outline().label(tr("打开审计日志文件夹"))
+                            .on_click(cx.listener(|view, _, window, cx| view.open_audit_folder(window, cx)))),
                 )
                 .into_any_element(),
         }
@@ -11304,7 +12845,7 @@ impl AppView {
             .flex()
             .flex_col()
             .gap_6()
-            .child(self.page_head("设置", div()))
+            .child(self.page_head(tr("设置"), div()))
             .when(narrow, |el| {
                 el.child(
                     div()
@@ -11312,7 +12853,7 @@ impl AppView {
                         .flex_col()
                         .gap_2()
                         .w_full()
-                        .child(div().text_size(px(14.)).child("设置分类"))
+                        .child(div().text_size(px(14.)).child(tr("设置分类")))
                         .child(
                             div()
                                 .id("settings-category-toggle")
@@ -11367,11 +12908,16 @@ impl AppView {
                         div()
                             .text_size(px(24.))
                             .font_weight(FontWeight::BOLD)
-                            .child("总览"),
+                            .child(tr("总览")),
                     )
-                    .child(Button::new("go-deploy").primary().label("去发布").on_click(
-                        cx.listener(|this, _, window, cx| this.navigate(Page::Deploy, window, cx)),
-                    )),
+                    .child(
+                        Button::new("go-deploy")
+                            .primary()
+                            .label(tr("去发布"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.navigate(Page::Deploy, window, cx)
+                            })),
+                    ),
             )
             .child(
                 div()
@@ -11417,7 +12963,7 @@ impl AppView {
                                 .border_color(self.palette().border)
                                 .p_4()
                                 .text_color(self.palette().muted)
-                                .child("暂无发布记录"),
+                                .child(tr("暂无发布记录")),
                         )
                         .child(
                             div()
@@ -11433,7 +12979,7 @@ impl AppView {
                                     this.deploy_tab = DeployTab::History;
                                     cx.notify();
                                 }))
-                                .child("查看全部"),
+                                .child(tr("查看全部")),
                         ),
                 ),
             )
@@ -11587,11 +13133,15 @@ impl AppView {
                         .child(
                             div()
                                 .text_color(self.palette().destructive)
-                                .child(error.clone()),
+                                .child(tr_system(error)),
                         )
-                        .child(Button::new("dashboard-hosts-retry").label("重试").on_click(
-                            cx.listener(|view, _, _, cx| view.retry_dashboard_hosts(cx)),
-                        )),
+                        .child(
+                            Button::new("dashboard-hosts-retry")
+                                .label(tr("重试"))
+                                .on_click(
+                                    cx.listener(|view, _, _, cx| view.retry_dashboard_hosts(cx)),
+                                ),
+                        ),
                 )
                 .into_any_element();
         }
@@ -11617,7 +13167,7 @@ impl AppView {
                     el.child(
                         Button::new("add-host")
                             .primary()
-                            .label("添加主机")
+                            .label(tr("添加主机"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.navigate(Page::Hosts, window, cx)
                             })),
@@ -11726,7 +13276,7 @@ impl AppView {
                                     .flex_col()
                                     .gap_2()
                                     .child(
-                                        div().flex().justify_between().child("内存").child(
+                                        div().flex().justify_between().child(tr("内存")).child(
                                             metrics
                                                 .map(|m| {
                                                     format!(

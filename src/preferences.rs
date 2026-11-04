@@ -32,3 +32,19 @@ pub fn save_theme(value: &str) -> io::Result<()> {
     fs::create_dir_all(path.parent().expect("theme path has a parent"))?;
     fs::write(path, value)
 }
+
+fn language_path() -> Option<PathBuf> {
+    data_dir().map(|path| path.join("language"))
+}
+
+pub fn load_language() -> Option<String> {
+    fs::read_to_string(language_path()?)
+        .ok()
+        .map(|value| value.trim().to_owned())
+}
+
+pub fn save_language(value: &str) -> io::Result<()> {
+    let path = language_path().ok_or_else(|| io::Error::other("无法确定本机配置目录"))?;
+    fs::create_dir_all(path.parent().expect("language path has a parent"))?;
+    fs::write(path, value)
+}

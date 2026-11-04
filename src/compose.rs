@@ -55,7 +55,7 @@ pub(crate) fn config_snapshot(files: &[DeploymentFile], env_file: &[u8]) -> Resu
         root: root.clone(),
         files: Vec::new(),
     };
-    let mut command = Command::new("docker");
+    let mut command = crate::local_process::command("docker");
     command
         .arg("compose")
         .arg("--project-directory")
@@ -440,7 +440,7 @@ fn validate_portability(raw: &Value, target_service: &str) -> Result<(), String>
 
 fn config(project: &Project) -> Result<Value, String> {
     check_source_files(project)?;
-    let mut command = Command::new("docker");
+    let mut command = crate::local_process::command("docker");
     command
         .arg("compose")
         .arg("--project-directory")

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 const CREDENTIAL_SERVICE: &str = "devingPanel:ssh";
 const KEY_CHUNK_SERVICE: &str = "devingPanel:ssh-key-chunks";
+const KEY_ENVELOPE_PREFIX: &str = "devingPanel:key:v1:";
 const KEY_CHUNK_UTF16_UNITS: usize = 1000;
 const MAX_KEY_CHUNKS: usize = 128;
 static CREDENTIAL_LIFECYCLE: Mutex<()> = Mutex::new(());
@@ -80,6 +81,65 @@ pub struct ConnectionMaterial {
     pub host: Host,
     pub credential: String,
     pub trusted_fingerprint: Option<String>,
+}
+
+pub fn key_credential(private_key: &str, passphrase: &str) -> Result<String, String> {
+    if private_key.is_empty() {
+        return Err("请填写私钥。".into());
+    }
+    if passphrase.is_empty() {
+        return Ok(private_key.to_owned());
+    }
+    serde_json::to_string(&(private_key, passphrase))
+        .map(|value| format!("{KEY_ENVELOPE_PREFIX}{value}"))
+        .map_err(|_| "无法保存私钥凭据。".into())
+}
+
+pub fn decode_key_credential(value: &str) -> Result<(String, Option<String>), String> {
+    if let Some(encoded) = value.strip_prefix(KEY_ENVELOPE_PREFIX) {
+        let (key, passphrase): (String, String) =
+            serde_json::from_str(encoded).map_err(|_| "私钥凭据无效，请重新配置。")?;
+        Ok((key, Some(passphrase)))
+    } else {
+        Ok((value.to_owned(), None))
+    }
+}
+
+#[cfg(test)]
+mod key_credential_tests {
+    use super::{decode_key_credential, key_credential};
+
+    #[test]
+    fn passphrase_round_trip_without_plaintext_in_errors() {
+        let encoded = key_credential("private-key", "secret\nphrase").unwrap();
+        assert_eq!(
+            decode_key_credential(&encoded).unwrap(),
+            ("private-key".into(), Some("secret\nphrase".into()))
+        );
+        assert_eq!(
+            decode_key_credential("old-key").unwrap(),
+            ("old-key".into(), None)
+        );
+        assert!(decode_key_credential("devingPanel:key:v1:broken").is_err());
+        assert!(key_credential("", "secret").is_err());
+    }
+
+    #[test]
+    fn encrypted_openssh_key_decrypts_with_stored_passphrase() {
+        let key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let encrypted = key.encrypt(&mut rand::rng(), "test passphrase").unwrap();
+        let pem = encrypted
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap();
+        let encoded = key_credential(&pem, "test passphrase").unwrap();
+        let (content, password) = decode_key_credential(&encoded).unwrap();
+        let parsed = russh::keys::PrivateKey::from_openssh(content.as_bytes()).unwrap();
+        assert!(parsed.is_encrypted());
+        assert!(parsed.decrypt("wrong passphrase").is_err());
+        assert!(parsed.decrypt(password.unwrap()).is_ok());
+    }
 }
 
 fn read_credential(id: &str) -> Result<String, String> {
@@ -401,6 +461,11 @@ fn cleanup_pending_with(
     (failed > 0).then(|| format!("仍有 {failed} 个凭据引用待清理；下次启动将重试。"))
 }
 
+pub fn cleanup_orphaned_credentials() -> Result<Option<String>, String> {
+    let conn = connect()?;
+    with_credential_lock(|| Ok(cleanup_pending_with(&conn, delete_credential)))
+}
+
 fn cleanup_deleting_with(
     conn: &Connection,
     delete: impl Fn(&str) -> Result<(), String>,
@@ -415,8 +480,7 @@ fn cleanup_deleting_with(
     };
     let mut failed = 0;
     for (id, credential_id) in deleting {
-        if !matches!(unresolved_host_tasks(conn, id), Ok(0))
-            || !matches!(completed_host_tasks(conn, id), Ok(0))
+        if !matches!(active_host_tasks(conn, id), Ok(0))
             || delete(&credential_id).is_err()
             || finalize_host_deletion(conn, id).is_err()
         {
@@ -428,8 +492,7 @@ fn cleanup_deleting_with(
 
 fn finalize_host_deletion(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     let transaction = conn.unchecked_transaction()?;
-    if unresolved_host_tasks(&transaction, id)? != 0 || completed_host_tasks(&transaction, id)? != 0
-    {
+    if active_host_tasks(&transaction, id)? != 0 {
         return Err(rusqlite::Error::InvalidQuery);
     }
     env_store::queue_for_host(&transaction, id)?;
@@ -455,6 +518,19 @@ fn completed_host_tasks(conn: &Connection, id: i64) -> rusqlite::Result<i64> {
     conn.query_row(
         "SELECT COUNT(*) FROM release_tasks WHERE host_id = ?1 AND outcome = 'complete' AND health_result = 'healthy'",
         [id], |row| row.get(0),
+    )
+}
+
+fn active_host_tasks(conn: &Connection, id: i64) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM release_tasks WHERE host_id = ?1 AND outcome = 'running')
+              + (SELECT COUNT(*) FROM rollback_tasks r JOIN release_tasks source
+                 ON source.id = r.source_task_id WHERE source.host_id = ?1 AND r.outcome = 'running')
+              + (SELECT COUNT(*) FROM release_batch_targets t JOIN release_batches b
+                 ON b.id = t.batch_id WHERE t.host_id = ?1
+                 AND b.state IN ('prepared', 'building', 'ready', 'running'))",
+        [id],
+        |row| row.get(0),
     )
 }
 
@@ -541,6 +617,13 @@ pub fn create(input: NewHost) -> Result<Host, String> {
             ));
         }
     }
+    crate::audit::record(
+        "create",
+        "host",
+        result.as_ref().map_or(0, |host| host.id),
+        "completed",
+        result.is_ok(),
+    );
     result
 }
 
@@ -662,6 +745,7 @@ pub fn update(id: i64, mut input: HostUpdate) -> Result<(Host, Option<String>), 
     }
     let result = update_in(&conn, id, input, reference.as_deref());
     let warning = cleanup_pending_with(&conn, delete_credential);
+    crate::audit::record("update", "host", id, "completed", result.is_ok());
     match result {
         Ok(host) => Ok((host, warning)),
         Err(error) => Err(match warning {
@@ -685,10 +769,8 @@ fn delete_in(
             |row| row.get(0),
         )
         .map_err(|_| "主机不存在。")?;
-    if unresolved_host_tasks(&transaction, id).map_err(|err| err.to_string())? != 0
-        || completed_host_tasks(&transaction, id).map_err(|err| err.to_string())? != 0
-    {
-        return Err("主机有未核实任务或已完成的受保护版本，不能删除或清理凭据。".into());
+    if active_host_tasks(&transaction, id).map_err(|err| err.to_string())? != 0 {
+        return Err("主机有正在执行的发布或回滚任务，不能删除。".into());
     }
     transaction
         .execute("UPDATE hosts SET deleting = 1 WHERE id = ?1", [id])
@@ -704,7 +786,9 @@ fn delete_in(
 pub fn delete(id: i64) -> Result<Option<String>, String> {
     let conn = connect()?;
     let _guard = lifecycle_lock()?;
-    delete_in(&conn, id, delete_credential)?;
+    let result = delete_in(&conn, id, delete_credential);
+    crate::audit::record("delete", "host", id, "completed", result.is_ok());
+    result?;
     Ok(env_store::cleanup_pending_in(
         &conn,
         env_store::delete_pending_secret,
@@ -726,7 +810,7 @@ mod tests {
     };
 
     #[test]
-    fn unresolved_release_prevents_host_and_credential_deletion() {
+    fn running_release_blocks_host_deletion_but_completed_history_does_not() {
         let conn = Connection::open_in_memory().unwrap();
         initialize(&conn).unwrap();
         conn.execute_batch(
@@ -737,7 +821,7 @@ mod tests {
                config_sha256, phase, outcome)
              VALUES ('task', 1, 2, 'app', 'web', '203.0.113.10', 22, 'root', 'password',
                'SHA256:known', 'app:v1', 'linux/amd64',
-               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'uploading', 'unknown');",
+               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'uploading', 'running');",
         ).unwrap();
         assert!(delete_in(&conn, 2, |_| panic!("credential must stay available")).is_err());
         assert!(
@@ -763,18 +847,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(deleting, 0);
-        conn.execute(
-            "UPDATE release_tasks SET outcome = 'failed' WHERE id = 'task'",
-            [],
-        )
-        .unwrap();
         conn.execute("UPDATE release_tasks SET phase = 'checked', outcome = 'complete', health_result = 'healthy' WHERE id = 'task'", []).unwrap();
-        assert!(
-            delete_in(&conn, 2, |_| panic!(
-                "completed history must keep credential"
-            ))
-            .is_err()
-        );
         assert!(
             update_in(
                 &conn,
@@ -792,8 +865,77 @@ mod tests {
             )
             .is_err()
         );
+        delete_in(&conn, 2, |_| Ok(())).unwrap();
+        let history: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM release_tasks WHERE id = 'task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history, 1);
+    }
+
+    #[test]
+    fn unknown_release_does_not_block_host_deletion() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO hosts (id, name, address, port, username, auth, group_name, credential_id)
+             VALUES (2, 'web', '203.0.113.10', 22, 'root', 'password', 'prod', 'ref');
+             INSERT INTO release_tasks (id, project_id, host_id, project_name, host_name, host_address,
+               host_port, host_username, host_auth, host_fingerprint, image_reference, platform,
+               config_sha256, phase, outcome)
+             VALUES ('task', 1, 2, 'app', 'web', '203.0.113.10', 22, 'root', 'password',
+               'SHA256:known', 'app:v1', 'linux/amd64',
+               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'checking', 'unknown');",
+        ).unwrap();
+        delete_in(&conn, 2, |_| Ok(())).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM release_tasks WHERE id = 'task'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn running_rollback_and_active_batch_block_host_deletion() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO hosts (id, name, address, port, username, auth, group_name, credential_id)
+             VALUES (2, 'web', '203.0.113.10', 22, 'root', 'password', 'prod', 'ref');
+             INSERT INTO release_tasks (id, project_id, host_id, project_name, host_name, host_address,
+               host_port, host_username, host_auth, host_fingerprint, image_reference, platform,
+               config_sha256, phase, outcome, health_result)
+             VALUES ('task', 1, 2, 'app', 'web', '203.0.113.10', 22, 'root', 'password',
+               'SHA256:known', 'app:v1', 'linux/amd64',
+               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'checked', 'complete', 'healthy');
+             INSERT INTO rollback_tasks (id, project_id, source_task_id, target_task_id, phase, outcome)
+             VALUES ('rollback', 1, 'task', 'task', 'restoring', 'running');",
+        ).unwrap();
+        assert!(delete_in(&conn, 2, |_| panic!("credential must stay available")).is_err());
         conn.execute(
-            "UPDATE release_tasks SET outcome = 'failed' WHERE id = 'task'",
+            "UPDATE rollback_tasks SET outcome = 'blocked' WHERE id = 'rollback'",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO release_batches (id, project_id, config_sha256, state)
+             VALUES ('batch', 1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'running');
+             INSERT INTO release_batch_targets (batch_id, ordinal, host_id, host_name, host_group,
+               host_address, host_port, host_username, host_auth, host_fingerprint, platform,
+               docker_endpoint, docker_daemon_id, state)
+             VALUES ('batch', 0, 2, 'web', 'prod', '203.0.113.10', 22, 'root', 'password',
+               'SHA256:known', 'linux/amd64', 'unix:///var/run/docker.sock', 'daemon', 'waiting');",
+        ).unwrap();
+        assert!(delete_in(&conn, 2, |_| panic!("credential must stay available")).is_err());
+        conn.execute(
+            "UPDATE release_batches SET state = 'paused' WHERE id = 'batch'",
             [],
         )
         .unwrap();

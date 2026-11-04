@@ -102,6 +102,7 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
              docker_daemon_id TEXT,
              image_reference TEXT NOT NULL,
              platform TEXT NOT NULL,
+             registry_mode INTEGER NOT NULL DEFAULT 0 CHECK (registry_mode IN (0, 1)),
              config_sha256 TEXT NOT NULL,
              phase TEXT NOT NULL,
              outcome TEXT NOT NULL CHECK (outcome IN ('running', 'failed', 'unknown', 'blocked', 'complete')),
@@ -211,6 +212,7 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
              config_sha256 TEXT NOT NULL,
              parallelism INTEGER NOT NULL DEFAULT 1 CHECK (parallelism BETWEEN 1 AND 32),
              state TEXT NOT NULL CHECK (state IN ('prepared', 'building', 'ready', 'running', 'paused', 'complete', 'unknown', 'terminated')),
+             registry_mode INTEGER NOT NULL DEFAULT 0 CHECK (registry_mode IN (0, 1)),
              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
          );
@@ -258,7 +260,52 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
              PRIMARY KEY (batch_id, ordinal, attempt),
              FOREIGN KEY (batch_id, ordinal) REFERENCES release_batch_targets(batch_id, ordinal)
          );
-         PRAGMA user_version = 33;
+         CREATE TABLE retention_policy (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             keep_count INTEGER NOT NULL CHECK (keep_count BETWEEN 1 AND 100),
+             auto_enabled INTEGER NOT NULL CHECK (auto_enabled IN (0, 1)),
+             last_checked_at TEXT
+         );
+         INSERT INTO retention_policy (id, keep_count, auto_enabled) VALUES (1, 3, 0);
+         CREATE TABLE retention_cleanup (
+             task_id TEXT PRIMARY KEY REFERENCES release_tasks(id),
+             state TEXT NOT NULL CHECK (state IN ('running', 'review', 'complete')),
+             detail TEXT NOT NULL DEFAULT '',
+             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );
+         CREATE TABLE registry_settings (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             address TEXT NOT NULL,
+             username TEXT NOT NULL,
+             credential_id TEXT NOT NULL UNIQUE,
+             enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1))
+         );
+         CREATE TABLE pending_registry_credentials (credential_id TEXT PRIMARY KEY);
+         CREATE TABLE s3_backup_settings (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             endpoint TEXT NOT NULL,
+             region TEXT NOT NULL,
+             bucket TEXT NOT NULL,
+             prefix TEXT NOT NULL,
+             path_style INTEGER NOT NULL CHECK (path_style IN (0, 1)),
+             access_key TEXT NOT NULL,
+             credential_id TEXT NOT NULL UNIQUE
+         );
+         CREATE TABLE pending_s3_credentials (credential_id TEXT PRIMARY KEY);
+         CREATE TABLE restore_review (project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE);
+         CREATE TABLE pending_restore_artifacts (
+             kind TEXT NOT NULL CHECK (kind IN ('task', 'batch')),
+             id TEXT NOT NULL,
+             chunks INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY (kind, id)
+         );
+         CREATE TABLE screen_lock_settings (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             salt TEXT NOT NULL,
+             verifier TEXT NOT NULL,
+             idle_minutes INTEGER NOT NULL CHECK (idle_minutes BETWEEN 1 AND 1440)
+         );
+         PRAGMA user_version = 37;
          COMMIT;",
         ),
         1 => {
@@ -738,7 +785,103 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             conn.execute_batch("PRAGMA user_version = 33; COMMIT;")?;
             initialize(conn)
         }
-        33 => Ok(()),
+        33 => {
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE retention_policy (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     keep_count INTEGER NOT NULL CHECK (keep_count BETWEEN 1 AND 100),
+                     auto_enabled INTEGER NOT NULL CHECK (auto_enabled IN (0, 1)),
+                     last_checked_at TEXT
+                 );
+                 INSERT INTO retention_policy (id, keep_count, auto_enabled) VALUES (1, 3, 0);
+                 CREATE TABLE retention_cleanup (
+                     task_id TEXT PRIMARY KEY REFERENCES release_tasks(id),
+                     state TEXT NOT NULL CHECK (state IN ('running', 'review', 'complete')),
+                     detail TEXT NOT NULL DEFAULT '',
+                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                 );
+                 PRAGMA user_version = 34;
+                 COMMIT;",
+            )?;
+            initialize(conn)
+        }
+        34 => {
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS registry_settings (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     address TEXT NOT NULL,
+                     username TEXT NOT NULL,
+                     credential_id TEXT NOT NULL UNIQUE,
+                     enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1))
+                 );
+                 CREATE TABLE IF NOT EXISTS pending_registry_credentials (credential_id TEXT PRIMARY KEY);",
+            )?;
+            let batch_table: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'release_batches')",
+                [], |row| row.get(0),
+            )?;
+            let mode_column: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('release_batches') WHERE name = 'registry_mode')",
+                [], |row| row.get(0),
+            )?;
+            if batch_table && !mode_column {
+                conn.execute_batch("ALTER TABLE release_batches ADD COLUMN registry_mode
+                    INTEGER NOT NULL DEFAULT 0 CHECK (registry_mode IN (0, 1));")?;
+            }
+            let task_table: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'release_tasks')",
+                [], |row| row.get(0),
+            )?;
+            let task_mode_column: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('release_tasks') WHERE name = 'registry_mode')",
+                [], |row| row.get(0),
+            )?;
+            if task_table && !task_mode_column {
+                conn.execute_batch("ALTER TABLE release_tasks ADD COLUMN registry_mode
+                    INTEGER NOT NULL DEFAULT 0 CHECK (registry_mode IN (0, 1));")?;
+            }
+            conn.execute_batch("PRAGMA user_version = 35; COMMIT;")?;
+            initialize(conn)
+        }
+        35 => {
+            conn.execute_batch("BEGIN;
+                CREATE TABLE IF NOT EXISTS s3_backup_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    endpoint TEXT NOT NULL,
+                    region TEXT NOT NULL,
+                    bucket TEXT NOT NULL,
+                    prefix TEXT NOT NULL,
+                    path_style INTEGER NOT NULL CHECK (path_style IN (0, 1)),
+                    access_key TEXT NOT NULL,
+                    credential_id TEXT NOT NULL UNIQUE
+                );
+                CREATE TABLE IF NOT EXISTS pending_s3_credentials (credential_id TEXT PRIMARY KEY);
+                CREATE TABLE IF NOT EXISTS restore_review (project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE);
+                CREATE TABLE IF NOT EXISTS pending_restore_artifacts (
+                    kind TEXT NOT NULL CHECK (kind IN ('task', 'batch')),
+                    id TEXT NOT NULL,
+                    chunks INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (kind, id)
+                );
+                PRAGMA user_version = 36;
+                COMMIT;")?;
+            initialize(conn)
+        }
+        36 => {
+            conn.execute_batch("BEGIN;
+                CREATE TABLE IF NOT EXISTS screen_lock_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    salt TEXT NOT NULL,
+                    verifier TEXT NOT NULL,
+                    idle_minutes INTEGER NOT NULL CHECK (idle_minutes BETWEEN 1 AND 1440)
+                );
+                PRAGMA user_version = 37;
+                COMMIT;")?;
+            initialize(conn)
+        }
+        37 => Ok(()),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }
@@ -747,6 +890,84 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
 mod tests {
     use super::initialize;
     use rusqlite::Connection;
+
+    #[test]
+    fn upgrades_screen_lock_from_version_thirty_six() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        conn.execute_batch("DROP TABLE screen_lock_settings; PRAGMA user_version = 36;")
+            .unwrap();
+        initialize(&conn).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 37);
+        conn.execute(
+            "INSERT INTO screen_lock_settings VALUES (1, 'salt', 'verifier', 5)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn upgrades_s3_backup_from_version_thirty_five() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        conn.execute_batch(
+            "DROP TABLE s3_backup_settings;
+            DROP TABLE pending_s3_credentials;
+            DROP TABLE restore_review;
+            DROP TABLE pending_restore_artifacts;
+            PRAGMA user_version = 35;",
+        )
+        .unwrap();
+        initialize(&conn).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 37);
+        conn.execute(
+            "INSERT INTO s3_backup_settings VALUES
+            (1,'https://s3.example.com','us-east-1','bucket','',1,'key','ref')",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn upgrades_registry_settings_from_version_thirty_four() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        conn.execute_batch(
+            "DROP TABLE registry_settings;
+             DROP TABLE pending_registry_credentials;
+             ALTER TABLE release_batches DROP COLUMN registry_mode;
+             ALTER TABLE release_tasks DROP COLUMN registry_mode;
+             PRAGMA user_version = 34;",
+        )
+        .unwrap();
+        initialize(&conn).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let batch_mode: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('release_batches') WHERE name = 'registry_mode'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(version, 37);
+        assert_eq!(batch_mode, 1);
+        let task_mode: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('release_tasks') WHERE name = 'registry_mode'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(task_mode, 1);
+        conn.execute(
+            "INSERT INTO registry_settings (id, address, username, credential_id)
+            VALUES (1, 'registry.example.com', 'deploy', 'secret-ref')",
+            [],
+        )
+        .unwrap();
+    }
 
     fn existing_health_audit(conn: &Connection) {
         conn.execute_batch(
@@ -771,6 +992,8 @@ mod tests {
                  created_at, updated_at FROM release_batches;
              DROP TABLE release_batches;
              ALTER TABLE old_batches RENAME TO release_batches;
+             DROP TABLE retention_cleanup;
+             DROP TABLE retention_policy;
              PRAGMA user_version = 32;",
         )
         .unwrap();
@@ -810,6 +1033,8 @@ mod tests {
                  'password', 'SHA256:test', 'linux/amd64', 'unix:///var/run/docker.sock',
                  'DAEMON:7', 'failed', 'old-task');
              DROP TABLE release_batch_attempts;
+             DROP TABLE retention_cleanup;
+             DROP TABLE retention_policy;
              PRAGMA user_version = 31;",
         )
         .unwrap();
@@ -849,7 +1074,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!((old, batches, version), (1, 0, 33));
+        assert_eq!((old, batches, version), (1, 0, 37));
     }
 
     #[test]
@@ -878,7 +1103,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -910,7 +1135,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -939,7 +1164,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -965,7 +1190,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -988,7 +1213,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -1020,7 +1245,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -1047,7 +1272,7 @@ mod tests {
             let version: i64 = conn
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 33);
+            assert_eq!(version, 37);
         }
     }
 
@@ -1069,7 +1294,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -1085,7 +1310,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -1107,7 +1332,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -1129,7 +1354,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -1154,7 +1379,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -1180,7 +1405,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -1200,7 +1425,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -1241,7 +1466,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -1271,7 +1496,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -1317,7 +1542,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -1337,25 +1562,29 @@ mod tests {
         existing_health_audit(&conn);
         initialize(&conn).unwrap();
         conn.execute(
-            "INSERT INTO release_tasks VALUES ('two', 7, 'DAEMON:TWO', 'running')",
+            "INSERT INTO release_tasks (id, project_id, docker_daemon_id, outcome)
+             VALUES ('two', 7, 'DAEMON:TWO', 'running')",
             [],
         )
         .unwrap();
         assert!(
             conn.execute(
-                "INSERT INTO release_tasks VALUES ('again', 7, 'DAEMON:ONE', 'running')",
+                "INSERT INTO release_tasks (id, project_id, docker_daemon_id, outcome)
+                 VALUES ('again', 7, 'DAEMON:ONE', 'running')",
                 []
             )
             .is_err()
         );
         conn.execute(
-            "INSERT INTO release_tasks VALUES ('legacy', 8, NULL, 'unknown')",
+            "INSERT INTO release_tasks (id, project_id, docker_daemon_id, outcome)
+             VALUES ('legacy', 8, NULL, 'unknown')",
             [],
         )
         .unwrap();
         assert!(
             conn.execute(
-                "INSERT INTO release_tasks VALUES ('legacy-again', 8, NULL, 'running')",
+                "INSERT INTO release_tasks (id, project_id, docker_daemon_id, outcome)
+                 VALUES ('legacy-again', 8, NULL, 'running')",
                 []
             )
             .is_err()
@@ -1363,7 +1592,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -1408,7 +1637,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
     }
 
     #[test]
@@ -1424,7 +1653,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
         let name: String = conn
             .query_row("SELECT name FROM projects", [], |row| row.get(0))
             .unwrap();
@@ -1474,7 +1703,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
         let pending: String = conn
             .query_row("SELECT credential_id FROM pending_credentials", [], |row| {
                 row.get(0)
@@ -1504,7 +1733,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
         conn.execute(
             "INSERT INTO project_hosts (project_id, host_id, ordinal) VALUES (3, 5, 0)",
             [],
@@ -1530,7 +1759,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
         let host_id: i64 = conn
             .query_row("SELECT host_id FROM project_hosts", [], |row| row.get(0))
             .unwrap();
@@ -1566,7 +1795,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
         let tables: i64 = conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'release_tasks'",
             [], |row| row.get(0),

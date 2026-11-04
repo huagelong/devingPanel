@@ -120,3 +120,26 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true
+
+  cleanup:
+    name: Clean temporary Actions storage
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Remove temporary Actions artifacts and unused caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          artifact_ids=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" --jq '.artifacts[].id')
+          for artifact_id in $artifact_ids; do
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
+          done
+          cache_ids=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/caches?per_page=100" --jq '.actions_caches[].id')
+          for cache_id in $cache_ids; do
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/actions/caches/${cache_id}"
+          done

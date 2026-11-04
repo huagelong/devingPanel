@@ -3,7 +3,7 @@ use crate::host_store::with_credential_lock;
 use crate::ssh::{self, DeploymentFile};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use keyring::{Entry, Error as KeyringError};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
@@ -378,6 +378,44 @@ pub fn load(id: &str) -> Result<RestoredMaterials, String> {
             compose_files,
             env_file,
         })
+    })
+}
+
+pub fn remove_historical(id: &str) -> Result<(), String> {
+    uuid::Uuid::parse_str(id).map_err(|_| "发布任务 ID 无效。")?;
+    with_credential_lock(|| {
+        let conn = connect()?;
+        let count: Option<i64> = conn
+            .query_row(
+                "SELECT chunks FROM release_materials WHERE task_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| err.to_string())?;
+        let Some(count) = count else {
+            return Ok(());
+        };
+        if !(0..=MAX_CHUNKS as i64).contains(&count) || !cleanup(id, count as usize) {
+            return Err("历史版本凭据清理未完成，稍后可重试。".into());
+        }
+        conn.execute("DELETE FROM release_materials WHERE task_id = ?1", [id])
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn remove_orphaned(id: &str, count: i64) -> Result<(), String> {
+    uuid::Uuid::parse_str(id).map_err(|_| "发布任务 ID 无效。")?;
+    if !(0..=MAX_CHUNKS as i64).contains(&count) {
+        return Err("版本材料块数无效。".into());
+    }
+    with_credential_lock(|| {
+        if cleanup(id, count as usize) {
+            Ok(())
+        } else {
+            Err("恢复前的版本材料清理待重试。".into())
+        }
     })
 }
 

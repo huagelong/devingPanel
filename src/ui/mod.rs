@@ -1,5 +1,15 @@
+macro_rules! tfmt {
+    ($template:literal $($rest:tt)*) => {
+        trf($template, format!($template $($rest)*))
+    };
+}
+
+mod i18n;
 mod pages;
 
+use i18n::{Language, tr, tr_system, trf};
+
+use crate::backup;
 use crate::batch_store;
 use crate::compose::{self, Service, ServiceSummary};
 use crate::docker::{self, DockerStatus};
@@ -7,18 +17,22 @@ use crate::env_store::{self, EnvInput, EnvRow};
 use crate::host_store::{self, Host};
 use crate::preferences;
 use crate::project_store::{self, Project};
+use crate::registry;
 use crate::release;
 use crate::release_archive;
 use crate::release_materials;
 use crate::release_store;
+use crate::retention;
 use crate::rollback_store;
+use crate::security;
 use crate::ssh::{self, TestResult};
 use crate::stack_release;
 use gpui_kit::InteractiveElement;
+use gpui_kit::component::Disableable;
 use gpui_kit::component::Icon;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::input::{InputEvent, InputState};
-use gpui_kit::component::{Theme, ThemeMode};
+use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
@@ -48,15 +62,15 @@ impl Page {
         Self::Settings,
     ];
 
-    fn title(self) -> &'static str {
-        match self {
+    fn title(self) -> String {
+        tr(match self {
             Self::Dashboard => "总览",
             Self::Hosts => "主机",
             Self::Projects => "项目",
             Self::Deploy => "发布",
             Self::Containers => "容器",
             Self::Settings => "设置",
-        }
+        })
     }
 
     fn icon(self) -> assets::IconName {
@@ -273,6 +287,12 @@ enum SettingsSection {
     Security,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackupTab {
+    Local,
+    S3,
+}
+
 impl SettingsSection {
     const ALL: [Self; 6] = [
         Self::Retention,
@@ -283,15 +303,15 @@ impl SettingsSection {
         Self::Security,
     ];
 
-    fn title(self) -> &'static str {
-        match self {
+    fn title(self) -> String {
+        tr(match self {
             Self::Retention => "发布保留策略",
             Self::Appearance => "外观",
             Self::Registry => "镜像仓库",
             Self::Backup => "备份与恢复",
             Self::Environment => "本地环境",
             Self::Security => "安全",
-        }
+        })
     }
 
     fn icon(self) -> assets::IconName {
@@ -426,12 +446,12 @@ impl ThemeChoice {
         }
     }
 
-    fn label(self) -> &'static str {
-        match self {
+    fn label(self) -> String {
+        tr(match self {
             Self::Light => "浅色",
             Self::Dark => "深色",
             Self::System => "跟随系统",
-        }
+        })
     }
 
     fn next(self) -> Self {
@@ -558,6 +578,56 @@ pub(crate) struct AppView {
     active_log_cancel: Option<Arc<AtomicBool>>,
     settings_section: SettingsSection,
     settings_menu_open: bool,
+    registry_config: Option<registry::Config>,
+    registry_address: Entity<InputState>,
+    registry_username: Entity<InputState>,
+    registry_token: Entity<InputState>,
+    registry_busy: bool,
+    registry_error: Option<String>,
+    backup_tab: BackupTab,
+    backup_password: Option<String>,
+    backup_password_input: Entity<InputState>,
+    backup_confirm_input: Entity<InputState>,
+    backup_import_input: Entity<InputState>,
+    backup_export_ready: bool,
+    backup_preview: Option<backup::Preview>,
+    backup_replace_confirmed: bool,
+    backup_busy: bool,
+    backup_error: Option<String>,
+    backup_epoch: u64,
+    s3_config: Option<backup::S3Config>,
+    s3_endpoint: Entity<InputState>,
+    s3_region: Entity<InputState>,
+    s3_bucket: Entity<InputState>,
+    s3_prefix: Entity<InputState>,
+    s3_access_key: Entity<InputState>,
+    s3_secret: Entity<InputState>,
+    s3_path_style: bool,
+    s3_objects: Vec<backup::S3Object>,
+    s3_delete_key: Option<String>,
+    lock_settings: Option<security::LockSettings>,
+    locked: bool,
+    last_activity: Instant,
+    lock_current: Entity<InputState>,
+    lock_new: Entity<InputState>,
+    lock_confirm: Entity<InputState>,
+    lock_interval: Entity<InputState>,
+    unlock_input: Entity<InputState>,
+    lock_busy: bool,
+    lock_error: Option<String>,
+    language: Language,
+    language_menu_open: bool,
+    language_error: Option<String>,
+    retention_policy: retention::Policy,
+    retention_policy_error: Option<String>,
+    retention_check_schedule: Option<(String, String)>,
+    retention_count_menu_open: bool,
+    retention_custom_open: bool,
+    retention_custom: Entity<InputState>,
+    retention_preview: Option<Result<retention::Preview, String>>,
+    retention_preview_loading: bool,
+    retention_running: bool,
+    retention_last_summary: Option<retention::Summary>,
     theme: ThemeChoice,
     dark: bool,
     theme_error: Option<String>,
@@ -618,17 +688,117 @@ pub(crate) struct AppView {
     dialog_seq: u64,
     _appearance: Subscription,
     _deploy_tag_subscription: Subscription,
+    _lock_keystrokes: Subscription,
+    _lock_activation: Subscription,
 }
 
 impl AppView {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let deploy_tag = cx.new(|cx| InputState::new(window, cx).placeholder("正在生成发布标识…"));
+        let deploy_tag =
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("正在生成发布标识…")));
         let tag_subscription = cx.subscribe(&deploy_tag, |view, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 view.schedule_tag_plan(cx);
             }
         });
         let theme = ThemeChoice::from_saved(preferences::load_theme());
+        let language = Language::from_saved(preferences::load_language());
+        i18n::set_current(language);
+        let (retention_policy, retention_policy_error) = match retention::load() {
+            Ok(policy) => (policy, None),
+            Err(error) => (retention::Policy::default(), Some(error)),
+        };
+        let retention_check_schedule = retention::check_schedule().ok().flatten();
+        let retention_custom =
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("输入 1～100 的保留数")));
+        let registry_cleanup_error = registry::cleanup_pending_credentials().err();
+        let _ = backup::cleanup_artifacts();
+        let _ = backup::cleanup_pending_s3_credentials();
+        let (registry_config, registry_error) = match registry::load() {
+            Ok(config) => (config, registry_cleanup_error),
+            Err(error) => (None, Some(error)),
+        };
+        let registry_address = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(
+                    registry_config
+                        .as_ref()
+                        .map_or("", |config| &config.address),
+                )
+                .placeholder("registry.example.com")
+        });
+        let registry_username = cx.new(|cx| {
+            InputState::new(window, cx).default_value(
+                registry_config
+                    .as_ref()
+                    .map_or("", |config| &config.username),
+            )
+        });
+        let registry_token = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder(tr("留空保留已保存令牌"))
+        });
+        let s3_config = backup::load_s3().ok().flatten();
+        let s3_input = |value: &str, window: &mut Window, cx: &mut Context<Self>| {
+            cx.new(|cx| InputState::new(window, cx).default_value(value))
+        };
+        let s3_endpoint = s3_input(
+            s3_config.as_ref().map_or("", |value| &value.endpoint),
+            window,
+            cx,
+        );
+        let s3_region = s3_input(
+            s3_config.as_ref().map_or("", |value| &value.region),
+            window,
+            cx,
+        );
+        let s3_bucket = s3_input(
+            s3_config.as_ref().map_or("", |value| &value.bucket),
+            window,
+            cx,
+        );
+        let s3_prefix = s3_input(
+            s3_config.as_ref().map_or("", |value| &value.prefix),
+            window,
+            cx,
+        );
+        let s3_access_key = s3_input(
+            s3_config.as_ref().map_or("", |value| &value.access_key),
+            window,
+            cx,
+        );
+        let s3_secret = cx.new(|cx| InputState::new(window, cx).masked(true));
+        let backup_password_input = cx.new(|cx| InputState::new(window, cx).masked(true));
+        let backup_confirm_input = cx.new(|cx| InputState::new(window, cx).masked(true));
+        let backup_import_input = cx.new(|cx| InputState::new(window, cx).masked(true));
+        let (lock_settings, lock_error) = match security::load() {
+            Ok(settings) => (settings, None),
+            Err(error) => (None, Some(error)),
+        };
+        let locked = lock_settings.is_some() || lock_error.is_some();
+        let lock_current = cx.new(|cx| InputState::new(window, cx).masked(true));
+        let lock_new = cx.new(|cx| InputState::new(window, cx).masked(true));
+        let lock_confirm = cx.new(|cx| InputState::new(window, cx).masked(true));
+        let lock_interval = cx.new(|cx| {
+            InputState::new(window, cx).default_value(
+                lock_settings
+                    .as_ref()
+                    .map_or(5, |settings| settings.idle_minutes)
+                    .to_string(),
+            )
+        });
+        let unlock_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(tr("输入锁屏密码"))
+                .masked(true)
+        });
+        let lock_keystrokes = cx.observe_keystrokes(|view, _, window, cx| {
+            view.record_activity(window, cx);
+        });
+        let lock_activation = cx.observe_window_activation(window, |view, window, cx| {
+            view.check_idle_lock(window, cx);
+        });
         let dark = theme.is_dark(window.appearance());
         Theme::change(
             if dark {
@@ -755,6 +925,73 @@ impl AppView {
             });
         })
         .detach();
+        cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(30))
+                .await;
+            loop {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        if !retention::due_daily_check()? {
+                            return Ok(None);
+                        }
+                        let preview = retention::preview()?;
+                        if !retention::claim_daily_check()? {
+                            return Ok(None);
+                        }
+                        let ids = preview
+                            .candidates
+                            .iter()
+                            .filter(|candidate| !candidate.needs_review)
+                            .map(|candidate| candidate.task_id.clone())
+                            .collect::<Vec<_>>();
+                        retention::execute(&ids, true).map(Some)
+                    })
+                    .await;
+                if view
+                    .update(cx, |view, cx| {
+                        match result {
+                            Ok(Some(summary)) => view.retention_last_summary = Some(summary),
+                            Ok(None) => {}
+                            Err(error) => view.retention_policy_error = Some(error),
+                        }
+                        view.retention_check_schedule = retention::check_schedule().ok().flatten();
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(60))
+                    .await;
+            }
+        })
+        .detach();
+        cx.spawn_in(window, async move |view, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(5))
+                    .await;
+                let settings = cx
+                    .background_executor()
+                    .spawn(async { security::load() })
+                    .await;
+                if cx
+                    .update(|window, app| {
+                        view.update(app, |view, cx| {
+                            view.sync_lock_settings(settings, window, cx);
+                            view.check_idle_lock(window, cx);
+                        })
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         Self {
             page: Page::Dashboard,
             menu_open: false,
@@ -852,6 +1089,56 @@ impl AppView {
             active_log_cancel: None,
             settings_section: SettingsSection::Retention,
             settings_menu_open: false,
+            registry_config,
+            registry_address,
+            registry_username,
+            registry_token,
+            registry_busy: false,
+            registry_error,
+            backup_tab: BackupTab::Local,
+            backup_password: None,
+            backup_password_input,
+            backup_confirm_input,
+            backup_import_input,
+            backup_export_ready: false,
+            backup_preview: None,
+            backup_replace_confirmed: false,
+            backup_busy: false,
+            backup_error: None,
+            backup_epoch: 0,
+            s3_path_style: s3_config.as_ref().is_some_and(|config| config.path_style),
+            s3_config,
+            s3_endpoint,
+            s3_region,
+            s3_bucket,
+            s3_prefix,
+            s3_access_key,
+            s3_secret,
+            s3_objects: Vec::new(),
+            s3_delete_key: None,
+            lock_settings,
+            locked,
+            last_activity: Instant::now(),
+            lock_current,
+            lock_new,
+            lock_confirm,
+            lock_interval,
+            unlock_input,
+            lock_busy: false,
+            lock_error,
+            language,
+            language_menu_open: false,
+            language_error: None,
+            retention_policy,
+            retention_policy_error,
+            retention_check_schedule,
+            retention_count_menu_open: false,
+            retention_custom_open: false,
+            retention_custom,
+            retention_preview: None,
+            retention_preview_loading: false,
+            retention_running: false,
+            retention_last_summary: None,
             theme,
             dark,
             theme_error: None,
@@ -912,6 +1199,8 @@ impl AppView {
             dialog_seq: 0,
             _appearance: appearance,
             _deploy_tag_subscription: tag_subscription,
+            _lock_keystrokes: lock_keystrokes,
+            _lock_activation: lock_activation,
         }
     }
 
@@ -930,6 +1219,28 @@ impl AppView {
         self.theme_error = preferences::save_theme(theme.saved())
             .err()
             .map(|err| format!("主题偏好保存失败：{err}"));
+        cx.notify();
+    }
+
+    fn set_language(&mut self, language: Language, window: &mut Window, cx: &mut Context<Self>) {
+        match preferences::save_language(language.saved()) {
+            Ok(()) => {
+                self.language = language;
+                i18n::set_current(language);
+                self.deploy_tag.update(cx, |input, cx| {
+                    input.set_placeholder(tr("正在生成发布标识…"), window, cx)
+                });
+                self.retention_custom.update(cx, |input, cx| {
+                    input.set_placeholder(tr("输入 1～100 的保留数"), window, cx)
+                });
+                self.unlock_input.update(cx, |input, cx| {
+                    input.set_placeholder(tr("输入锁屏密码"), window, cx)
+                });
+                self.language_menu_open = false;
+                self.language_error = None;
+            }
+            Err(error) => self.language_error = Some(format!("无法保存语言偏好：{error}")),
+        }
         cx.notify();
     }
 
@@ -970,6 +1281,15 @@ impl AppView {
     }
 
     fn navigate(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page == Page::Settings
+            && page != Page::Settings
+            && self.settings_section == SettingsSection::Backup
+        {
+            self.backup_epoch = self.backup_epoch.wrapping_add(1);
+            self.backup_preview = None;
+            self.backup_replace_confirmed = false;
+            self.backup_export_ready = false;
+        }
         if self.page == Page::Deploy && page != Page::Deploy {
             self.clear_batch_preflight();
             if let Some(cancel) = self.deploy_target_cancel.take() {
@@ -1058,13 +1378,217 @@ impl AppView {
         cx.notify();
     }
 
+    fn check_idle_lock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.locked {
+            return;
+        }
+        if let Some(settings) = &self.lock_settings
+            && self.last_activity.elapsed()
+                >= std::time::Duration::from_secs(settings.idle_minutes as u64 * 60)
+        {
+            self.lock_now(window, cx);
+        }
+    }
+
+    fn sync_lock_settings(
+        &mut self,
+        settings: Result<Option<security::LockSettings>, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.lock_busy {
+            return;
+        }
+        match settings {
+            Ok(settings)
+                if settings != self.lock_settings
+                    || (settings.is_none() && self.locked && self.lock_error.is_some()) =>
+            {
+                self.lock_settings = settings;
+                self.lock_error = None;
+                if self.lock_settings.is_some() {
+                    self.lock_now(window, cx);
+                } else {
+                    self.locked = false;
+                    self.last_activity = Instant::now();
+                    cx.notify();
+                }
+            }
+            Err(error) => {
+                if self.lock_settings.is_some() {
+                    self.lock_now(window, cx);
+                }
+                self.locked = true;
+                self.lock_error = Some(tr_system(&error));
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    fn record_activity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.check_idle_lock(window, cx);
+        if !self.locked {
+            self.last_activity = Instant::now();
+        }
+    }
+
+    fn lock_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.locked || self.lock_busy || self.lock_settings.is_none() {
+            return;
+        }
+        self.locked = true;
+        crate::audit::record("lock", "screen_lock", 1, "completed", true);
+        self.backup_password = None;
+        self.backup_preview = None;
+        self.backup_export_ready = false;
+        self.backup_replace_confirmed = false;
+        self.backup_epoch = self.backup_epoch.wrapping_add(1);
+        self.env_form = None;
+        self.build_form = None;
+        self.manifest_form = None;
+        self.dialog_seq = self.dialog_seq.wrapping_add(1);
+        for input in [
+            &self.backup_password_input,
+            &self.backup_confirm_input,
+            &self.backup_import_input,
+            &self.registry_token,
+            &self.s3_secret,
+            &self.lock_current,
+            &self.lock_new,
+            &self.lock_confirm,
+            &self.unlock_input,
+        ] {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        if window.has_active_dialog(cx) {
+            window.close_dialog(cx);
+        }
+        if window.has_active_sheet(cx) {
+            window.close_sheet(cx);
+        }
+        cx.notify();
+    }
+
+    fn unlock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.lock_busy {
+            return;
+        }
+        let password = self.unlock_input.read(cx).value().to_string();
+        self.lock_busy = true;
+        self.lock_error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { security::verify(&password) })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.lock_busy = false;
+                    match result {
+                        Ok(true) => {
+                            crate::audit::record("unlock", "screen_lock", 1, "completed", true);
+                            view.locked = false;
+                            view.last_activity = Instant::now();
+                            view.lock_error = None;
+                        }
+                        Ok(false) => {
+                            crate::audit::record("unlock", "screen_lock", 1, "completed", false);
+                            view.lock_error = Some(tr("锁屏密码错误。"));
+                        }
+                        Err(error) => {
+                            crate::audit::record("unlock", "screen_lock", 1, "completed", false);
+                            view.lock_error = Some(tr_system(&error));
+                        }
+                    }
+                    view.unlock_input
+                        .update(cx, |input, cx| input.set_value("", window, cx));
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn lock_screen(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex_1()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_6()
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(360.))
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(img("branding/deving-panel.png").size(px(32.)))
+                            .child(
+                                div()
+                                    .text_size(px(20.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("devingPanel"),
+                            ),
+                    )
+                    .child(div().text_color(self.palette().muted).child(tr("已锁定")))
+                    .child(
+                        gpui_kit::component::input::Input::new(&self.unlock_input)
+                            .w_full()
+                            .disabled(self.lock_busy),
+                    )
+                    .when_some(self.lock_error.clone(), |el, error| {
+                        el.child(div().text_color(self.palette().destructive).child(error))
+                    })
+                    .child(
+                        gpui_kit::component::button::Button::new("unlock")
+                            .label(tr("解锁"))
+                            .disabled(self.lock_busy)
+                            .on_click(cx.listener(|this, _, window, cx| this.unlock(window, cx))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                gpui_kit::component::button::Button::new("lock-language-zh")
+                                    .outline()
+                                    .label("简体中文")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_language(Language::Chinese, window, cx)
+                                    })),
+                            )
+                            .child(
+                                gpui_kit::component::button::Button::new("lock-language-en")
+                                    .outline()
+                                    .label("English")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_language(Language::English, window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
     fn toggle_menu(&mut self, cx: &mut Context<Self>) {
         self.menu_open = !self.menu_open;
         cx.notify();
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut links = div().flex().flex_col().gap_1().pt_6();
+        let mut links = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .when(!cfg!(target_os = "windows"), |el| el.pt_6());
         for page in Page::ALL {
             let selected = page == self.page;
             links = links.child(
@@ -1105,18 +1629,16 @@ impl AppView {
             .border_color(self.palette().border)
             .bg(self.palette().background)
             .p_3()
-            .child(
-                div()
-                    .h(px(44.))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .font_weight(FontWeight::BOLD)
-                    .text_size(px(16.))
-                    .child(svg().path("branding/deving-panel.svg").size(px(28.)))
-                    .child("devingPanel"),
-            )
+            .when(!cfg!(target_os = "windows"), |el| {
+                el.child(
+                    div()
+                        .h(px(44.))
+                        .flex()
+                        .items_center()
+                        .px_3()
+                        .child(img("branding/deving-panel.png").size(px(28.))),
+                )
+            })
             .child(links)
             .child(div().flex_1())
             .child(
@@ -1125,7 +1647,7 @@ impl AppView {
                     .pb_3()
                     .text_size(px(12.))
                     .text_color(self.palette().muted)
-                    .child("仅 SSH · 无远端 Agent"),
+                    .child(tr("仅 SSH · 无远端 Agent")),
             )
     }
 
@@ -1161,47 +1683,153 @@ impl AppView {
                             .text_color(self.palette().muted)
                             .child(match self.page {
                                 Page::Settings => {
-                                    format!("设置  ›  {}", self.settings_section.title())
+                                    tfmt!("设置  ›  {}", self.settings_section.title())
                                 }
                                 Page::Projects => self
                                     .project_id
                                     .and_then(|id| {
                                         self.projects.iter().find(|project| project.id == id)
                                     })
-                                    .map(|project| format!("项目  ›  {}", project.name))
-                                    .unwrap_or_else(|| "项目".into()),
+                                    .map(|project| tfmt!("项目  ›  {}", project.name))
+                                    .unwrap_or_else(|| tr("项目")),
                                 Page::Hosts => self
                                     .host_id
                                     .and_then(|id| self.hosts.iter().find(|host| host.id == id))
-                                    .map(|host| format!("主机  ›  {}", host.name))
-                                    .unwrap_or_else(|| "主机".into()),
-                                page => page.title().to_owned(),
+                                    .map(|host| tfmt!("主机  ›  {}", host.name))
+                                    .unwrap_or_else(|| tr("主机")),
+                                page => page.title(),
                             }),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_4()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(div().size(px(8.)).rounded_full().bg(self.docker_color()))
-                            .when(!mobile, |el| el.child(self.docker.label())),
-                    )
-                    .child(
-                        div()
-                            .id("theme-toggle")
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.set_theme(this.theme.next(), window, cx);
-                            }))
-                            .child(Icon::new(assets::IconName::Sun).size(px(18.))),
-                    ),
-            )
+            .when(!cfg!(target_os = "windows"), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_4()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(div().size(px(8.)).rounded_full().bg(self.docker_color()))
+                                .when(!mobile, |el| el.child(self.docker.label())),
+                        )
+                        .child(
+                            div()
+                                .id("theme-toggle")
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_theme(this.theme.next(), window, cx);
+                                }))
+                                .child(Icon::new(assets::IconName::Sun).size(px(18.))),
+                        )
+                        .when(self.lock_settings.is_some(), |el| {
+                            el.child(
+                                div()
+                                    .id("lock-now-topbar")
+                                    .tooltip(|window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(tr("立即锁屏"))
+                                            .build(window, cx)
+                                    })
+                                    .cursor_pointer()
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| {
+                                            this.lock_now(window, cx)
+                                        }),
+                                    )
+                                    .child(Icon::new(assets::IconName::ShieldCheck).size(px(18.))),
+                            )
+                        }),
+                )
+            })
+    }
+
+    fn window_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let compact = window.viewport_size().width < px(500.);
+        TitleBar::new().child(
+            div()
+                .w_full()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .min_w_0()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .min_w_0()
+                        .child(img("branding/deving-panel.png").size(px(20.)))
+                        .child("devingPanel"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .flex_shrink_0()
+                        .pr_3()
+                        .text_size(px(12.))
+                        .when(!self.locked, |el| {
+                            el.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div().size(px(8.)).rounded_full().bg(self.docker_color()),
+                                    )
+                                    .when(!compact, |el| el.child(self.docker.label())),
+                            )
+                        })
+                        .when(!self.locked, |el| {
+                            el.child(
+                                div()
+                                    .id("titlebar-theme-toggle")
+                                    .size(px(28.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .occlude()
+                                    .cursor_pointer()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_theme(this.theme.next(), window, cx);
+                                    }))
+                                    .child(Icon::new(assets::IconName::Sun).size(px(16.))),
+                            )
+                        })
+                        .when(self.lock_settings.is_some() && !self.locked, |el| {
+                            el.child(
+                                div()
+                                    .id("titlebar-lock-now")
+                                    .tooltip(|window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(tr("立即锁屏"))
+                                            .build(window, cx)
+                                    })
+                                    .size(px(28.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .occlude()
+                                    .cursor_pointer()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| {
+                                            this.lock_now(window, cx)
+                                        }),
+                                    )
+                                    .child(Icon::new(assets::IconName::ShieldCheck).size(px(16.))),
+                            )
+                        }),
+                ),
+        )
     }
 
     fn mobile_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1236,43 +1864,73 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.locked {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(self.palette().background)
+                .text_color(self.palette().foreground)
+                .font_family(ui_font())
+                .when(cfg!(target_os = "windows"), |el| {
+                    el.child(self.window_titlebar(window, cx))
+                })
+                .child(self.lock_screen(cx))
+                .into_any_element();
+        }
         let mobile = window.viewport_size().width < px(720.);
         div()
             .size_full()
             .flex()
+            .flex_col()
             .bg(self.palette().background)
             .text_color(self.palette().foreground)
             .font_family(ui_font())
-            .when(!mobile, |el| el.child(self.sidebar(cx)))
+            .when(cfg!(target_os = "windows"), |el| {
+                el.child(self.window_titlebar(window, cx))
+            })
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .h_full()
                     .flex()
-                    .flex_col()
-                    .child(self.topbar(mobile, cx))
-                    .when(mobile && self.menu_open, |el| {
-                        el.child(self.mobile_menu(cx))
-                    })
+                    .min_h_0()
+                    .when(!mobile, |el| el.child(self.sidebar(cx)))
                     .child(
                         div()
-                            .id("content-scroll")
                             .flex_1()
                             .min_w_0()
-                            .overflow_y_scroll()
-                            .when(mobile, |el| el.px_4())
-                            .when(!mobile, |el| el.px_8())
-                            .py_6()
-                            .child(div().w_full().min_w_0().max_w(px(1280.)).mx_auto().child(
-                                self.content(
-                                    window.viewport_size().width < px(1024.),
-                                    window.viewport_size().width,
-                                    cx,
-                                ),
-                            )),
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .child(self.topbar(mobile, cx))
+                            .when(mobile && self.menu_open, |el| {
+                                el.child(self.mobile_menu(cx))
+                            })
+                            .child(
+                                div()
+                                    .id("content-scroll")
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_y_scroll()
+                                    .when(mobile, |el| el.px_4())
+                                    .when(!mobile, |el| el.px_8())
+                                    .py_6()
+                                    .child(
+                                        div().w_full().min_w_0().max_w(px(1280.)).mx_auto().child(
+                                            self.content(
+                                                window.viewport_size().width < px(1024.),
+                                                window.viewport_size().width,
+                                                cx,
+                                            ),
+                                        ),
+                                    ),
+                            ),
                     ),
             )
+            .on_mouse_move(cx.listener(|this, _, window, cx| this.record_activity(window, cx)))
+            .on_scroll_wheel(cx.listener(|this, _, window, cx| this.record_activity(window, cx)))
+            .into_any_element()
     }
 }
 
@@ -1788,6 +2446,7 @@ mod tests {
                     project_id: project.id,
                     config_sha256: "a".repeat(64),
                     parallelism: 1,
+                    registry_mode: false,
                     state: "paused".into(),
                     created_at: "2026-10-27 10:00:00".into(),
                     images: vec![crate::batch_store::BatchImageRecord {
@@ -2123,6 +2782,7 @@ mod tests {
                         project_id: project.id,
                         config_sha256: "a".repeat(64),
                         parallelism: 1,
+                        registry_mode: false,
                         state: "building".into(),
                         created_at: "2026-10-27 10:00:00".into(),
                         images: vec![],
@@ -2683,8 +3343,8 @@ mod tests {
         );
         let action = std::env::var("DEVINGPANEL_TEST_BATCH_RESOLUTION").unwrap();
         assert!(matches!(action.as_str(), "skip" | "terminate"));
-        let batch_id = "11c78bf5-86e2-44b4-8248-02b7595cf404";
-        let failed_task = "f2d2510d-f16c-4f1c-afaf-ffc6c883ded8";
+        let batch_id = "00000000-0000-4000-8000-000000000009";
+        let failed_task = "00000000-0000-4000-8000-00000000003e";
         let batch = crate::batch_store::get(batch_id).unwrap();
         assert_eq!(batch.project_id, 1856624452);
         assert_eq!(batch.state, "paused");
@@ -2711,8 +3371,8 @@ mod tests {
 
         let mut baselines = Vec::new();
         for (target, (address, daemon)) in batch.targets.iter().zip([
-            ("192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
-            ("192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
+            ("192.0.2.129", "00000000-0000-4000-8000-000000000008"),
+            ("192.0.2.130", "00000000-0000-4000-8000-000000000011"),
         ]) {
             assert_eq!(target.host.address, address);
             assert_eq!(target.docker_daemon_id, daemon);
@@ -2875,8 +3535,8 @@ mod tests {
         );
         let stage = std::env::var("DEVINGPANEL_TEST_LAN_GUI_STAGE").unwrap();
         assert!(matches!(stage.as_str(), "before" | "after"));
-        let batch_id = "0f657b6d-5704-478b-9c4b-77891812b52a";
-        let task_id = "9ff19800-bdb8-4e48-b228-bce2c8550419";
+        let batch_id = "00000000-0000-4000-8000-000000000007";
+        let task_id = "00000000-0000-4000-8000-000000000030";
         let batch = crate::batch_store::get(batch_id).unwrap();
         assert_eq!(batch.project_id, 1856624464);
         assert_eq!(batch.state, "paused");
@@ -2903,8 +3563,8 @@ mod tests {
         );
         let mut baselines = Vec::new();
         for (target, (address, daemon)) in batch.targets.iter().zip([
-            ("192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
-            ("192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
+            ("192.0.2.130", "00000000-0000-4000-8000-000000000011"),
+            ("192.0.2.129", "00000000-0000-4000-8000-000000000008"),
         ]) {
             assert_eq!(target.host.address, address);
             assert_eq!(target.docker_daemon_id, daemon);
@@ -3213,8 +3873,8 @@ mod tests {
         .unwrap();
         let mut baselines = Vec::new();
         for (target, (address, daemon)) in plan.targets.iter().zip([
-            ("192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
-            ("192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
+            ("192.0.2.129", "00000000-0000-4000-8000-000000000008"),
+            ("192.0.2.130", "00000000-0000-4000-8000-000000000011"),
         ]) {
             assert_eq!(target.host.address, address);
             assert_eq!(target.docker_daemon_id, daemon);
@@ -3437,8 +4097,8 @@ mod tests {
         );
         let mut baseline = Vec::new();
         for (host_id, address, daemon) in [
-            (1, "192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
-            (2, "192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
+            (1, "192.0.2.129", "00000000-0000-4000-8000-000000000008"),
+            (2, "192.0.2.130", "00000000-0000-4000-8000-000000000011"),
         ] {
             let host = crate::host_store::list()
                 .unwrap()
@@ -3754,12 +4414,12 @@ mod tests {
             ),
             ("checked", "blocked", Some("healthy"))
         );
-        assert_eq!(task.host.address, "192.168.63.129");
+        assert_eq!(task.host.address, "192.0.2.129");
         assert_eq!(
             crate::ssh::docker_identity_for_host(task.host.clone())
                 .unwrap()
                 .1,
-            "882622c2-a12a-4ac3-99d4-c3ab389f2641"
+            "00000000-0000-4000-8000-000000000008"
         );
         let observed = crate::ssh::observe_release_project(&task).unwrap();
         assert_eq!(observed.containers.len(), 4);
@@ -3889,14 +4549,14 @@ mod tests {
         for (target, address, daemon, count) in [
             (
                 &batch.targets[0],
-                "192.168.63.129",
-                "882622c2-a12a-4ac3-99d4-c3ab389f2641",
+                "192.0.2.129",
+                "00000000-0000-4000-8000-000000000008",
                 36,
             ),
             (
                 &batch.targets[1],
-                "192.168.63.130",
-                "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+                "192.0.2.130",
+                "00000000-0000-4000-8000-000000000011",
                 24,
             ),
         ] {
@@ -4306,7 +4966,7 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("ui-lan-batch-")
         );
-        let batch_id = "33917694-1a25-41f2-9f0e-fa3ec3631090";
+        let batch_id = "00000000-0000-4000-8000-000000000015";
         let batch = crate::batch_store::get(batch_id).unwrap();
         assert_eq!(batch.project_id, 1856624453);
         assert_eq!(batch.state, "running");
@@ -4322,12 +4982,12 @@ mod tests {
             ),
             ("checked", "blocked", Some("healthy"))
         );
-        assert_eq!(task.host.address, "192.168.63.130");
+        assert_eq!(task.host.address, "192.0.2.130");
         assert_eq!(
             crate::ssh::docker_identity_for_host(task.host.clone())
                 .unwrap()
                 .1,
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"
+            "00000000-0000-4000-8000-000000000011"
         );
         let observed = crate::ssh::observe_release_project(&task).unwrap();
         assert_eq!(observed.containers.len(), 4);
@@ -4416,11 +5076,11 @@ mod tests {
             pointers(),
             vec![
                 (
-                    "882622c2-a12a-4ac3-99d4-c3ab389f2641".into(),
+                    "00000000-0000-4000-8000-000000000008".into(),
                     batch.targets[0].release_task_id.clone().unwrap()
                 ),
                 (
-                    "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6".into(),
+                    "00000000-0000-4000-8000-000000000011".into(),
                     second_id.clone()
                 ),
             ]
@@ -4443,20 +5103,20 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("ui-lan-batch-")
         );
-        let batch = crate::batch_store::get("33917694-1a25-41f2-9f0e-fa3ec3631090").unwrap();
+        let batch = crate::batch_store::get("00000000-0000-4000-8000-000000000015").unwrap();
         assert_eq!(batch.project_id, 1856624453);
         assert_eq!(batch.state, "complete");
         for (target, address, daemon, count) in [
             (
                 &batch.targets[0],
-                "192.168.63.129",
-                "882622c2-a12a-4ac3-99d4-c3ab389f2641",
+                "192.0.2.129",
+                "00000000-0000-4000-8000-000000000008",
                 32,
             ),
             (
                 &batch.targets[1],
-                "192.168.63.130",
-                "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+                "192.0.2.130",
+                "00000000-0000-4000-8000-000000000011",
                 24,
             ),
         ] {
@@ -4503,8 +5163,8 @@ mod tests {
                 .canonicalize()
                 .unwrap()
         );
-        let batch_id = "95c6bb3e-137b-4f54-b37e-b9ec27784e01";
-        let task_id = "86a7b61d-602f-4120-b99a-51cd0ba32abf";
+        let batch_id = "00000000-0000-4000-8000-00000000002d";
+        let task_id = "00000000-0000-4000-8000-00000000002a";
         let batch = crate::batch_store::get(batch_id).unwrap();
         assert_eq!(batch.project_id, 1856624451);
         assert_eq!(batch.state, "unknown");
@@ -4541,14 +5201,14 @@ mod tests {
         for (target, address, daemon, count) in [
             (
                 &batch.targets[0],
-                "192.168.63.129",
-                "882622c2-a12a-4ac3-99d4-c3ab389f2641",
+                "192.0.2.129",
+                "00000000-0000-4000-8000-000000000008",
                 32,
             ),
             (
                 &batch.targets[1],
-                "192.168.63.130",
-                "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+                "192.0.2.130",
+                "00000000-0000-4000-8000-000000000011",
                 24,
             ),
         ] {
@@ -4691,8 +5351,8 @@ mod tests {
                 .canonicalize()
                 .unwrap()
         );
-        let batch_id = "00a18c00-67e7-4d5a-a510-0003735118c1";
-        let task_id = "f5ae8406-b619-40af-a2fc-f69a8f0f059d";
+        let batch_id = "00000000-0000-4000-8000-000000000003";
+        let task_id = "00000000-0000-4000-8000-000000000040";
         let batch = crate::batch_store::get(batch_id).unwrap();
         assert_eq!(batch.project_id, 1856624456);
         assert_eq!(batch.state, "unknown");
@@ -4722,14 +5382,14 @@ mod tests {
         for (target, address, daemon, count) in [
             (
                 &batch.targets[0],
-                "192.168.63.129",
-                "882622c2-a12a-4ac3-99d4-c3ab389f2641",
+                "192.0.2.129",
+                "00000000-0000-4000-8000-000000000008",
                 36,
             ),
             (
                 &batch.targets[1],
-                "192.168.63.130",
-                "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+                "192.0.2.130",
+                "00000000-0000-4000-8000-000000000011",
                 28,
             ),
         ] {
@@ -4911,8 +5571,8 @@ mod tests {
                 .canonicalize()
                 .unwrap()
         );
-        let batch_id = "0e1ffb0e-25ba-4537-a76e-a3c164ffaf0b";
-        let task_id = "004cd188-9511-4eaa-b224-4bf971265776";
+        let batch_id = "00000000-0000-4000-8000-000000000006";
+        let task_id = "00000000-0000-4000-8000-000000000001";
         let batch = crate::batch_store::get(batch_id).unwrap();
         assert_eq!(batch.project_id, 1856624454);
         assert_eq!(batch.state, "unknown");
@@ -4961,14 +5621,14 @@ mod tests {
         for (target, address, daemon, count) in [
             (
                 &batch.targets[0],
-                "192.168.63.129",
-                "882622c2-a12a-4ac3-99d4-c3ab389f2641",
+                "192.0.2.129",
+                "00000000-0000-4000-8000-000000000008",
                 36,
             ),
             (
                 &batch.targets[1],
-                "192.168.63.130",
-                "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+                "192.0.2.130",
+                "00000000-0000-4000-8000-000000000011",
                 24,
             ),
         ] {
@@ -5101,8 +5761,8 @@ mod tests {
                 .canonicalize()
                 .unwrap()
         );
-        let batch_id = "0e1ffb0e-25ba-4537-a76e-a3c164ffaf0b";
-        let task_id = "006cf747-ae46-428e-a3ca-f896a7c31c9a";
+        let batch_id = "00000000-0000-4000-8000-000000000006";
+        let task_id = "00000000-0000-4000-8000-000000000002";
         let batch = crate::batch_store::get(batch_id).unwrap();
         assert_eq!(batch.project_id, 1856624454);
         assert_eq!(batch.state, "unknown");
@@ -5156,14 +5816,14 @@ mod tests {
         for (target, address, daemon, count) in [
             (
                 &batch.targets[0],
-                "192.168.63.129",
-                "882622c2-a12a-4ac3-99d4-c3ab389f2641",
+                "192.0.2.129",
+                "00000000-0000-4000-8000-000000000008",
                 36,
             ),
             (
                 &batch.targets[1],
-                "192.168.63.130",
-                "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+                "192.0.2.130",
+                "00000000-0000-4000-8000-000000000011",
                 28,
             ),
         ] {
@@ -5319,11 +5979,8 @@ mod tests {
         let password = std::env::var("DEVINGPANEL_TEST_LAN_PASSWORD")
             .expect("isolated LAN test password is required");
         let conn = crate::database::connect().unwrap();
-        let fingerprint = "SHA256:+YD+qOVvzV7TP3DUXlFSIXadVdH8aNaUoeYLfEGcKE4";
-        for (name, address) in [
-            ("vps-smoke", "192.168.63.129"),
-            ("vps-second", "192.168.63.130"),
-        ] {
+        let fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        for (name, address) in [("vps-smoke", "192.0.2.129"), ("vps-second", "192.0.2.130")] {
             let host = crate::host_store::create(crate::host_store::NewHost {
                 name: name.into(),
                 address: address.into(),
@@ -5403,13 +6060,13 @@ mod tests {
         for (target, address, daemon_id) in [
             (
                 &snapshot.targets[0],
-                "192.168.63.129",
-                "882622c2-a12a-4ac3-99d4-c3ab389f2641",
+                "192.0.2.129",
+                "00000000-0000-4000-8000-000000000008",
             ),
             (
                 &snapshot.targets[1],
-                "192.168.63.130",
-                "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+                "192.0.2.130",
+                "00000000-0000-4000-8000-000000000011",
             ),
         ] {
             assert_eq!(target.host.address, address);
@@ -5646,14 +6303,6 @@ mod tests {
                 .find(|target| target.host.id == *host_id)
                 .unwrap();
             assert!(saved.host == *current);
-            assert_eq!(
-                current.address,
-                if *host_id == 2 {
-                    "43.162.99.10"
-                } else {
-                    "129.211.23.223"
-                }
-            );
             let mut probe = prior_tasks
                 .iter()
                 .find(|task| task.host.id == *host_id)
@@ -5893,7 +6542,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             (host.address.as_str(), host.port, host.username.as_str()),
-            ("129.211.23.223", 22, "root")
+            ("198.51.100.10", 22, "root")
         );
         assert_eq!(host.address, previous.host.address);
         assert_eq!(host.port, previous.host.port);
@@ -6013,8 +6662,8 @@ mod tests {
         use gpui_kit::component::WindowExt as _;
         use gpui_kit::{AppContext as _, Modifiers, WindowOptions};
         use sha2::{Digest, Sha256};
-        const EXPECTED_SOURCE: &str = "ba6717cf-7d58-488a-8a31-9393bd3df38c";
-        const EXPECTED_TARGET: &str = "67795719-9538-4c2e-be5c-67b40d8dcca0";
+        const EXPECTED_SOURCE: &str = "00000000-0000-4000-8000-000000000034";
+        const EXPECTED_TARGET: &str = "00000000-0000-4000-8000-000000000021";
         let fingerprint = |task_id: &str| {
             let services = crate::release_store::confirmed_services(task_id).unwrap();
             let text = services
@@ -6094,7 +6743,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             (host.address.as_str(), host.port, host.username.as_str()),
-            ("129.211.23.223", 22, "root")
+            ("198.51.100.10", 22, "root")
         );
         assert_eq!(
             (

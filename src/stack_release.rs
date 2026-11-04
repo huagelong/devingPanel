@@ -5,6 +5,7 @@ use crate::env_store;
 use crate::host_store;
 use crate::project_config::{self, BuildSpec, Manifest};
 use crate::project_store::{self, Project};
+use crate::registry;
 use crate::release;
 use crate::release_materials;
 use crate::release_store::{self, HealthResult, Intent, Outcome, Phase};
@@ -17,6 +18,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+
+const UNKNOWN_REGISTRY_PUSH: &str = "镜像仓库推送结果待核实";
 
 fn build_project(project: &Project, spec: &BuildSpec) -> Project {
     let mut item = project.clone();
@@ -681,6 +684,18 @@ fn build_shared_images_local(
             &built.archive,
         )?;
     }
+    if crate::batch_store::registry_mode(batch_id)? {
+        for built in &result {
+            on_event(&format!("推送镜像：{} {}", built.service, built.platform));
+            if let Err(error) = registry::push(&built.image.reference, &cancel) {
+                let state = crate::batch_store::mark_unknown_registry_push(batch_id)
+                    .err()
+                    .map(|reason| format!("；批次状态保存失败：{reason}"))
+                    .unwrap_or_default();
+                return Err(format!("{error}；{UNKNOWN_REGISTRY_PUSH}{state}。"));
+            }
+        }
+    }
     crate::batch_store::ready(batch_id)?;
     Ok(result)
 }
@@ -858,6 +873,10 @@ pub fn upload_batch_host_archives(
         return Err("批次传输已取消。".into());
     }
     release_store::advance(&prepared.task_id, Phase::Built, Phase::Uploading)?;
+    if crate::batch_store::registry_mode(batch_id)? {
+        release_store::advance(&prepared.task_id, Phase::Uploading, Phase::Uploaded)?;
+        return Ok(Vec::new());
+    }
     let mut uploaded = Vec::new();
     for (service, reference) in &planned.images {
         let result = (|| {
@@ -950,6 +969,61 @@ pub fn load_batch_host_archives(
         })
     {
         return Err("批次镜像加载前主机任务状态已变化。".into());
+    }
+    if crate::batch_store::registry_mode(batch_id)? {
+        let credentials =
+            registry::enabled_credentials()?.ok_or("镜像仓库配置已失效，批次无法继续。")?;
+        let mut services = Vec::new();
+        for (service, reference) in &plan.images {
+            let (_, _, image_ids, saved_reference) =
+                crate::batch_store::archive_record(batch_id, service, &target.platform)?;
+            if saved_reference != *reference
+                || !reference.starts_with(&format!("{}/", credentials.config.address))
+            {
+                return Err("批次镜像与镜像仓库配置不一致。".into());
+            }
+            services.push(StackService {
+                service: service.clone(),
+                reference: reference.clone(),
+                image_ids,
+            });
+        }
+        release_store::advance(&prepared.task_id, Phase::Uploaded, Phase::Loading)?;
+        for service in &services {
+            let result = (|| {
+                release_store::record_image_ids(
+                    &prepared.task_id,
+                    &service.service,
+                    &service.image_ids,
+                )?;
+                on_event(&format!("远端拉取镜像：{}", service.service));
+                ssh::pull_registry_image(
+                    target.host.clone(),
+                    ssh::ReleaseDockerIdentity {
+                        endpoint: &target.docker_endpoint,
+                        daemon_id: &target.docker_daemon_id,
+                    },
+                    &prepared.task_id,
+                    &service.reference,
+                    &target.platform,
+                    &service.image_ids,
+                    &credentials,
+                    cancel.clone(),
+                )
+            })();
+            if let Err(error) = result {
+                let _ = release_store::settle(
+                    &prepared.task_id,
+                    Phase::Loading,
+                    Outcome::Unknown,
+                    "批次镜像仓库拉取结果待核实",
+                );
+                return Err(error);
+            }
+        }
+        release_store::advance(&prepared.task_id, Phase::Loading, Phase::Loaded)?;
+        release_store::advance(&prepared.task_id, Phase::Loaded, Phase::AwaitingDeployment)?;
+        return Ok(services);
     }
     let records = release_store::uploaded_archives(&prepared.task_id)?;
     if records.len() != plan.images.len() || plan.images.is_empty() {
@@ -1397,9 +1471,15 @@ pub fn run_batch_sequential(
         cancel.clone(),
         &mut on_event,
     ) {
-        let detail = match crate::batch_store::terminate_unstarted(&batch_id) {
-            Ok(()) => message,
-            Err(reason) => format!("{message}；批次终止待核实：{reason}"),
+        let detail = if message.contains(UNKNOWN_REGISTRY_PUSH)
+            || crate::batch_store::get(&batch_id).is_ok_and(|batch| batch.state == "unknown")
+        {
+            message
+        } else {
+            match crate::batch_store::terminate_unstarted(&batch_id) {
+                Ok(()) => message,
+                Err(reason) => format!("{message}；批次终止待核实：{reason}"),
+            }
         };
         return Err(BatchRunError {
             batch_id: Some(batch_id),
@@ -1436,9 +1516,15 @@ pub fn run_batch_parallel(
         cancel.clone(),
         &mut on_event,
     ) {
-        let detail = match crate::batch_store::terminate_unstarted(&batch_id) {
-            Ok(()) => message,
-            Err(reason) => format!("{message}；批次终止待核实：{reason}"),
+        let detail = if message.contains(UNKNOWN_REGISTRY_PUSH)
+            || crate::batch_store::get(&batch_id).is_ok_and(|batch| batch.state == "unknown")
+        {
+            message
+        } else {
+            match crate::batch_store::terminate_unstarted(&batch_id) {
+                Ok(()) => message,
+                Err(reason) => format!("{message}；批次终止待核实：{reason}"),
+            }
         };
         return Err(BatchRunError {
             batch_id: Some(batch_id),
@@ -2483,6 +2569,16 @@ pub fn run(
         return Err("本机 default 构建器不支持目标平台。".into());
     }
     let planned = release::plan_manifest_images(&manifest, base_tag, &targets)?;
+    let registry_credentials = registry::enabled_credentials()?;
+    if let Some(credentials) = &registry_credentials
+        && planned.iter().any(|image| {
+            !image
+                .reference
+                .starts_with(&format!("{}/", credentials.config.address))
+        })
+    {
+        return Err("镜像仓库模式要求所有构建镜像名以 Registry 地址开头。".into());
+    }
     if planned.len() != manifest.builds.len() {
         return Err("多镜像构建计划不完整。".into());
     }
@@ -2516,29 +2612,32 @@ pub fn run(
     };
     let id = uuid::Uuid::new_v4().to_string();
     let first = &planned[0];
-    release_store::create(&Intent {
-        id: id.clone(),
-        project_id,
-        project_name: project.name.clone(),
-        host: host.clone(),
-        docker_endpoint: docker_endpoint.clone(),
-        docker_daemon_id: docker_daemon_id.clone(),
-        image_reference: first.reference.clone(),
-        platform: first.platform.clone(),
-        images: manifest
-            .builds
-            .iter()
-            .zip(&planned)
-            .map(|(spec, image)| {
-                (
-                    spec.service.clone(),
-                    image.reference.clone(),
-                    image.platform.clone(),
-                )
-            })
-            .collect(),
-        config_sha256: digest.clone(),
-    })?;
+    registry::create_release_intent(
+        &Intent {
+            id: id.clone(),
+            project_id,
+            project_name: project.name.clone(),
+            host: host.clone(),
+            docker_endpoint: docker_endpoint.clone(),
+            docker_daemon_id: docker_daemon_id.clone(),
+            image_reference: first.reference.clone(),
+            platform: first.platform.clone(),
+            images: manifest
+                .builds
+                .iter()
+                .zip(&planned)
+                .map(|(spec, image)| {
+                    (
+                        spec.service.clone(),
+                        image.reference.clone(),
+                        image.platform.clone(),
+                    )
+                })
+                .collect(),
+            config_sha256: digest.clone(),
+        },
+        &registry_credentials,
+    )?;
     if let Err(error) = release_materials::save(&id, materials) {
         let outcome = if error.contains("部分凭据可能残留") {
             Outcome::Unknown
@@ -2581,29 +2680,145 @@ pub fn run(
         return Err("项目文件在构建期间变化，未开始上传。".into());
     }
     release_store::advance(&id, Phase::Built, Phase::Uploading)?;
-    let mut uploaded = Vec::new();
-    for (spec, image) in manifest.builds.iter().zip(&built) {
-        on_event(&format!("传输镜像：{}", spec.service));
-        match release::transfer_built_image(
-            &id,
-            &spec.service,
-            host.clone(),
-            image,
-            cancel.clone(),
-            |sent, total| {
-                on_event(&format!("镜像传输 {sent}/{total} 字节"));
-            },
-        ) {
-            Ok(value) => uploaded.push(value),
-            Err(error) => {
+    let expected: Vec<StackService> = if let Some(credentials) = &registry_credentials {
+        let mut images = Vec::new();
+        for (spec, image) in manifest.builds.iter().zip(&built) {
+            on_event(&format!("推送镜像：{}", spec.service));
+            let result = (|| {
+                let archive = build::save_image(image, cancel.clone())?;
+                crate::release_archive::retain(&id, &spec.service, &archive)?;
+                registry::push_with_credentials(credentials, &image.reference, &cancel)?;
+                Ok::<_, String>(archive.image_ids.clone())
+            })();
+            match result {
+                Ok(image_ids) => images.push(StackService {
+                    service: spec.service.clone(),
+                    reference: image.reference.clone(),
+                    image_ids,
+                }),
+                Err(error) => {
+                    let _ = release_store::settle(
+                        &id,
+                        Phase::Uploading,
+                        Outcome::Unknown,
+                        "镜像仓库推送结果待核实",
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        release_store::advance(&id, Phase::Uploading, Phase::Uploaded)?;
+        release_store::advance(&id, Phase::Uploaded, Phase::Loading)?;
+        for (service, image) in images.iter().zip(&built) {
+            if let Err(error) =
+                release_store::record_image_ids(&id, &service.service, &service.image_ids)
+            {
+                let _ = release_store::settle(
+                    &id,
+                    Phase::Loading,
+                    Outcome::Unknown,
+                    "镜像仓库镜像 ID 保存结果待核实",
+                );
+                return Err(error);
+            }
+            on_event(&format!("远端拉取镜像：{}", service.service));
+            if let Err(error) = ssh::pull_registry_image(
+                host.clone(),
+                docker_identity,
+                &id,
+                &image.reference,
+                &image.platform,
+                &service.image_ids,
+                credentials,
+                cancel.clone(),
+            ) {
+                let _ = release_store::settle(
+                    &id,
+                    Phase::Loading,
+                    Outcome::Unknown,
+                    "镜像仓库拉取结果待核实",
+                );
+                return Err(error);
+            }
+        }
+        release_store::advance(&id, Phase::Loading, Phase::Loaded)?;
+        images
+    } else {
+        let mut uploaded = Vec::new();
+        for (spec, image) in manifest.builds.iter().zip(&built) {
+            on_event(&format!("传输镜像：{}", spec.service));
+            match release::transfer_built_image(
+                &id,
+                &spec.service,
+                host.clone(),
+                image,
+                cancel.clone(),
+                |sent, total| {
+                    on_event(&format!("镜像传输 {sent}/{total} 字节"));
+                },
+            ) {
+                Ok(value) => uploaded.push(value),
+                Err(error) => {
+                    let cleanup = cleanup_known_archives(&uploaded, None, |archive| {
+                        ssh::cleanup_uploaded_archive(host.clone(), archive)
+                    });
+                    let _ = release_store::settle(
+                        &id,
+                        Phase::Uploading,
+                        Outcome::Unknown,
+                        "多镜像传输结果待核实",
+                    );
+                    return Err(match cleanup {
+                        Ok(()) => error,
+                        Err(warning) => format!("{error}；{warning}"),
+                    });
+                }
+            }
+        }
+        release_store::advance(&id, Phase::Uploading, Phase::Uploaded)?;
+        release_store::advance(&id, Phase::Uploaded, Phase::Loading)?;
+        for (index, ((spec, image), archive)) in manifest
+            .builds
+            .iter()
+            .zip(&built)
+            .zip(&uploaded)
+            .enumerate()
+        {
+            on_event(&format!("远端加载镜像：{}", spec.service));
+            if let Err(error) =
+                release_store::record_image_ids(&id, &spec.service, &archive.image_ids)
+            {
                 let cleanup = cleanup_known_archives(&uploaded, None, |archive| {
                     ssh::cleanup_uploaded_archive(host.clone(), archive)
                 });
                 let _ = release_store::settle(
                     &id,
-                    Phase::Uploading,
+                    Phase::Loading,
                     Outcome::Unknown,
-                    "多镜像传输结果待核实",
+                    "镜像归档 ID 保存结果待核实",
+                );
+                return Err(if cleanup.is_ok() {
+                    error
+                } else {
+                    format!("{error}；远端临时归档清理待核实")
+                });
+            }
+            if let Err(error) = ssh::load_uploaded_archive(
+                host.clone(),
+                docker_identity,
+                archive,
+                &image.reference,
+                &image.platform,
+                cancel.clone(),
+            ) {
+                let cleanup = cleanup_known_archives(&uploaded, Some(index), |archive| {
+                    ssh::cleanup_uploaded_archive(host.clone(), archive)
+                });
+                let _ = release_store::settle(
+                    &id,
+                    Phase::Loading,
+                    Outcome::Unknown,
+                    "多镜像加载结果待核实",
                 );
                 return Err(match cleanup {
                     Ok(()) => error,
@@ -2611,64 +2826,26 @@ pub fn run(
                 });
             }
         }
-    }
-    release_store::advance(&id, Phase::Uploading, Phase::Uploaded)?;
-    release_store::advance(&id, Phase::Uploaded, Phase::Loading)?;
-    for (index, ((spec, image), archive)) in manifest
-        .builds
-        .iter()
-        .zip(&built)
-        .zip(&uploaded)
-        .enumerate()
-    {
-        on_event(&format!("远端加载镜像：{}", spec.service));
-        if let Err(error) = release_store::record_image_ids(&id, &spec.service, &archive.image_ids)
-        {
-            let cleanup = cleanup_known_archives(&uploaded, None, |archive| {
-                ssh::cleanup_uploaded_archive(host.clone(), archive)
-            });
-            let _ = release_store::settle(
-                &id,
-                Phase::Loading,
-                Outcome::Unknown,
-                "镜像归档 ID 保存结果待核实",
-            );
-            return Err(if cleanup.is_ok() {
-                error
-            } else {
-                format!("{error}；远端临时归档清理待核实")
-            });
+        release_store::advance(&id, Phase::Loading, Phase::Loaded)?;
+        if let Err(error) = cleanup_known_archives(&uploaded, None, |archive| {
+            ssh::cleanup_uploaded_archive(host.clone(), archive)
+        }) {
+            let _ =
+                release_store::settle(&id, Phase::Loaded, Outcome::Unknown, "临时归档清理待核实");
+            return Err(error);
         }
-        if let Err(error) = ssh::load_uploaded_archive(
-            host.clone(),
-            docker_identity,
-            archive,
-            &image.reference,
-            &image.platform,
-            cancel.clone(),
-        ) {
-            let cleanup = cleanup_known_archives(&uploaded, Some(index), |archive| {
-                ssh::cleanup_uploaded_archive(host.clone(), archive)
-            });
-            let _ = release_store::settle(
-                &id,
-                Phase::Loading,
-                Outcome::Unknown,
-                "多镜像加载结果待核实",
-            );
-            return Err(match cleanup {
-                Ok(()) => error,
-                Err(warning) => format!("{error}；{warning}"),
-            });
-        }
-    }
-    release_store::advance(&id, Phase::Loading, Phase::Loaded)?;
-    if let Err(error) = cleanup_known_archives(&uploaded, None, |archive| {
-        ssh::cleanup_uploaded_archive(host.clone(), archive)
-    }) {
-        let _ = release_store::settle(&id, Phase::Loaded, Outcome::Unknown, "临时归档清理待核实");
-        return Err(error);
-    }
+        manifest
+            .builds
+            .iter()
+            .zip(&built)
+            .zip(&uploaded)
+            .map(|((spec, image), archive)| StackService {
+                service: spec.service.clone(),
+                reference: image.reference.clone(),
+                image_ids: archive.image_ids.clone(),
+            })
+            .collect()
+    };
     release_store::advance(&id, Phase::Loaded, Phase::AwaitingDeployment)?;
     release_store::advance(&id, Phase::AwaitingDeployment, Phase::Staging)?;
     on_event("上传 Compose 和环境配置");
@@ -2689,17 +2866,6 @@ pub fn run(
     };
     release_store::advance(&id, Phase::Staging, Phase::Staged)?;
     release_store::advance(&id, Phase::Staged, Phase::Validating)?;
-    let expected: Vec<StackService> = manifest
-        .builds
-        .iter()
-        .zip(&planned)
-        .zip(&uploaded)
-        .map(|((spec, image), archive)| StackService {
-            service: spec.service.clone(),
-            reference: image.reference.clone(),
-            image_ids: archive.image_ids.clone(),
-        })
-        .collect();
     on_event("校验所有 Compose 服务");
     let services = match ssh::validate_staged_stack(
         host.clone(),
@@ -3240,8 +3406,8 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         for (id, address, daemon) in [
-            (1, "192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
-            (2, "192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
+            (1, "192.0.2.129", "00000000-0000-4000-8000-000000000008"),
+            (2, "192.0.2.130", "00000000-0000-4000-8000-000000000011"),
         ] {
             let host = hosts.iter().find(|host| host.id == id).unwrap();
             assert_eq!(host.address, address);
@@ -3803,11 +3969,8 @@ mod tests {
             project_id: None,
             host_ids: Vec::new(),
         };
-        let fingerprint = "SHA256:+YD+qOVvzV7TP3DUXlFSIXadVdH8aNaUoeYLfEGcKE4";
-        for (name, address) in [
-            ("vps-smoke", "192.168.63.129"),
-            ("vps-second", "192.168.63.130"),
-        ] {
+        let fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        for (name, address) in [("vps-smoke", "192.0.2.129"), ("vps-second", "192.0.2.130")] {
             let host = crate::host_store::create(crate::host_store::NewHost {
                 name: name.into(),
                 address: address.into(),
@@ -4029,15 +4192,15 @@ mod tests {
         assert_eq!(batch.targets[0].state, "running");
         assert_eq!(batch.targets[1].state, "waiting");
         assert!(batch.targets[1].release_task_id.is_none());
-        assert_eq!(batch.targets[0].host.address, "192.168.63.129");
-        assert_eq!(batch.targets[1].host.address, "192.168.63.130");
+        assert_eq!(batch.targets[0].host.address, "192.0.2.129");
+        assert_eq!(batch.targets[1].host.address, "192.0.2.130");
         assert_eq!(
             batch.targets[0].docker_daemon_id,
-            "882622c2-a12a-4ac3-99d4-c3ab389f2641"
+            "00000000-0000-4000-8000-000000000008"
         );
         assert_eq!(
             batch.targets[1].docker_daemon_id,
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"
+            "00000000-0000-4000-8000-000000000011"
         );
         for target in &batch.targets {
             assert_eq!(
@@ -4189,7 +4352,7 @@ mod tests {
         let cut_second =
             std::env::var("DEVINGPANEL_TEST_PARALLEL_CUT_SECOND").as_deref() == Ok("1");
         assert!(!(fail_second && cut_second));
-        let proxy = cut_second.then(|| CutOnceSshProxy::new("192.168.63.130:22"));
+        let proxy = cut_second.then(|| CutOnceSshProxy::new("192.0.2.130:22"));
         let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
             .canonicalize()
             .unwrap();
@@ -4211,16 +4374,16 @@ mod tests {
         assert!(std::fs::read_dir(&appdata).unwrap().next().is_none());
         let password = std::env::var("DEVINGPANEL_TEST_LAN_PASSWORD")
             .expect("isolated LAN test password is required");
-        let fingerprint = "SHA256:+YD+qOVvzV7TP3DUXlFSIXadVdH8aNaUoeYLfEGcKE4";
+        let fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let mut host_ids = Vec::new();
         for (name, address, port) in [
-            ("vps-smoke", "192.168.63.129", 22),
+            ("vps-smoke", "192.0.2.129", 22),
             (
                 "vps-second",
                 if cut_second {
                     "127.0.0.1"
                 } else {
-                    "192.168.63.130"
+                    "192.0.2.130"
                 },
                 proxy.as_ref().map_or(22, |proxy| proxy.port),
             ),
@@ -4309,11 +4472,11 @@ mod tests {
         );
         assert_eq!(
             plan.targets[0].docker_daemon_id,
-            "882622c2-a12a-4ac3-99d4-c3ab389f2641"
+            "00000000-0000-4000-8000-000000000008"
         );
         assert_eq!(
             plan.targets[1].docker_daemon_id,
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"
+            "00000000-0000-4000-8000-000000000011"
         );
         let mut baselines = Vec::new();
         for target in &plan.targets {
@@ -4553,21 +4716,21 @@ mod tests {
         let hosts = [
             (
                 "vps-smoke",
-                "192.168.63.129",
+                "192.0.2.129",
                 22,
                 "root",
                 "password",
                 password.as_str(),
-                "SHA256:+YD+qOVvzV7TP3DUXlFSIXadVdH8aNaUoeYLfEGcKE4",
+                "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             ),
             (
                 "qemu-arm64",
-                "192.168.63.131",
+                "192.0.2.131",
                 2223,
                 "tester",
                 "key",
                 private_key.as_str(),
-                "SHA256:12rUdY5YJc15z7yk6La4DsIhHx57foGiQZo6+i8I/Ns",
+                "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
             ),
         ];
         let mut host_ids = Vec::new();
@@ -4766,12 +4929,12 @@ mod tests {
         );
         assert!(std::fs::read_dir(&appdata).unwrap().next().is_none());
         let password = std::env::var("DEVINGPANEL_TEST_LAN_PASSWORD").unwrap();
-        let fingerprint = "SHA256:+YD+qOVvzV7TP3DUXlFSIXadVdH8aNaUoeYLfEGcKE4";
+        let fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let mut host_ids = Vec::new();
         for (name, address) in [
-            ("vps-smoke", "192.168.63.129"),
-            ("vps-third", "192.168.63.131"),
-            ("vps-second", "192.168.63.130"),
+            ("vps-smoke", "192.0.2.129"),
+            ("vps-third", "192.0.2.131"),
+            ("vps-second", "192.0.2.130"),
         ] {
             let host = crate::host_store::create(crate::host_store::NewHost {
                 name: name.into(),
@@ -5264,10 +5427,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pointers, 0);
-        let addresses = ["192.168.63.129", "192.168.63.130"];
+        let addresses = ["192.0.2.129", "192.0.2.130"];
         let daemons = [
-            "882622c2-a12a-4ac3-99d4-c3ab389f2641",
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+            "00000000-0000-4000-8000-000000000008",
+            "00000000-0000-4000-8000-000000000011",
         ];
         for (index, target) in batch.targets.iter().enumerate() {
             assert_eq!(target.host.address, addresses[index]);
@@ -5368,12 +5531,9 @@ mod tests {
 
         assert!(std::fs::read_dir(&appdata).unwrap().next().is_none());
         let password = std::env::var("DEVINGPANEL_TEST_LAN_PASSWORD").unwrap();
-        let fingerprint = "SHA256:+YD+qOVvzV7TP3DUXlFSIXadVdH8aNaUoeYLfEGcKE4";
+        let fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let mut hosts = Vec::new();
-        for (name, address) in [
-            ("vps-smoke", "192.168.63.129"),
-            ("vps-second", "192.168.63.130"),
-        ] {
+        for (name, address) in [("vps-smoke", "192.0.2.129"), ("vps-second", "192.0.2.130")] {
             let host = crate::host_store::create(crate::host_store::NewHost {
                 name: name.into(),
                 address: address.into(),
@@ -5430,11 +5590,11 @@ mod tests {
         assert_eq!(plan.targets.len(), 2);
         assert_eq!(
             plan.targets[0].docker_daemon_id,
-            "882622c2-a12a-4ac3-99d4-c3ab389f2641"
+            "00000000-0000-4000-8000-000000000008"
         );
         assert_eq!(
             plan.targets[1].docker_daemon_id,
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"
+            "00000000-0000-4000-8000-000000000011"
         );
         let mut baselines = Vec::new();
         for target in &plan.targets {
@@ -5725,7 +5885,7 @@ mod tests {
         );
         let batch_id =
             std::env::var("DEVINGPANEL_TEST_LAN_BATCH_ID").expect("audited batch ID required");
-        audit_completed_lan_batch(&batch_id, "54af5cba-f122-4ee4-9a96-3cc7189c089c");
+        audit_completed_lan_batch(&batch_id, "00000000-0000-4000-8000-00000000001e");
     }
 
     #[test]
@@ -5782,7 +5942,7 @@ mod tests {
         assert!(project.id > 1_000_000_000);
         assert_eq!(project.host_ids, [1, 2]);
         let mut baseline = Vec::new();
-        for (id, address) in [(1, "192.168.63.129"), (2, "192.168.63.130")] {
+        for (id, address) in [(1, "192.0.2.129"), (2, "192.0.2.130")] {
             let host = hosts.iter().find(|host| host.id == id).unwrap();
             assert_eq!(host.address, address);
             let mut ids = crate::ssh::inventory(id)
@@ -5800,8 +5960,8 @@ mod tests {
             preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
         assert_eq!(preflight.targets.len(), 2);
         for (target, daemon_id) in preflight.targets.iter().zip([
-            "882622c2-a12a-4ac3-99d4-c3ab389f2641",
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+            "00000000-0000-4000-8000-000000000008",
+            "00000000-0000-4000-8000-000000000011",
         ]) {
             assert_eq!(target.docker_daemon_id, daemon_id);
             let probe = crate::release_store::TaskSnapshot {
@@ -5970,7 +6130,7 @@ mod tests {
         assert_eq!(batch.state, "complete");
         assert!(batch.targets.iter().all(|target| target.state == "healthy"));
         assert_eq!(pointers(), 2);
-        audit_completed_lan_batch(&batch_id, "54af5cba-f122-4ee4-9a96-3cc7189c089c");
+        audit_completed_lan_batch(&batch_id, "00000000-0000-4000-8000-00000000001e");
         eprintln!(
             "LAN unknown-health batch reconciled and complete: project={}, batch={}, tasks={},{}",
             project.id, batch_id, first_id, second_id
@@ -6119,8 +6279,8 @@ mod tests {
         assert_eq!(project.host_ids, [1, 2]);
         let mut baseline = Vec::new();
         for (host_id, address, daemon) in [
-            (1, "192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
-            (2, "192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
+            (1, "192.0.2.129", "00000000-0000-4000-8000-000000000008"),
+            (2, "192.0.2.130", "00000000-0000-4000-8000-000000000011"),
         ] {
             let host = crate::host_store::list()
                 .unwrap()
@@ -6146,8 +6306,8 @@ mod tests {
         let snapshot = preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
         assert_eq!(snapshot.targets.len(), 2);
         for (target, daemon) in snapshot.targets.iter().zip([
-            "882622c2-a12a-4ac3-99d4-c3ab389f2641",
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+            "00000000-0000-4000-8000-000000000008",
+            "00000000-0000-4000-8000-000000000011",
         ]) {
             assert_eq!(target.docker_daemon_id, daemon);
             let probe = crate::release_store::TaskSnapshot {
@@ -6362,8 +6522,8 @@ mod tests {
         let snapshot = preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
         let mut baselines = Vec::new();
         for (target, (address, daemon)) in snapshot.targets.iter().zip([
-            ("192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
-            ("192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
+            ("192.0.2.129", "00000000-0000-4000-8000-000000000008"),
+            ("192.0.2.130", "00000000-0000-4000-8000-000000000011"),
         ]) {
             assert_eq!(target.host.address, address);
             assert_eq!(target.docker_daemon_id, daemon);
@@ -6564,18 +6724,8 @@ mod tests {
         assert_eq!(project.host_ids, [1, 2]);
         let mut before = Vec::new();
         for (id, address, daemon, count) in [
-            (
-                1,
-                "192.168.63.129",
-                "882622c2-a12a-4ac3-99d4-c3ab389f2641",
-                36,
-            ),
-            (
-                2,
-                "192.168.63.130",
-                "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
-                28,
-            ),
+            (1, "192.0.2.129", "00000000-0000-4000-8000-000000000008", 36),
+            (2, "192.0.2.130", "00000000-0000-4000-8000-000000000011", 28),
         ] {
             let host = crate::host_store::list()
                 .unwrap()
@@ -6627,8 +6777,8 @@ mod tests {
             preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
         assert_eq!(preflight.targets.len(), 2);
         for (target, daemon_id) in preflight.targets.iter().zip([
-            "882622c2-a12a-4ac3-99d4-c3ab389f2641",
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+            "00000000-0000-4000-8000-000000000008",
+            "00000000-0000-4000-8000-000000000011",
         ]) {
             assert_eq!(target.docker_daemon_id, daemon_id);
             let probe = crate::release_store::TaskSnapshot {
@@ -6749,15 +6899,15 @@ mod tests {
         assert_eq!(batch.targets[0].state, "unknown");
         assert_eq!(batch.targets[1].state, "waiting");
         assert!(batch.targets[1].release_task_id.is_none());
-        assert_eq!(batch.targets[0].host.address, "192.168.63.129");
-        assert_eq!(batch.targets[1].host.address, "192.168.63.130");
+        assert_eq!(batch.targets[0].host.address, "192.0.2.129");
+        assert_eq!(batch.targets[1].host.address, "192.0.2.130");
         assert_eq!(
             batch.targets[0].docker_daemon_id,
-            "882622c2-a12a-4ac3-99d4-c3ab389f2641"
+            "00000000-0000-4000-8000-000000000008"
         );
         assert_eq!(
             batch.targets[1].docker_daemon_id,
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"
+            "00000000-0000-4000-8000-000000000011"
         );
         let project = crate::project_store::effective(batch.project_id).unwrap();
         assert!(
@@ -6966,7 +7116,7 @@ mod tests {
         assert!(project.id > 1_000_000_000);
         assert_eq!(project.host_ids, [1, 2]);
         let mut baseline = Vec::new();
-        for (id, address) in [(1, "192.168.63.129"), (2, "192.168.63.130")] {
+        for (id, address) in [(1, "192.0.2.129"), (2, "192.0.2.130")] {
             let host = crate::host_store::list()
                 .unwrap()
                 .0
@@ -6989,8 +7139,8 @@ mod tests {
             preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
         assert_eq!(preflight.targets.len(), 2);
         for (target, daemon_id) in preflight.targets.iter().zip([
-            "882622c2-a12a-4ac3-99d4-c3ab389f2641",
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+            "00000000-0000-4000-8000-000000000008",
+            "00000000-0000-4000-8000-000000000011",
         ]) {
             assert_eq!(target.docker_daemon_id, daemon_id);
             let probe = crate::release_store::TaskSnapshot {
@@ -7141,18 +7291,8 @@ mod tests {
         assert_eq!(project.host_ids, [1, 2]);
         let mut baseline = Vec::new();
         for (host_id, address, daemon, count) in [
-            (
-                1,
-                "192.168.63.129",
-                "882622c2-a12a-4ac3-99d4-c3ab389f2641",
-                32,
-            ),
-            (
-                2,
-                "192.168.63.130",
-                "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
-                24,
-            ),
+            (1, "192.0.2.129", "00000000-0000-4000-8000-000000000008", 32),
+            (2, "192.0.2.130", "00000000-0000-4000-8000-000000000011", 24),
         ] {
             let host = crate::host_store::list()
                 .unwrap()
@@ -7179,8 +7319,8 @@ mod tests {
         let snapshot = preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
         assert_eq!(snapshot.targets.len(), 2);
         for (target, daemon) in snapshot.targets.iter().zip([
-            "882622c2-a12a-4ac3-99d4-c3ab389f2641",
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+            "00000000-0000-4000-8000-000000000008",
+            "00000000-0000-4000-8000-000000000011",
         ]) {
             assert_eq!(target.docker_daemon_id, daemon);
             let probe = crate::release_store::TaskSnapshot {
@@ -7275,7 +7415,7 @@ mod tests {
                 .canonicalize()
                 .unwrap()
         );
-        let batch = crate::batch_store::get("0e1ffb0e-25ba-4537-a76e-a3c164ffaf0b").unwrap();
+        let batch = crate::batch_store::get("00000000-0000-4000-8000-000000000006").unwrap();
         assert_eq!(batch.project_id, 1856624454);
         assert_eq!(batch.state, "unknown");
         assert_eq!(batch.targets[0].state, "healthy");
@@ -7298,13 +7438,13 @@ mod tests {
         for (target, address, daemon) in [
             (
                 &batch.targets[0],
-                "192.168.63.129",
-                "882622c2-a12a-4ac3-99d4-c3ab389f2641",
+                "192.0.2.129",
+                "00000000-0000-4000-8000-000000000008",
             ),
             (
                 &batch.targets[1],
-                "192.168.63.130",
-                "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+                "192.0.2.130",
+                "00000000-0000-4000-8000-000000000011",
             ),
         ] {
             assert_eq!(target.host.address, address);
@@ -7342,7 +7482,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             pointers,
-            [("882622c2-a12a-4ac3-99d4-c3ab389f2641".into(), first.id)]
+            [("00000000-0000-4000-8000-000000000008".into(), first.id)]
         );
     }
 
@@ -7398,7 +7538,7 @@ mod tests {
         assert!(project.id > 1_000_000_000);
         assert_eq!(project.host_ids, [1, 2]);
         let mut baseline = Vec::new();
-        for (id, address) in [(1, "192.168.63.129"), (2, "192.168.63.130")] {
+        for (id, address) in [(1, "192.0.2.129"), (2, "192.0.2.130")] {
             let host = crate::host_store::list()
                 .unwrap()
                 .0
@@ -7421,8 +7561,8 @@ mod tests {
             preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
         assert_eq!(preflight.targets.len(), 2);
         for (target, daemon_id) in preflight.targets.iter().zip([
-            "882622c2-a12a-4ac3-99d4-c3ab389f2641",
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+            "00000000-0000-4000-8000-000000000008",
+            "00000000-0000-4000-8000-000000000011",
         ]) {
             assert_eq!(target.docker_daemon_id, daemon_id);
             let probe = crate::release_store::TaskSnapshot {
@@ -7548,12 +7688,12 @@ mod tests {
                 .canonicalize()
                 .unwrap()
         );
-        let proxy = CutOnceSshProxy::new("192.168.63.130:22");
+        let proxy = CutOnceSshProxy::new("192.0.2.130:22");
         let conn = crate::database::connect().unwrap();
         assert_eq!(
             conn.execute(
                 "UPDATE hosts SET address = '127.0.0.1', port = ?1
-                 WHERE id = 2 AND address = '192.168.63.130' AND port = 22",
+                 WHERE id = 2 AND address = '192.0.2.130' AND port = 22",
                 [proxy.port],
             )
             .unwrap(),
@@ -7591,16 +7731,16 @@ mod tests {
         assert_eq!(project.host_ids, [1, 2]);
         let tag = format!("lannetcut{}", uuid::Uuid::new_v4().simple());
         let plan = preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
-        assert_eq!(plan.targets[0].host.address, "192.168.63.129");
+        assert_eq!(plan.targets[0].host.address, "192.0.2.129");
         assert_eq!(plan.targets[1].host.address, "127.0.0.1");
         assert_eq!(plan.targets[1].host.port, proxy.port);
         assert_eq!(
             plan.targets[0].docker_daemon_id,
-            "882622c2-a12a-4ac3-99d4-c3ab389f2641"
+            "00000000-0000-4000-8000-000000000008"
         );
         assert_eq!(
             plan.targets[1].docker_daemon_id,
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"
+            "00000000-0000-4000-8000-000000000011"
         );
         let mut baselines = Vec::new();
         for target in &plan.targets {
@@ -7772,7 +7912,7 @@ mod tests {
                 .canonicalize()
                 .unwrap()
         );
-        let batch_id = "2104580a-6470-4c36-9643-8e1415822f64";
+        let batch_id = "00000000-0000-4000-8000-000000000010";
         let before = crate::batch_store::get(batch_id).unwrap();
         assert_eq!(before.project_id, 1856624458);
         assert_eq!(before.state, "complete");
@@ -7782,10 +7922,10 @@ mod tests {
                 .iter()
                 .all(|target| target.state == "healthy")
         );
-        assert_eq!(before.targets[1].host.address, "192.168.63.130");
+        assert_eq!(before.targets[1].host.address, "192.0.2.130");
         assert_eq!(
             before.targets[1].docker_daemon_id,
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"
+            "00000000-0000-4000-8000-000000000011"
         );
         let current_id = before.targets[1].release_task_id.as_ref().unwrap();
         let current = crate::release_store::get_task(current_id).unwrap();
@@ -7917,8 +8057,8 @@ mod tests {
         let plan = preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
         let mut baselines = Vec::new();
         for (target, (address, daemon)) in plan.targets.iter().zip([
-            ("192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
-            ("192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
+            ("192.0.2.129", "00000000-0000-4000-8000-000000000008"),
+            ("192.0.2.130", "00000000-0000-4000-8000-000000000011"),
         ]) {
             assert_eq!(target.host.address, address);
             assert_eq!(target.docker_daemon_id, daemon);
@@ -8130,8 +8270,8 @@ mod tests {
         let plan = preflight_batch(project.id, &tag, Arc::new(AtomicBool::new(false))).unwrap();
         let mut baselines = Vec::new();
         for (target, (address, daemon)) in plan.targets.iter().zip([
-            ("192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
-            ("192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
+            ("192.0.2.129", "00000000-0000-4000-8000-000000000008"),
+            ("192.0.2.130", "00000000-0000-4000-8000-000000000011"),
         ]) {
             assert_eq!(target.host.address, address);
             assert_eq!(target.docker_daemon_id, daemon);
@@ -8313,7 +8453,7 @@ mod tests {
             assert!(warning.is_none());
         }
         let mut baseline = Vec::new();
-        for (id, address) in [(1, "192.168.63.129"), (2, "192.168.63.130")] {
+        for (id, address) in [(1, "192.0.2.129"), (2, "192.0.2.130")] {
             let host = crate::host_store::list()
                 .unwrap()
                 .0
@@ -8352,8 +8492,8 @@ mod tests {
         assert_eq!(preflight.targets.len(), 2);
         assert_ne!(preflight.env_files[0], preflight.env_files[1]);
         for (target, daemon_id) in preflight.targets.iter().zip([
-            "882622c2-a12a-4ac3-99d4-c3ab389f2641",
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6",
+            "00000000-0000-4000-8000-000000000008",
+            "00000000-0000-4000-8000-000000000011",
         ]) {
             assert_eq!(target.docker_daemon_id, daemon_id);
             let probe = crate::release_store::TaskSnapshot {
@@ -8432,7 +8572,7 @@ mod tests {
         assert_eq!(
             pointers(),
             vec![(
-                "882622c2-a12a-4ac3-99d4-c3ab389f2641".into(),
+                "00000000-0000-4000-8000-000000000008".into(),
                 first_id.clone()
             )]
         );
@@ -8488,7 +8628,7 @@ mod tests {
         assert_eq!(
             pointers(),
             vec![(
-                "882622c2-a12a-4ac3-99d4-c3ab389f2641".into(),
+                "00000000-0000-4000-8000-000000000008".into(),
                 first_id.clone()
             )]
         );
@@ -8579,8 +8719,8 @@ mod tests {
         );
         let mut baseline = Vec::new();
         for (target, (address, daemon)) in plan.targets.iter().zip([
-            ("192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
-            ("192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
+            ("192.0.2.130", "00000000-0000-4000-8000-000000000011"),
+            ("192.0.2.129", "00000000-0000-4000-8000-000000000008"),
         ]) {
             assert_eq!(target.host.address, address);
             assert_eq!(target.docker_daemon_id, daemon);
@@ -8715,10 +8855,10 @@ mod tests {
         assert_eq!(batch.targets.len(), 2);
         assert_eq!(batch.targets[0].state, "healthy");
         assert_eq!(batch.targets[1].state, "failed");
-        assert_eq!(batch.targets[1].host.address, "192.168.63.130");
+        assert_eq!(batch.targets[1].host.address, "192.0.2.130");
         assert_eq!(
             batch.targets[1].docker_daemon_id,
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"
+            "00000000-0000-4000-8000-000000000011"
         );
         let project = crate::project_store::effective(batch.project_id).unwrap();
         assert!(
@@ -8789,7 +8929,7 @@ mod tests {
         assert_eq!(
             pointers,
             [(
-                "882622c2-a12a-4ac3-99d4-c3ab389f2641".into(),
+                "00000000-0000-4000-8000-000000000008".into(),
                 first_id.clone()
             )]
         );
@@ -8820,12 +8960,12 @@ mod tests {
                 .canonicalize()
                 .unwrap()
         );
-        let task = crate::release_store::get_task("75b10830-affe-4d8f-85e1-c4a8d9b0f4e5").unwrap();
+        let task = crate::release_store::get_task("00000000-0000-4000-8000-000000000026").unwrap();
         assert_eq!(task.project_id, 1856624449);
-        assert_eq!(task.host.address, "192.168.63.129");
+        assert_eq!(task.host.address, "192.0.2.129");
         assert_eq!(
             task.docker_daemon_id.as_deref(),
-            Some("882622c2-a12a-4ac3-99d4-c3ab389f2641")
+            Some("00000000-0000-4000-8000-000000000008")
         );
         let error = crate::ssh::verify_start_completed(&task).unwrap_err();
         assert!(error.contains("标记"), "{error}");
@@ -8861,15 +9001,15 @@ mod tests {
         assert_eq!(batch.targets[0].state, "unknown");
         assert_eq!(batch.targets[1].state, "waiting");
         assert!(batch.targets[1].release_task_id.is_none());
-        assert_eq!(batch.targets[0].host.address, "192.168.63.129");
-        assert_eq!(batch.targets[1].host.address, "192.168.63.130");
+        assert_eq!(batch.targets[0].host.address, "192.0.2.129");
+        assert_eq!(batch.targets[1].host.address, "192.0.2.130");
         assert_eq!(
             batch.targets[0].docker_daemon_id,
-            "882622c2-a12a-4ac3-99d4-c3ab389f2641"
+            "00000000-0000-4000-8000-000000000008"
         );
         assert_eq!(
             batch.targets[1].docker_daemon_id,
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"
+            "00000000-0000-4000-8000-000000000011"
         );
         let project = crate::project_store::effective(batch.project_id).unwrap();
         assert!(
@@ -9059,8 +9199,8 @@ mod tests {
         assert_eq!(project.host_ids, [1, 2]);
         let hosts = crate::host_store::list().unwrap().0;
         assert_eq!(hosts.len(), 2);
-        assert_eq!(hosts[0].address, "192.168.63.130");
-        assert_eq!(hosts[1].address, "192.168.63.129");
+        assert_eq!(hosts[0].address, "192.0.2.130");
+        assert_eq!(hosts[1].address, "192.0.2.129");
         let reservation: (String, String, i64) = conn
             .query_row(
                 "SELECT name, path, manifest_mode FROM projects WHERE id = ?1",
@@ -9400,6 +9540,7 @@ mod tests {
             project_id: 1,
             config_sha256: "digest".into(),
             parallelism: 2,
+            registry_mode: false,
             state: "unknown".into(),
             created_at: String::new(),
             images: vec![],

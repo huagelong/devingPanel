@@ -346,7 +346,15 @@ fn validate_in(conn: &Connection, intent: &Intent) -> Result<(), String> {
 }
 
 pub fn create(intent: &Intent) -> Result<(), String> {
-    create_in(&connect()?, intent)
+    let result = create_in(&connect()?, intent);
+    crate::audit::record(
+        "rollback",
+        "project",
+        intent.project_id,
+        "prepared",
+        result.is_ok(),
+    );
+    result
 }
 
 fn advance_in(conn: &Connection, id: &str, from: Phase, to: Phase) -> Result<(), String> {
@@ -643,7 +651,9 @@ pub fn complete(
     healthy: bool,
     observed: &[crate::ssh::ObservedContainer],
 ) -> Result<(), String> {
-    complete_in(&connect()?, id, healthy, observed)
+    let result = complete_in(&connect()?, id, healthy, observed);
+    crate::audit::record("rollback", "task", id, "checked", result.is_ok() && healthy);
+    result
 }
 
 fn reconcile_in(

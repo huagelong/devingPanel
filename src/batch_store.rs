@@ -34,6 +34,7 @@ pub struct BatchRecord {
     pub project_id: i64,
     pub config_sha256: String,
     pub parallelism: usize,
+    pub registry_mode: bool,
     pub state: String,
     pub created_at: String,
     pub images: Vec<BatchImageRecord>,
@@ -166,10 +167,27 @@ fn create_with_parallel_in(
         return Err("批次目标主机数量已变化。".into());
     }
     let id = uuid::Uuid::new_v4().to_string();
+    let registry: Option<String> = tx
+        .query_row(
+            "SELECT address FROM registry_settings WHERE id = 1 AND enabled = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some(address) = &registry
+        && plan
+            .plan
+            .builds
+            .iter()
+            .any(|image| !image.reference.starts_with(&format!("{address}/")))
+    {
+        return Err("镜像仓库模式要求所有构建镜像名以 Registry 地址开头。".into());
+    }
     tx.execute(
-        "INSERT INTO release_batches (id, project_id, config_sha256, parallelism, state)
-         VALUES (?1, ?2, ?3, ?4, 'prepared')",
-        params![id, project_id, plan.config_sha256, parallelism as i64],
+        "INSERT INTO release_batches (id, project_id, config_sha256, parallelism, state, registry_mode)
+         VALUES (?1, ?2, ?3, ?4, 'prepared', ?5)",
+        params![id, project_id, plan.config_sha256, parallelism as i64, registry.is_some()],
     )
     .map_err(|_| "项目已有未完成或待核实的批次。".to_owned())?;
     for build in &plan.plan.builds {
@@ -210,6 +228,61 @@ fn create_with_parallel_in(
     Ok(id)
 }
 
+pub fn registry_mode(batch_id: &str) -> Result<bool, String> {
+    let conn = connect()?;
+    conn.query_row(
+        "SELECT registry_mode FROM release_batches WHERE id = ?1",
+        [batch_id],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
+}
+
+pub fn mark_unknown_registry_push(batch_id: &str) -> Result<(), String> {
+    let conn = connect()?;
+    mark_unknown_registry_push_in(&conn, batch_id)
+}
+
+pub fn acknowledge_unknown_registry_push(batch_id: &str) -> Result<(), String> {
+    let mut conn = connect()?;
+    acknowledge_unknown_registry_push_in(&mut conn, batch_id)
+}
+
+fn acknowledge_unknown_registry_push_in(
+    conn: &mut Connection,
+    batch_id: &str,
+) -> Result<(), String> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let changed = tx.execute(
+        "UPDATE release_batches SET state = 'terminated', updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?1 AND state = 'unknown' AND registry_mode = 1
+           AND NOT EXISTS (SELECT 1 FROM release_batch_targets
+                           WHERE batch_id = ?1 AND (state != 'waiting' OR release_task_id IS NOT NULL))",
+        [batch_id],
+    ).map_err(|error| error.to_string())?;
+    if changed != 1 {
+        return Err("批次状态或目标任务已变化，不能结束镜像仓库推送核对。".into());
+    }
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn mark_unknown_registry_push_in(conn: &Connection, batch_id: &str) -> Result<(), String> {
+    let changed = conn
+        .execute(
+            "UPDATE release_batches SET state = 'unknown', updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?1 AND state = 'building' AND registry_mode = 1",
+            [batch_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err("镜像推送结果不确定，批次状态无法保存。".into())
+    }
+}
+
 #[allow(dead_code)] // Batch execution remains disabled until per-host release intents are atomic.
 pub fn create(project_id: i64, plan: &BatchPreflight) -> Result<String, String> {
     create_with_parallel(project_id, plan, 1)
@@ -225,7 +298,9 @@ pub fn create_with_parallel(
         plan,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )?;
-    create_with_parallel_in(&connect()?, project_id, plan, parallelism)
+    crate::host_store::with_credential_lock(|| {
+        create_with_parallel_in(&connect()?, project_id, plan, parallelism)
+    })
 }
 
 fn begin_build_in(conn: &Connection, id: &str) -> Result<(), String> {
@@ -827,9 +902,9 @@ fn recent_in(conn: &Connection, project_id: Option<i64>) -> Result<Vec<BatchReco
 fn get_in(conn: &Connection, id: &str) -> Result<BatchRecord, String> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)
         .map_err(|err| err.to_string())?;
-    let (project_id, config_sha256, parallelism, state, created_at) = tx
+    let (project_id, config_sha256, parallelism, registry_mode, state, created_at) = tx
         .query_row(
-            "SELECT project_id, config_sha256, parallelism, state, created_at
+            "SELECT project_id, config_sha256, parallelism, registry_mode, state, created_at
              FROM release_batches WHERE id = ?1",
             [id],
             |row| {
@@ -839,6 +914,7 @@ fn get_in(conn: &Connection, id: &str) -> Result<BatchRecord, String> {
                     row.get::<_, i64>(2)? as usize,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )
@@ -924,6 +1000,7 @@ fn get_in(conn: &Connection, id: &str) -> Result<BatchRecord, String> {
         project_id,
         config_sha256,
         parallelism,
+        registry_mode,
         state,
         created_at,
         images,
@@ -934,9 +1011,10 @@ fn get_in(conn: &Connection, id: &str) -> Result<BatchRecord, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        begin_build_in, close_pretransfer_in, create_in, get_in, interrupted_projects_in,
-        mark_interrupted_in, ready_in, recent_in, record_archive_in, retry_failed_in,
-        skip_failed_in, terminate_resolved_in, terminate_unstarted_in,
+        acknowledge_unknown_registry_push_in, begin_build_in, close_pretransfer_in, create_in,
+        get_in, interrupted_projects_in, mark_interrupted_in, mark_unknown_registry_push_in,
+        ready_in, recent_in, record_archive_in, retry_failed_in, skip_failed_in,
+        terminate_resolved_in, terminate_unstarted_in,
     };
     use crate::database::initialize;
     use crate::host_store::Host;
@@ -946,6 +1024,37 @@ mod tests {
     };
     use rusqlite::Connection;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn uncertain_registry_push_keeps_batch_open_for_review() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO release_batches (id, project_id, config_sha256, state, registry_mode)
+             VALUES ('registry-batch', 1, 'digest', 'building', 1);",
+        )
+        .unwrap();
+        mark_unknown_registry_push_in(&conn, "registry-batch").unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM release_batches WHERE id = 'registry-batch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "unknown");
+        assert!(terminate_unstarted_in(&conn, "registry-batch").is_err());
+        acknowledge_unknown_registry_push_in(&mut conn, "registry-batch").unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM release_batches WHERE id = 'registry-batch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "terminated");
+        assert!(acknowledge_unknown_registry_push_in(&mut conn, "registry-batch").is_err());
+    }
 
     #[test]
     fn retry_preserves_failed_attempt_and_checks_current_task() {

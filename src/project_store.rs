@@ -2,6 +2,7 @@ use crate::database::connect;
 use crate::env_store;
 use crate::host_store::with_credential_lock;
 use crate::project_config;
+use crate::release_materials;
 use rusqlite::{Connection, Row, Transaction, TransactionBehavior, params};
 use std::path::{Component, Path, PathBuf};
 
@@ -84,6 +85,19 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
         manifest_mode: row.get::<_, i64>(8)? != 0,
         config_error: None,
     })
+}
+
+fn next_project_id(conn: &Connection) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(id), 0) + 1 FROM (
+         SELECT id FROM projects
+         UNION ALL SELECT project_id FROM release_tasks
+         UNION ALL SELECT project_id FROM release_batches
+         UNION ALL SELECT project_id FROM rollback_tasks)",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|err| err.to_string())
 }
 
 fn list_in(conn: &Connection) -> rusqlite::Result<Vec<Project>> {
@@ -171,6 +185,9 @@ pub fn list() -> Result<Vec<Project>, String> {
 }
 
 pub fn effective(id: i64) -> Result<Project, String> {
+    if crate::backup::needs_review(id)? {
+        return Err("恢复后的项目尚未确认配置，请核对路径、构建参数、环境变量及主机凭据。".into());
+    }
     let project = list()?
         .into_iter()
         .find(|project| project.id == id)
@@ -316,15 +333,16 @@ fn create_from_manifest_in(
     let manifest = project_config::load(&root)?;
     let host_ids = project_config::resolve_targets(&manifest, hosts).ok();
     let path = root.to_string_lossy().into_owned();
-    let transaction = conn
-        .unchecked_transaction()
+    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|err| err.to_string())?;
+    let id = next_project_id(&transaction)?;
     let changed = transaction
         .execute(
-            "INSERT INTO projects (name, path, dockerfile, image, tag_rule, platform, service, manifest_mode)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, 1
-             WHERE NOT EXISTS (SELECT 1 FROM projects WHERE name = ?1 OR path = ?2)",
+            "INSERT INTO projects (id, name, path, dockerfile, image, tag_rule, platform, service, manifest_mode)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1
+             WHERE NOT EXISTS (SELECT 1 FROM projects WHERE name = ?2 OR path = ?3)",
             params![
+                id,
                 manifest.name,
                 path,
                 manifest.dockerfile,
@@ -338,7 +356,6 @@ fn create_from_manifest_in(
     if changed == 0 {
         return Err("同名项目或项目目录已存在，请打开现有项目。".into());
     }
-    let id = transaction.last_insert_rowid();
     if let Some(host_ids) = host_ids {
         for (ordinal, host_id) in host_ids.into_iter().enumerate() {
             transaction
@@ -392,18 +409,22 @@ fn create_in(conn: &Connection, input: NewProject) -> Result<Project, String> {
     } else {
         String::new()
     };
-    let changed = conn
+    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|err| err.to_string())?;
+    let id = next_project_id(&transaction)?;
+    let changed = transaction
         .execute(
-            "INSERT INTO projects (name, path, dockerfile, image)
-         SELECT ?1, ?2, ?3, ?4 WHERE NOT EXISTS (SELECT 1 FROM projects WHERE name = ?1)",
-            params![input.name, input.path, input.dockerfile, image],
+            "INSERT INTO projects (id, name, path, dockerfile, image)
+         SELECT ?1, ?2, ?3, ?4, ?5 WHERE NOT EXISTS (SELECT 1 FROM projects WHERE name = ?2)",
+            params![id, input.name, input.path, input.dockerfile, image],
         )
         .map_err(|err| err.to_string())?;
     if changed == 0 {
         return Err("项目名已存在。".into());
     }
+    transaction.commit().map_err(|err| err.to_string())?;
     Ok(Project {
-        id: conn.last_insert_rowid(),
+        id,
         name: input.name,
         path: input.path,
         dockerfile: input.dockerfile,
@@ -508,7 +529,15 @@ pub fn set_hosts(id: i64, host_ids: Vec<i64>) -> Result<(Project, Option<String>
 }
 
 pub fn create(input: NewProject) -> Result<Project, String> {
-    create_in(&connect()?, input)
+    let result = create_in(&connect()?, input);
+    crate::audit::record(
+        "create",
+        "project",
+        result.as_ref().map_or(0, |project| project.id),
+        "completed",
+        result.is_ok(),
+    );
+    result
 }
 
 fn update_in(conn: &Connection, id: i64, input: NewProject) -> Result<Project, String> {
@@ -551,44 +580,45 @@ fn update_in(conn: &Connection, id: i64, input: NewProject) -> Result<Project, S
 }
 
 pub fn update(id: i64, input: NewProject) -> Result<Project, String> {
-    update_in(&connect()?, id, input)
+    let result = update_in(&connect()?, id, input);
+    crate::audit::record("update", "project", id, "completed", result.is_ok());
+    result
 }
 
 fn delete_in(conn: &Connection, id: i64) -> Result<(), String> {
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|err| err.to_string())?;
-    let batch_history: i64 = transaction
+    let active_batches: i64 = transaction
         .query_row(
-            "SELECT COUNT(*) FROM release_batches WHERE project_id = ?1",
+            "SELECT COUNT(*) FROM release_batches WHERE project_id = ?1
+             AND state IN ('prepared', 'building', 'ready', 'running')",
             [id],
             |row| row.get(0),
         )
         .map_err(|err| err.to_string())?;
-    if batch_history != 0 {
-        return Err("项目有发布批次历史，不能删除或复用项目 ID。".into());
+    if active_batches != 0 {
+        return Err("项目有正在发布的批次，不能删除。".into());
     }
     let unresolved: i64 = transaction
         .query_row(
-            "SELECT COUNT(*) FROM release_tasks WHERE project_id = ?1 AND (
-            outcome IN ('running', 'unknown', 'blocked')
-            OR (outcome = 'complete' AND health_result = 'healthy'))",
+            "SELECT COUNT(*) FROM release_tasks WHERE project_id = ?1 AND outcome = 'running'",
             [id],
             |row| row.get(0),
         )
         .map_err(|err| err.to_string())?;
     if unresolved != 0 {
-        return Err("项目有未核实任务或已完成的受保护版本，不能删除。".into());
+        return Err("项目有正在执行的发布任务，不能删除。".into());
     }
     let rollback_active: i64 = transaction
         .query_row(
             "SELECT COUNT(*) FROM rollback_tasks WHERE project_id = ?1
-         AND outcome IN ('running', 'unknown', 'blocked')",
+         AND outcome = 'running'",
             [id],
             |row| row.get(0),
         )
         .map_err(|err| err.to_string())?;
     if rollback_active != 0 {
-        return Err("项目有待核实的回滚任务，不能删除。".into());
+        return Err("项目有正在执行的回滚任务，不能删除。".into());
     }
     env_store::queue_for_project(&transaction, id).map_err(|err| err.to_string())?;
     if transaction
@@ -603,8 +633,11 @@ fn delete_in(conn: &Connection, id: i64) -> Result<(), String> {
 }
 
 pub fn delete(id: i64) -> Result<Option<String>, String> {
+    let _guard = release_materials::acquire_guard(id)?;
     let conn = connect()?;
-    with_credential_lock(|| delete_in(&conn, id))?;
+    let result = with_credential_lock(|| delete_in(&conn, id));
+    crate::audit::record("delete", "project", id, "completed", result.is_ok());
+    result?;
     Ok(env_store::cleanup_pending().unwrap_or_else(Some))
 }
 
@@ -925,7 +958,33 @@ mod tests {
             [],
         )
         .unwrap();
-        assert!(delete_in(&conn, 7).is_err());
+        conn.execute(
+            "INSERT INTO release_tasks (id, project_id, host_id, project_name, host_name, host_address,
+             host_port, host_username, host_auth, host_fingerprint, image_reference, platform,
+             config_sha256, phase, outcome)
+             VALUES ('unknown-task', 7, 1, 'app', 'host', 'host.example', 22, 'root', 'password',
+             'SHA256:known', 'app:v1', 'linux/amd64', ?1, 'uploading', 'unknown')",
+            ["a".repeat(64)],
+        )
+        .unwrap();
+        delete_in(&conn, 7).unwrap();
+        assert_eq!(super::next_project_id(&conn).unwrap(), 8);
+        let history: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM release_batches WHERE project_id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history, 1);
+        let tasks: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM release_tasks WHERE project_id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tasks, 1);
     }
 
     #[test]
@@ -1092,22 +1151,16 @@ mod tests {
              host_port, host_username, host_auth, host_fingerprint, image_reference, platform,
              config_sha256, phase, outcome)
              VALUES ('task', ?1, 5, 'app', 'host', 'host.example', 22, 'root', 'password',
-             'SHA256:known', 'app:v1', 'linux/amd64', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'loading', 'unknown')",
+             'SHA256:known', 'app:v1', 'linux/amd64', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'loading', 'running')",
             [first.id],
         ).unwrap();
         assert!(delete_in(&conn, first.id).is_err());
         conn.execute(
-            "UPDATE release_tasks SET outcome = 'failed' WHERE id = 'task'",
+            "UPDATE release_tasks SET outcome = 'unknown' WHERE id = 'task'",
             [],
         )
         .unwrap();
         conn.execute("UPDATE release_tasks SET phase = 'checked', outcome = 'complete', health_result = 'healthy' WHERE id = 'task'", []).unwrap();
-        assert!(delete_in(&conn, first.id).is_err());
-        conn.execute(
-            "UPDATE release_tasks SET outcome = 'failed' WHERE id = 'task'",
-            [],
-        )
-        .unwrap();
         delete_in(&conn, first.id).unwrap();
         assert_eq!(list_in(&conn).unwrap()[0].id, other.id);
         let relations: i64 = conn
@@ -1124,6 +1177,18 @@ mod tests {
                 .unwrap(),
             0
         );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM release_tasks WHERE project_id = ?1",
+                [first.id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        delete_in(&conn, other.id).unwrap();
+        let replacement = create_in(&conn, draft("replacement")).unwrap();
+        assert!(replacement.id > first.id);
         fs::remove_file(directory.join("Dockerfile")).unwrap();
         fs::remove_file(new_directory.join("Dockerfile")).unwrap();
         fs::remove_file(new_directory.join("compose.yml")).unwrap();
@@ -1459,7 +1524,7 @@ mod tests {
             [("A".into(), "1".into()), ("B".into(), "2".into())]
         );
         assert_eq!(list_in(&reopened).unwrap()[0].service, "web");
-        reopened.pragma_update(None, "user_version", 34).unwrap();
+        reopened.pragma_update(None, "user_version", 38).unwrap();
         assert!(initialize(&reopened).is_err());
         drop(reopened);
         set_compose_files_in(
@@ -1522,7 +1587,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 37);
         let project = &list_in(&conn).unwrap()[0];
         assert_eq!(project.image, "repo/app");
         assert_eq!(project.platform, "linux/arm64");

@@ -213,8 +213,12 @@ pub fn recent(project_id: Option<i64>) -> Result<Vec<TaskSnapshot>, String> {
         .map_err(|err| err.to_string())
 }
 
-fn retention_plan_in(conn: &Connection, project_id: i64) -> Result<RetentionPlan, String> {
-    if project_id <= 0 {
+fn retention_plan_with_keep_in(
+    conn: &Connection,
+    project_id: i64,
+    keep_count: u8,
+) -> Result<RetentionPlan, String> {
+    if project_id <= 0 || keep_count == 0 {
         return Err("项目 ID 无效。".into());
     }
     let rows = conn
@@ -244,7 +248,16 @@ fn retention_plan_in(conn: &Connection, project_id: i64) -> Result<RetentionPlan
             |row| row.get(0),
         )
         .map_err(|err| err.to_string())?;
+    let batch_active: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM release_batches WHERE project_id = ?1
+             AND state IN ('prepared', 'building', 'ready', 'running', 'paused', 'unknown')",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(|err| err.to_string())?;
     let unresolved = rollback_active != 0
+        || batch_active != 0
         || rows
             .iter()
             .any(|row| matches!(row.4.as_str(), "running" | "unknown" | "blocked"));
@@ -271,16 +284,41 @@ fn retention_plan_in(conn: &Connection, project_id: i64) -> Result<RetentionPlan
         }) {
             continue;
         }
-        let predecessor: Option<String> = conn
-            .query_row(
-                "SELECT predecessor_task_id FROM release_predecessors WHERE task_id = ?1",
-                [&id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|err| err.to_string())?
-            .flatten();
-        current.insert(daemon, (id, predecessor));
+        let mut chain = Vec::new();
+        let mut next = Some(id);
+        let mut complete = true;
+        while let Some(task_id) = next {
+            if chain.contains(&task_id)
+                || !rows.iter().any(|row| {
+                    row.0 == task_id
+                        && row.1.is_some()
+                        && row.2.as_deref() == Some(daemon.as_str())
+                        && row.3 == "checked"
+                        && row.4 == "complete"
+                        && row.5.as_deref() == Some("healthy")
+                })
+            {
+                complete = false;
+                break;
+            }
+            chain.push(task_id.clone());
+            match conn
+                .query_row(
+                    "SELECT predecessor_task_id FROM release_predecessors WHERE task_id = ?1",
+                    [&task_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|err| err.to_string())?
+            {
+                Some(predecessor) => next = predecessor,
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        current.insert(daemon, (chain, complete));
     }
     let entries = rows
         .into_iter()
@@ -294,13 +332,19 @@ fn retention_plan_in(conn: &Connection, project_id: i64) -> Result<RetentionPlan
                 && daemon.is_some()
             {
                 match daemon.as_ref().and_then(|daemon| current.get(daemon)) {
-                    Some((current_id, predecessor)) => {
-                        if task_id == *current_id {
+                    Some((chain, complete)) => {
+                        if chain.first() == Some(&task_id) {
                             RetentionClass::LatestCompleted
-                        } else if predecessor.as_deref() == Some(task_id.as_str()) {
+                        } else if chain
+                            .iter()
+                            .take(keep_count as usize)
+                            .any(|id| id == &task_id)
+                        {
                             RetentionClass::PreviousCompleted
-                        } else {
+                        } else if *complete && chain.iter().any(|id| id == &task_id) {
                             RetentionClass::HistoricalReview
+                        } else {
+                            RetentionClass::UncertainHistory
                         }
                     }
                     _ => RetentionClass::UncertainHistory,
@@ -317,8 +361,17 @@ fn retention_plan_in(conn: &Connection, project_id: i64) -> Result<RetentionPlan
     })
 }
 
+#[cfg(test)]
+fn retention_plan_in(conn: &Connection, project_id: i64) -> Result<RetentionPlan, String> {
+    retention_plan_with_keep_in(conn, project_id, 2)
+}
+
 pub fn retention_plan(project_id: i64) -> Result<RetentionPlan, String> {
-    retention_plan_in(&connect()?, project_id)
+    retention_plan_with_keep_in(
+        &connect()?,
+        project_id,
+        crate::retention::load()?.keep_count,
+    )
 }
 
 pub fn get_unresolved(id: &str) -> Result<TaskSnapshot, String> {
@@ -897,7 +950,15 @@ fn create_with_batch_in(
 }
 
 pub fn create(intent: &Intent) -> Result<(), String> {
-    create_in(&connect()?, intent)
+    let result = create_in(&connect()?, intent);
+    crate::audit::record(
+        "release",
+        "project",
+        intent.project_id,
+        "prepared",
+        result.is_ok(),
+    );
+    result
 }
 
 #[allow(dead_code)] // Batch coordinator will use this after shared builds are safely retained.
@@ -1633,7 +1694,15 @@ pub fn complete_checked(
     task: &TaskSnapshot,
     observed: &[crate::ssh::ObservedContainer],
 ) -> Result<(), String> {
-    complete_checked_in(&connect()?, task, observed)
+    let result = complete_checked_in(&connect()?, task, observed);
+    crate::audit::record(
+        "release",
+        "project",
+        task.project_id,
+        "checked",
+        result.is_ok(),
+    );
+    result
 }
 
 fn reconcile_healthy_in(
@@ -3641,6 +3710,11 @@ mod tests {
                 [&draft.id]).unwrap();
             completed.push(draft.id);
         }
+        conn.execute(
+            "INSERT INTO release_predecessors (task_id, predecessor_task_id) VALUES (?1, NULL)",
+            [&completed[0]],
+        )
+        .unwrap();
         conn.execute("INSERT INTO project_current_version (project_id, task_id, docker_daemon_id) VALUES (1, ?1, 'ABC:123')",
             [&completed[1]]).unwrap();
         conn.execute(
@@ -3714,6 +3788,45 @@ mod tests {
         assert_eq!(plan.entries[0].class, RetentionClass::UncertainHistory);
         assert_eq!(plan.entries[1].class, RetentionClass::LatestCompleted);
         assert!(retention_plan_in(&conn, 0).is_err());
+    }
+
+    #[test]
+    fn retention_keeps_three_confirmed_versions_before_reclaiming_older_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        seed(&conn);
+        let mut versions = Vec::new();
+        for _ in 0..4 {
+            let draft = intent();
+            create_in(&conn, &draft).unwrap();
+            conn.execute(
+                "UPDATE release_tasks SET phase = 'checked', outcome = 'complete', health_result = 'healthy' WHERE id = ?1",
+                [&draft.id],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO release_predecessors (task_id, predecessor_task_id) VALUES (?1, ?2)",
+                rusqlite::params![draft.id, versions.last()],
+            )
+            .unwrap();
+            versions.push(draft.id);
+        }
+        conn.execute(
+            "INSERT INTO project_current_version (project_id, task_id, docker_daemon_id) VALUES (1, ?1, 'ABC:123')",
+            [&versions[3]],
+        ).unwrap();
+        let plan = super::retention_plan_with_keep_in(&conn, 1, 3).unwrap();
+        assert_eq!(
+            plan.entries
+                .iter()
+                .map(|entry| entry.class)
+                .collect::<Vec<_>>(),
+            [
+                RetentionClass::LatestCompleted,
+                RetentionClass::PreviousCompleted,
+                RetentionClass::PreviousCompleted,
+                RetentionClass::HistoricalReview,
+            ]
+        );
     }
 
     #[test]
@@ -3876,8 +3989,8 @@ mod tests {
                 .map(|entry| entry.class)
                 .collect::<Vec<_>>(),
             [
-                RetentionClass::HistoricalReview,
-                RetentionClass::HistoricalReview,
+                RetentionClass::UncertainHistory,
+                RetentionClass::UncertainHistory,
                 RetentionClass::LatestCompleted
             ]
         );
@@ -3895,7 +4008,7 @@ mod tests {
                 .map(|entry| entry.class)
                 .collect::<Vec<_>>(),
             [
-                RetentionClass::HistoricalReview,
+                RetentionClass::UncertainHistory,
                 RetentionClass::LatestCompleted,
                 RetentionClass::PreviousCompleted
             ]

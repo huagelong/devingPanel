@@ -1231,8 +1231,15 @@ async fn connect_authenticated(material: ConnectionMaterial) -> Result<Connectio
             .map_err(|_| "SSH 密码认证失败。")?
             .success(),
         "key" => {
-            let key = PrivateKey::from_openssh(material.credential.as_bytes())
-                .map_err(|_| "私钥格式无效或已加密；请使用未加密的 OpenSSH 私钥。")?;
+            let (content, passphrase) = host_store::decode_key_credential(&material.credential)?;
+            let mut key = PrivateKey::from_openssh(content.as_bytes())
+                .map_err(|_| "私钥格式无效；请使用 OpenSSH 私钥。")?;
+            if key.is_encrypted() {
+                let password = passphrase.ok_or("私钥已加密，请在主机配置中填写私钥口令。")?;
+                key = key
+                    .decrypt(&password)
+                    .map_err(|_| "私钥口令错误或无法解密。")?;
+            }
             let hash = handle
                 .best_supported_rsa_hash()
                 .await
@@ -3607,6 +3614,146 @@ pub fn historical_image_states(
         ))
 }
 
+pub struct HistoricalCleanupResult {
+    pub removed_tags: usize,
+    pub skipped_shared_tags: usize,
+}
+
+pub fn cleanup_historical_release(
+    task: &TaskSnapshot,
+    images: &[crate::release_store::HistoricalImage],
+    shared_references: &HashSet<String>,
+    may_have_changed_remote: &mut bool,
+) -> Result<HistoricalCleanupResult, String> {
+    let states = historical_image_states(task, images)?;
+    if states
+        .iter()
+        .any(|(_, state)| *state == HistoricalImageState::Changed)
+    {
+        return Err("历史镜像 tag 已指向不同镜像，禁止清理。".into());
+    }
+    let endpoint = task
+        .docker_endpoint
+        .as_deref()
+        .ok_or("旧任务缺少 Docker endpoint 快照。")?;
+    let daemon_id = task
+        .docker_daemon_id
+        .as_deref()
+        .ok_or("旧任务缺少 Docker daemon 身份快照。")?;
+    let material = material_for(&task.host)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化历史镜像清理环境。")?
+        .block_on(async {
+            let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+                .await
+                .map_err(|_| "历史镜像清理连接超时。")??;
+            checked_release_endpoint(
+                &handle,
+                ReleaseDockerIdentity {
+                    endpoint,
+                    daemon_id,
+                },
+            )
+            .await?;
+            let mut result = HistoricalCleanupResult {
+                removed_tags: 0,
+                skipped_shared_tags: 0,
+            };
+            for image in images {
+                if shared_references.contains(&image.reference) {
+                    result.skipped_shared_tags += 1;
+                    continue;
+                }
+                let reference = shell_quote(&image.reference)?;
+                let list = docker_command(
+                    endpoint,
+                    &format!("image ls --filter reference={reference} --format '{{{{.Repository}}}}:{{{{.Tag}}}}'"),
+                );
+                let listed = archive_command(&handle, &list).await?;
+                if !listed.lines().any(|line| line == image.reference) {
+                    continue;
+                }
+                let format = r#"{"Id":{{json .Id}},"Os":{{json .Os}},"Architecture":{{json .Architecture}},"RepoTags":{{json .RepoTags}}}"#;
+                let inspect = docker_command(
+                    endpoint,
+                    &format!("image inspect --format {} {reference}", shell_quote(format)?),
+                );
+                let metadata = archive_command(&handle, &inspect).await?;
+                if !historical_image_matches(&metadata, image)? {
+                    return Err("历史镜像 tag 在清理期间变化。".into());
+                }
+                let row: Value = serde_json::from_str(&metadata)
+                    .map_err(|_| "历史镜像元数据无法解析。")?;
+                let image_id = row.get("Id").and_then(Value::as_str).ok_or("历史镜像 ID 缺失。")?;
+                let tags = row.get("RepoTags").and_then(Value::as_array).ok_or("镜像 tag 清单缺失。")?;
+                if tags.len() != 1 || tags[0].as_str() != Some(&image.reference) {
+                    result.skipped_shared_tags += 1;
+                    continue;
+                }
+                let all = archive_command(
+                    &handle,
+                    &docker_command(endpoint, "ps -a --no-trunc --format '{{.ID}}'"),
+                )
+                .await?;
+                let ids: Vec<String> = all.lines().map(str::to_owned).collect();
+                if ids.len() > 100 || ids.iter().any(|id| validate_container_id(id).is_err()) {
+                    return Err("无法完整核实 daemon 上的容器引用。".into());
+                }
+                if !ids.is_empty() {
+                    let output = archive_command_with_timeout(
+                        &handle,
+                        &deployment_inspect_command(endpoint, &ids)?,
+                        Duration::from_secs(20),
+                    )
+                    .await?;
+                    if output.lines().count() != ids.len() {
+                        return Err("daemon 容器元数据不完整。".into());
+                    }
+                    for line in output.lines() {
+                        let container: Value = serde_json::from_str(line)
+                            .map_err(|_| "容器镜像引用无法解析。")?;
+                        if container.get("Image").and_then(Value::as_str) == Some(image_id)
+                            || container.get("ConfigImage").and_then(Value::as_str)
+                                == Some(&image.reference)
+                        {
+                            return Err("历史镜像仍被容器引用，暂不清理该版本。".into());
+                        }
+                    }
+                }
+                *may_have_changed_remote = true;
+                archive_command(
+                    &handle,
+                    &docker_command(endpoint, &format!("image rm -- {reference}")),
+                )
+                .await?;
+                let after = archive_command(&handle, &list).await?;
+                if after.lines().any(|line| line == image.reference) {
+                    return Err("历史镜像 tag 删除后仍存在。".into());
+                }
+                result.removed_tags += 1;
+            }
+            let home = archive_command(&handle, "sh -c 'printf %s \"$HOME\"'").await?;
+            let directory = validated_release_directory(&home, task.project_id, &task.id)?;
+            let parent = directory.rsplit_once('/').ok_or("远端发布目录无效。")?.0;
+            let quoted_parent = shell_quote(parent)?;
+            let quoted_directory = shell_quote(&directory)?;
+            let remove = format!(
+                "if test -e {quoted_directory} || test -L {quoted_directory}; then \
+                 test -d {quoted_directory} && test ! -L {quoted_directory} && \
+                 test \"$(realpath -- {quoted_parent})\" = {quoted_parent} && \
+                 test \"$(realpath -- {quoted_directory})\" = {quoted_directory} && \
+                 rm -r -- {quoted_directory}; fi; \
+                 test ! -e {quoted_directory} && test ! -L {quoted_directory}"
+            );
+            *may_have_changed_remote = true;
+            archive_command(&handle, &remove).await?;
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+            Ok(result)
+        })
+}
+
 fn inspect_deployment_state(
     output: &str,
     ids: &[String],
@@ -4441,6 +4588,137 @@ pub fn load_uploaded_archive(
         ))
 }
 
+pub fn pull_registry_image(
+    expected_host: Host,
+    identity: ReleaseDockerIdentity<'_>,
+    task_id: &str,
+    reference: &str,
+    platform: &str,
+    image_ids: &[String],
+    credentials: &crate::registry::Credentials,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let task = uuid::Uuid::parse_str(task_id).map_err(|_| "发布任务 ID 无效。")?;
+    let valid_reference = reference.rsplit_once(':').is_some_and(|(image, tag)| {
+        crate::project_store::valid_image_name(image)
+            && !tag.is_empty()
+            && tag.len() <= 128
+            && tag
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            && tag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    });
+    if !valid_reference
+        || !reference.starts_with(&format!("{}/", credentials.config.address))
+        || !matches!(platform, "linux/amd64" | "linux/arm64")
+        || image_ids.is_empty()
+        || image_ids.iter().any(|id| {
+            id.len() != 71
+                || !id.starts_with("sha256:")
+                || !id[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return Err("镜像仓库拉取目标无效。".into());
+    }
+    let material = material_for(&expected_host)?;
+    let active_auth_tasks = crate::registry::active_task_ids()?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "无法初始化远端镜像拉取环境。".to_owned())?
+        .block_on(async {
+            let handle = tokio::time::timeout(Duration::from_secs(20), trusted_handle(material))
+                .await.map_err(|_| "远端镜像拉取连接超时；临时认证目录可能残留，请核对并轮换令牌。")?
+                .map_err(|_| "远端 SSH 连接失败；临时认证目录可能残留，请核对并轮换令牌。")?;
+            let stale = archive_command(&handle,
+                "find /tmp -maxdepth 1 -mindepth 1 -type d -user \"$(id -u)\" -name 'devingpanel-auth-*' -mmin +1440 -printf '%f\\n'")
+                .await.map_err(|_| "无法核对过期的镜像仓库临时认证目录。")?;
+            for name in stale.lines() {
+                let Some(id) = name.strip_prefix("devingpanel-auth-") else { continue; };
+                if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || active_auth_tasks.contains(id) { continue; }
+                archive_command(&handle, &format!("rm -rf -- /tmp/{name}"))
+                    .await.map_err(|_| "过期的镜像仓库认证目录清理失败，请核对并轮换令牌。")?;
+            }
+            let endpoint = checked_release_endpoint(&handle, identity).await?;
+            let host_platform = linux_platform(&archive_command(&handle, "uname -m").await?);
+            let daemon_platform = archive_command(&handle,
+                &docker_command(&endpoint, "info --format '{{.OSType}}/{{.Architecture}}'"))
+                .await?;
+            let daemon_platform = match daemon_platform.trim() {
+                "linux/x86_64" | "linux/amd64" => Some("linux/amd64"),
+                "linux/aarch64" | "linux/arm64" => Some("linux/arm64"),
+                _ => None,
+            };
+            if host_platform != Some(platform) || daemon_platform != Some(platform) {
+                return Err("远端主机或 Docker 架构与镜像不一致。".into());
+            }
+            let filter = shell_quote(&format!("reference={reference}"))?;
+            let existing = archive_command(&handle, &docker_command(&endpoint,
+                &format!("image ls --filter {filter} --format '{{{{.Repository}}}}:{{{{.Tag}}}}'")))
+                .await?;
+            if existing.lines().any(|line| line == reference) {
+                return Err("远端镜像 tag 已存在，禁止覆盖。".into());
+            }
+            if cancel.load(Ordering::Relaxed) { return Err("镜像拉取已取消。".into()); }
+            let directory = format!("/tmp/devingpanel-auth-{}", task.simple());
+            let address = shell_quote(&credentials.config.address)?;
+            let username = shell_quote(&credentials.config.username)?;
+            let reference_arg = shell_quote(reference)?;
+            let script = format!(
+                "umask 077; dir={directory}; mkdir -m 700 -- \"$dir\" || exit 1; trap 'rm -rf -- \"$dir\"' EXIT HUP INT TERM; docker --config \"$dir\" login --username {username} --password-stdin {address} >/dev/null 2>&1 && chmod 600 \"$dir/config.json\" && docker --config \"$dir\" --host {endpoint} image pull {reference_arg} >/dev/null 2>&1"
+            );
+            let command = format!("sh -c {}", shell_quote(&script)?);
+            let mut channel = handle.channel_open_session().await
+                .map_err(|_| "无法打开远端镜像拉取会话。")?;
+            let pull_result = async {
+                channel.exec(true, command).await
+                    .map_err(|_| "无法启动远端镜像拉取。")?;
+                channel.data(credentials.token.as_bytes()).await
+                    .map_err(|_| "无法传递镜像仓库令牌。")?;
+                channel.eof().await.map_err(|_| "无法结束镜像仓库令牌输入。")?;
+                let mut exit = None;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(60 * 60);
+                loop {
+                    tokio::select! {
+                        _ = wait_cancel(&cancel) => return Err("远端镜像拉取已取消，结果待核实。".into()),
+                        _ = tokio::time::sleep_until(deadline) => return Err("远端镜像拉取超时，结果待核实。".into()),
+                        message = channel.wait() => match message {
+                            Some(ChannelMsg::ExitStatus { exit_status }) => exit = Some(exit_status),
+                            Some(_) => {},
+                            None => break,
+                        },
+                    }
+                }
+                if exit == Some(0) { Ok(()) } else {
+                    Err("远端镜像仓库登录或拉取失败，结果待核实。".into())
+                }
+            }.await;
+            if pull_result.is_err() { let _ = channel.close().await; }
+            let cleanup = archive_command(&handle,
+                &format!("rm -rf -- {directory} && test ! -e {directory}"))
+                .await;
+            match (pull_result, cleanup) {
+                (Ok(()), Ok(_)) => {},
+                (Err(error), Ok(_)) => return Err(error),
+                (Ok(()), Err(_)) => return Err("远端镜像已拉取，但临时认证目录清理待核实；请轮换令牌。".into()),
+                (Err(error), Err(_)) => return Err(format!("{error}；临时认证目录清理待核实，请轮换令牌。")),
+            }
+            let inspect = docker_command(&endpoint, &format!(
+                "image inspect --format '{}' {reference_arg}",
+                r#"{"Id":{{json .Id}},"Os":{{json .Os}},"Architecture":{{json .Architecture}}}"#,
+            ));
+            let result = archive_command(&handle, &inspect).await
+                .map_err(|_| "镜像拉取后无法核对元数据，结果待核实。")?;
+            verified_loaded_image(&result, image_ids, platform)?;
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+            Ok(())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -4460,17 +4738,17 @@ mod tests {
                 .canonicalize()
                 .unwrap()
         );
-        let batch_id = "17d64ab0-18f7-4d17-b881-db907a3312b3";
+        let batch_id = "00000000-0000-4000-8000-00000000000c";
         let batch = crate::batch_store::get(batch_id).unwrap();
         assert_eq!(batch.project_id, 1856624467);
         assert_eq!(batch.state, "unknown");
         assert_eq!(batch.targets[0].state, "unknown");
         assert_eq!(batch.targets[1].state, "waiting");
         let target = &batch.targets[0];
-        assert_eq!(target.host.address, "192.168.63.129");
+        assert_eq!(target.host.address, "192.0.2.129");
         assert_eq!(
             target.docker_daemon_id,
-            "882622c2-a12a-4ac3-99d4-c3ab389f2641"
+            "00000000-0000-4000-8000-000000000008"
         );
         let task_id = target.release_task_id.as_ref().unwrap();
         let task = crate::release_store::get_task(task_id).unwrap();
@@ -4491,7 +4769,7 @@ mod tests {
                 .1,
             target.docker_daemon_id
         );
-        let address: SocketAddr = "192.168.63.129:22".parse().unwrap();
+        let address: SocketAddr = "192.0.2.129:22".parse().unwrap();
         assert!(TcpStream::connect_timeout(&address, Duration::from_secs(3)).is_ok());
 
         let material = super::material_for(&target.host).unwrap();
@@ -4504,7 +4782,7 @@ mod tests {
                 let route = super::command_limited(&handle, "ip -o -4 route show default", 4096)
                     .await
                     .unwrap();
-                assert!(route.contains("dev ens33") && route.contains("src 192.168.63.129"));
+                assert!(route.contains("dev ens33") && route.contains("src 192.0.2.129"));
                 let unit = format!(
                     "devingpanel-link-restore-1856624467-{}",
                     uuid::Uuid::new_v4().simple()
@@ -4595,14 +4873,14 @@ mod tests {
                 .canonicalize()
                 .unwrap()
         );
-        let batch = crate::batch_store::get("0e1ffb0e-25ba-4537-a76e-a3c164ffaf0b").unwrap();
+        let batch = crate::batch_store::get("00000000-0000-4000-8000-000000000006").unwrap();
         assert_eq!(batch.project_id, 1856624454);
         assert_eq!(batch.state, "unknown");
         let target = &batch.targets[1];
-        assert_eq!(target.host.address, "192.168.63.130");
+        assert_eq!(target.host.address, "192.0.2.130");
         assert_eq!(
             target.docker_daemon_id,
-            "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"
+            "00000000-0000-4000-8000-000000000011"
         );
         let handle = super::trusted_handle(super::material_for(&target.host).unwrap())
             .await
@@ -5178,8 +5456,8 @@ mod tests {
         );
         let hosts = crate::host_store::list().unwrap().0;
         for (id, address, daemon) in [
-            (1, "192.168.63.129", "882622c2-a12a-4ac3-99d4-c3ab389f2641"),
-            (2, "192.168.63.130", "ac70e19f-a489-49f3-82f0-0a4ad66ca2e6"),
+            (1, "192.0.2.129", "00000000-0000-4000-8000-000000000008"),
+            (2, "192.0.2.130", "00000000-0000-4000-8000-000000000011"),
         ] {
             let host = hosts.iter().find(|host| host.id == id).unwrap().clone();
             assert_eq!(host.address, address);
