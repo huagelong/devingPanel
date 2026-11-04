@@ -2522,12 +2522,7 @@ impl AppView {
             return;
         }
         if existing.is_some_and(|project| project.manifest_mode) {
-            window.push_notification(
-                Notification::warning(
-                    "此项目由开发者维护 devingpanel.yaml，请编辑文件后重新读取。",
-                ),
-                cx,
-            );
+            self.select_project(id.unwrap(), window, cx);
             return;
         }
         self.dialog_seq = self.dialog_seq.wrapping_add(1);
@@ -2773,6 +2768,12 @@ impl AppView {
                                 .find(|project| project.id == id)
                                 .filter(|project| !project.manifest_mode)
                                 .map(|project| BuildForm::new(project, window, cx));
+                            view.manifest_form = view
+                                .projects
+                                .iter()
+                                .find(|project| project.id == id)
+                                .filter(|project| project.manifest_mode)
+                                .and_then(|project| ManifestForm::new(project, window, cx).ok());
                         }
                         if let Some(id) = view.deploy_project_id {
                             view.select_deploy_project(id, window, cx);
@@ -2826,9 +2827,12 @@ impl AppView {
                     let _ = view.update(app, |view, cx| {
                         if let Some(existing) = view.projects.iter_mut().find(|item| item.id == id)
                         {
-                            *existing = project;
+                            *existing = project.clone();
                         }
                         view.build_form = None;
+                        if view.project_id == Some(id) {
+                            view.manifest_form = ManifestForm::new(&project, window, cx).ok();
+                        }
                         view.invalidate_compose_summary();
                         if view.deploy_project_id == Some(id) {
                             view.select_deploy_project(id, window, cx);
@@ -3406,6 +3410,11 @@ impl AppView {
             self.project_id = Some(id);
             self.project_tab = ProjectTab::Build;
             self.build_form = Some(BuildForm::new(&project, window, cx));
+            self.manifest_form = if project.manifest_mode {
+                ManifestForm::new(&project, window, cx).ok()
+            } else {
+                None
+            };
             self.target_form = None;
             self.env_form = None;
             self.env_generation = self.env_generation.wrapping_add(1);
@@ -4826,69 +4835,480 @@ impl AppView {
                     .on_click(cx.listener(|view, _, window, cx| view.save_environment(window, cx))))))
     }
 
-    fn manifest_panel(&self, project: &Project) -> AnyElement {
-        if let Some(error) = &project.config_error {
+    pub(super) fn save_manifest_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.manifest_saving {
+            return;
+        }
+        let Some(form) = self.manifest_form.as_ref() else {
+            return;
+        };
+        let id = form.project_id;
+        let expected = form.source.clone();
+        let builds: Vec<crate::project_config::BuildSpec> = form
+            .builds
+            .iter()
+            .map(|row| crate::project_config::BuildSpec {
+                service: row.service.read(cx).value().to_string(),
+                dockerfile: row.dockerfile.read(cx).value().to_string(),
+                image: row.image.read(cx).value().to_string(),
+                platform: row.platform.clone(),
+                args: row
+                    .args
+                    .iter()
+                    .map(|arg| {
+                        (
+                            arg.key.read(cx).value().to_string(),
+                            arg.value.read(cx).value().to_string(),
+                        )
+                    })
+                    .collect(),
+            })
+            .collect();
+        let Some(first) = builds.first() else {
+            window.push_notification(Notification::error("至少需要一个构建服务"), cx);
+            return;
+        };
+        let manifest = crate::project_config::Manifest {
+            name: form.name.read(cx).value().to_string(),
+            tag_rule: form.tag.read(cx).value().to_string(),
+            dockerfile: first.dockerfile.clone(),
+            image: first.image.clone(),
+            platform: first.platform.clone(),
+            build_args: first.args.clone(),
+            service: first.service.clone(),
+            builds,
+            compose_files: form
+                .compose
+                .iter()
+                .map(|row| row.read(cx).value().to_string())
+                .collect(),
+            targets: form
+                .targets
+                .iter()
+                .map(|row| crate::project_config::Target {
+                    group: row.group.read(cx).value().to_string(),
+                    host: row.host.read(cx).value().to_string(),
+                })
+                .collect(),
+        };
+        self.manifest_saving = true;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { project_store::save_manifest(id, &expected, &manifest) })
+                .await;
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    view.manifest_saving = false;
+                    if let Ok(project) = &result {
+                        if let Some(existing) = view.projects.iter_mut().find(|item| item.id == id)
+                        {
+                            *existing = project.clone();
+                        }
+                        if view.project_id == Some(id) {
+                            view.manifest_form = ManifestForm::new(project, window, cx).ok();
+                            view.invalidate_compose_summary();
+                        }
+                        view.refresh_deploy_if_current(id, cx);
+                    }
+                    cx.notify();
+                });
+                match result {
+                    Ok(project) if project.config_error.is_some() => window.push_notification(
+                        Notification::warning("配置已保存；目标主机变更需管理员确认绑定"),
+                        app,
+                    ),
+                    Ok(_) => window
+                        .push_notification(Notification::success("devingpanel.yaml 已保存"), app),
+                    Err(error) => window.push_notification(Notification::error(error), app),
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn manifest_panel(&self, project: &Project, cx: &mut Context<Self>) -> AnyElement {
+        let Some(form) = self
+            .manifest_form
+            .as_ref()
+            .filter(|form| form.project_id == project.id)
+        else {
             return self
                 .panel(
                     "项目配置待修复",
-                    "请联系技术人员修复项目文件，或由管理员预先配置目标主机与凭据。",
+                    "重新读取配置后编辑。",
                     div()
                         .px_6()
                         .pb_6()
                         .text_color(self.palette().destructive)
-                        .child(error.clone()),
+                        .child(
+                            project
+                                .config_error
+                                .clone()
+                                .unwrap_or_else(|| "无法读取 devingpanel.yaml。".into()),
+                        ),
                 )
                 .into_any_element();
-        }
-        let (title, content) = match self.project_tab {
-            ProjectTab::Build => (
-                "构建配置",
-                match crate::project_config::load(std::path::Path::new(&project.path)) {
-                    Ok(manifest) => format!(
-                        "共 {} 个镜像  ·  Tag：{}  ·  {}",
-                        manifest.builds.len(),
-                        manifest.tag_rule,
-                        manifest
-                            .builds
-                            .iter()
-                            .map(|build| format!(
-                                "{}：{}  ·  {}  ·  {}",
-                                build.service, build.image, build.platform, build.dockerfile
-                            ))
-                            .collect::<Vec<_>>()
-                            .join("  /  ")
-                    ),
-                    Err(_) => "配置已变化，请重新读取项目。".into(),
-                },
-            ),
-            ProjectTab::Compose => (
-                "Compose",
-                format!("按顺序合并：{}", project.compose_files.join("  →  ")),
-            ),
-            ProjectTab::Targets => (
-                "目标主机",
-                format!(
-                    "按顺序发布：{}",
-                    project
-                        .host_ids
-                        .iter()
-                        .filter_map(|id| self
-                            .hosts
-                            .iter()
-                            .find(|host| host.id == *id)
-                            .map(|host| format!("{}/{}", host.group, host.name)))
-                        .collect::<Vec<_>>()
-                        .join("  →  ")
-                ),
-            ),
-            _ => ("项目配置", String::new()),
         };
-        self.panel(
-            title,
-            "配置由项目目录的 devingpanel.yaml 提供；此处只读。",
-            div().px_6().pb_6().whitespace_normal().child(content),
-        )
-        .into_any_element()
+        let busy = self.manifest_saving;
+        let mut content = div().px_6().pb_6().flex().flex_col().gap_4();
+        let title = match self.project_tab {
+            ProjectTab::Build => {
+                content = content.child(Self::form_field(
+                    "项目名",
+                    Input::new(&form.name).w_full().disabled(busy),
+                ));
+                content = content.child(Self::form_field(
+                    "Tag 规则",
+                    Input::new(&form.tag).w_full().disabled(busy),
+                ));
+                for (index, row) in form.builds.iter().enumerate() {
+                    let mut args = div().flex().flex_col().gap_2();
+                    for (arg_index, arg) in row.args.iter().enumerate() {
+                        args = args.child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(Input::new(&arg.key).w_full().disabled(busy)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(Input::new(&arg.value).w_full().disabled(busy)),
+                                )
+                                .child(
+                                    Button::new(("yaml-arg-delete", index * 1000 + arg_index))
+                                        .icon(assets::IconName::Trash)
+                                        .accessibility_label("删除参数")
+                                        .disabled(busy)
+                                        .on_click(cx.listener(move |view, _, _, cx| {
+                                            if let Some(row) = view
+                                                .manifest_form
+                                                .as_mut()
+                                                .and_then(|form| form.builds.get_mut(index))
+                                            {
+                                                if arg_index < row.args.len() {
+                                                    row.args.remove(arg_index);
+                                                    cx.notify();
+                                                }
+                                            }
+                                        })),
+                                ),
+                        );
+                    }
+                    content = content.child(
+                        div()
+                            .border_t_1()
+                            .border_color(self.palette().border)
+                            .pt_4()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(format!("构建 {}", index + 1))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap_1()
+                                            .child(
+                                                Button::new(("yaml-build-up", index))
+                                                    .icon(assets::IconName::ArrowUp)
+                                                    .accessibility_label("上移构建")
+                                                    .disabled(busy || index == 0)
+                                                    .on_click(cx.listener(
+                                                        move |view, _, _, cx| {
+                                                            if let Some(form) =
+                                                                view.manifest_form.as_mut()
+                                                            {
+                                                                form.builds.swap(index, index - 1);
+                                                                cx.notify();
+                                                            }
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new(("yaml-build-down", index))
+                                                    .icon(assets::IconName::ArrowDown)
+                                                    .accessibility_label("下移构建")
+                                                    .disabled(
+                                                        busy || index + 1 == form.builds.len(),
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        move |view, _, _, cx| {
+                                                            if let Some(form) =
+                                                                view.manifest_form.as_mut()
+                                                            {
+                                                                form.builds.swap(index, index + 1);
+                                                                cx.notify();
+                                                            }
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new(("yaml-build-delete", index))
+                                                    .icon(assets::IconName::Trash)
+                                                    .accessibility_label("删除构建")
+                                                    .disabled(busy || form.builds.len() == 1)
+                                                    .on_click(cx.listener(
+                                                        move |view, _, _, cx| {
+                                                            if let Some(form) =
+                                                                view.manifest_form.as_mut()
+                                                            {
+                                                                form.builds.remove(index);
+                                                                cx.notify();
+                                                            }
+                                                        },
+                                                    )),
+                                            ),
+                                    ),
+                            )
+                            .child(Self::form_field(
+                                "服务",
+                                Input::new(&row.service).w_full().disabled(busy),
+                            ))
+                            .child(Self::form_field(
+                                "Dockerfile",
+                                Input::new(&row.dockerfile).w_full().disabled(busy),
+                            ))
+                            .child(Self::form_field(
+                                "镜像名",
+                                Input::new(&row.image).w_full().disabled(busy),
+                            ))
+                            .child(Self::form_field(
+                                "目标平台",
+                                Button::new(("yaml-platform", index))
+                                    .label(row.platform.clone())
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        if let Some(row) = view
+                                            .manifest_form
+                                            .as_mut()
+                                            .and_then(|form| form.builds.get_mut(index))
+                                        {
+                                            row.platform = match row.platform.as_str() {
+                                                "auto" => "linux/amd64",
+                                                "linux/amd64" => "linux/arm64",
+                                                _ => "auto",
+                                            }
+                                            .into();
+                                            cx.notify();
+                                        }
+                                    })),
+                            ))
+                            .child("Build args（明文）")
+                            .child(args)
+                            .child(
+                                Button::new(("yaml-arg-add", index))
+                                    .label("添加参数")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |view, _, window, cx| {
+                                        if let Some(row) = view
+                                            .manifest_form
+                                            .as_mut()
+                                            .and_then(|form| form.builds.get_mut(index))
+                                        {
+                                            row.args.push(BuildArgRow {
+                                                key: cx.new(|cx| {
+                                                    InputState::new(window, cx).placeholder("KEY")
+                                                }),
+                                                value: cx.new(|cx| {
+                                                    InputState::new(window, cx).placeholder("VALUE")
+                                                }),
+                                            });
+                                            cx.notify();
+                                        }
+                                    })),
+                            ),
+                    );
+                }
+                content = content.child(
+                    Button::new("yaml-build-add")
+                        .label("添加构建")
+                        .disabled(busy || form.builds.len() >= 16)
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            if let Some(form) = view.manifest_form.as_mut() {
+                                form.builds.push(ManifestBuildRow {
+                                    service: cx.new(|cx| {
+                                        InputState::new(window, cx).placeholder("服务名")
+                                    }),
+                                    dockerfile: cx.new(|cx| {
+                                        InputState::new(window, cx).default_value("Dockerfile")
+                                    }),
+                                    image: cx.new(|cx| {
+                                        InputState::new(window, cx).placeholder("镜像名")
+                                    }),
+                                    platform: "auto".into(),
+                                    args: Vec::new(),
+                                });
+                                cx.notify();
+                            }
+                        })),
+                );
+                "构建配置"
+            }
+            ProjectTab::Compose => {
+                for (index, row) in form.compose.iter().enumerate() {
+                    content = content.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(format!("{}.", index + 1))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Input::new(row).w_full().disabled(busy)),
+                            )
+                            .child(
+                                Button::new(("yaml-compose-up", index))
+                                    .icon(assets::IconName::ArrowUp)
+                                    .accessibility_label("上移")
+                                    .disabled(busy || index == 0)
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        if let Some(form) = view.manifest_form.as_mut() {
+                                            form.compose.swap(index, index - 1);
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new(("yaml-compose-down", index))
+                                    .icon(assets::IconName::ArrowDown)
+                                    .accessibility_label("下移")
+                                    .disabled(busy || index + 1 == form.compose.len())
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        if let Some(form) = view.manifest_form.as_mut() {
+                                            form.compose.swap(index, index + 1);
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new(("yaml-compose-delete", index))
+                                    .icon(assets::IconName::Trash)
+                                    .accessibility_label("删除")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        if let Some(form) = view.manifest_form.as_mut() {
+                                            form.compose.remove(index);
+                                            cx.notify();
+                                        }
+                                    })),
+                            ),
+                    );
+                }
+                content = content.child(
+                    Button::new("yaml-compose-add")
+                        .label("添加 Compose 文件")
+                        .disabled(busy)
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            if let Some(form) = view.manifest_form.as_mut() {
+                                form.compose.push(cx.new(|cx| {
+                                    InputState::new(window, cx).placeholder("compose.yaml")
+                                }));
+                                cx.notify();
+                            }
+                        })),
+                );
+                "Compose"
+            }
+            ProjectTab::Targets => {
+                for (index, row) in form.targets.iter().enumerate() {
+                    content = content.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(format!("{}.", index + 1))
+                            .child(div().flex_1().min_w_0().child(Self::form_field(
+                                "主机组",
+                                Input::new(&row.group).w_full().disabled(busy),
+                            )))
+                            .child(div().flex_1().min_w_0().child(Self::form_field(
+                                "主机别名",
+                                Input::new(&row.host).w_full().disabled(busy),
+                            )))
+                            .child(
+                                Button::new(("yaml-target-up", index))
+                                    .icon(assets::IconName::ArrowUp)
+                                    .accessibility_label("上移")
+                                    .disabled(busy || index == 0)
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        if let Some(form) = view.manifest_form.as_mut() {
+                                            form.targets.swap(index, index - 1);
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new(("yaml-target-down", index))
+                                    .icon(assets::IconName::ArrowDown)
+                                    .accessibility_label("下移")
+                                    .disabled(busy || index + 1 == form.targets.len())
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        if let Some(form) = view.manifest_form.as_mut() {
+                                            form.targets.swap(index, index + 1);
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new(("yaml-target-delete", index))
+                                    .icon(assets::IconName::Trash)
+                                    .accessibility_label("删除")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        if let Some(form) = view.manifest_form.as_mut() {
+                                            form.targets.remove(index);
+                                            cx.notify();
+                                        }
+                                    })),
+                            ),
+                    );
+                }
+                content = content.child(
+                    Button::new("yaml-target-add")
+                        .label("添加目标主机")
+                        .disabled(busy)
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            if let Some(form) = view.manifest_form.as_mut() {
+                                form.targets.push(ManifestTargetRow {
+                                    group: cx.new(|cx| {
+                                        InputState::new(window, cx).placeholder("主机组")
+                                    }),
+                                    host: cx.new(|cx| {
+                                        InputState::new(window, cx).placeholder("主机别名")
+                                    }),
+                                });
+                                cx.notify();
+                            }
+                        })),
+                );
+                "目标主机"
+            }
+            _ => "项目配置",
+        };
+        content = content.child(
+            Button::new("yaml-save")
+                .primary()
+                .label("保存到 devingpanel.yaml")
+                .disabled(busy)
+                .on_click(cx.listener(|view, _, window, cx| view.save_manifest_form(window, cx))),
+        );
+        self.panel(title, "编辑后保存到项目目录的 devingpanel.yaml。", content)
+            .into_any_element()
     }
 
     pub(super) fn refresh_release_tasks(
@@ -7812,7 +8232,7 @@ impl AppView {
             ProjectTab::Build | ProjectTab::Compose | ProjectTab::Targets
                 if project.manifest_mode =>
             {
-                self.manifest_panel(project)
+                self.manifest_panel(project, cx)
             }
             ProjectTab::Build => self.build_panel(project, narrow, cx),
             ProjectTab::Compose => self.compose_panel(project, cx),
@@ -7848,7 +8268,7 @@ impl AppView {
                         "项目配置来源"
                     },
                     if project.manifest_mode {
-                        "开发者维护的非秘密发布方案"
+                        "由 devingPanel 编辑并保存的非秘密发布配置"
                     } else {
                         "当前为本机表单配置，可明确迁移到项目文件"
                     },

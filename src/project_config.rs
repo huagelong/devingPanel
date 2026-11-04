@@ -5,6 +5,7 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Component, Path};
+use uuid::Uuid;
 use yaml_rust2::yaml::Hash;
 use yaml_rust2::{Yaml, YamlLoader};
 
@@ -244,24 +245,13 @@ pub fn parse(source: &str) -> Result<Manifest, String> {
 
 pub fn load(root: &Path) -> Result<Manifest, String> {
     let root = root.canonicalize().map_err(|_| "项目目录不存在。")?;
-    let path = root.join(FILE_NAME);
-    let canonical = path
-        .canonicalize()
-        .map_err(|_| "项目缺少 devingpanel.yaml。")?;
-    if !canonical.starts_with(&root) || !canonical.is_file() {
-        return Err("devingpanel.yaml 必须位于项目目录内。".into());
-    }
-    let mut bytes = Vec::new();
-    File::open(canonical)
-        .map_err(|_| "无法读取 devingpanel.yaml。")?
-        .take(MAX_MANIFEST_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "无法读取 devingpanel.yaml。")?;
-    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
-        return Err("devingpanel.yaml 超过 64 KiB。".into());
-    }
-    let source = String::from_utf8(bytes).map_err(|_| "devingpanel.yaml 必须是 UTF-8。")?;
+    let source = read_source(&root)?;
     let manifest = parse(&source)?;
+    validate_files(&root, &manifest)?;
+    Ok(manifest)
+}
+
+fn validate_files(root: &Path, manifest: &Manifest) -> Result<(), String> {
     for build in &manifest.builds {
         NewProject {
             name: manifest.name.clone(),
@@ -279,7 +269,107 @@ pub fn load(root: &Path) -> Result<Manifest, String> {
             return Err(format!("Compose 文件必须位于项目目录内：{file}"));
         }
     }
-    Ok(manifest)
+    Ok(())
+}
+
+pub fn read_source(root: &Path) -> Result<String, String> {
+    let root = root.canonicalize().map_err(|_| "项目目录不存在。")?;
+    let path = root.join(FILE_NAME);
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| "项目缺少 devingpanel.yaml。")?;
+    if !canonical.starts_with(&root) || !canonical.is_file() {
+        return Err("devingpanel.yaml 必须位于项目目录内。".into());
+    }
+    let mut bytes = Vec::new();
+    File::open(canonical)
+        .map_err(|_| "无法读取 devingpanel.yaml。")?
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "无法读取 devingpanel.yaml。")?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err("devingpanel.yaml 超过 64 KiB。".into());
+    }
+    String::from_utf8(bytes).map_err(|_| "devingpanel.yaml 必须是 UTF-8。".into())
+}
+
+pub fn serialize(manifest: &Manifest) -> String {
+    let mut source = format!(
+        "version: 2\nname: {}\ntag: {}\nbuilds:\n",
+        quoted(&manifest.name),
+        quoted(&manifest.tag_rule)
+    );
+    for build in &manifest.builds {
+        source.push_str(&format!(
+            "  - service: {}\n    dockerfile: {}\n    image: {}\n    platform: {}\n    args:\n",
+            quoted(&build.service),
+            quoted(&build.dockerfile),
+            quoted(&build.image),
+            quoted(&build.platform)
+        ));
+        if build.args.is_empty() {
+            source.push_str("      {}\n");
+        } else {
+            for (key, value) in &build.args {
+                source.push_str(&format!("      {}: {}\n", quoted(key), quoted(value)));
+            }
+        }
+    }
+    source.push_str("deploy:\n  compose:\n    files:\n");
+    for file in &manifest.compose_files {
+        source.push_str(&format!("      - {}\n", quoted(file)));
+    }
+    source.push_str("  targets:\n");
+    for target in &manifest.targets {
+        source.push_str(&format!(
+            "    - group: {}\n      host: {}\n",
+            quoted(&target.group),
+            quoted(&target.host)
+        ));
+    }
+    source
+}
+
+pub fn save(root: &Path, expected_source: &str, manifest: &Manifest) -> Result<(), String> {
+    let root = root.canonicalize().map_err(|_| "项目目录不存在。")?;
+    let current = read_source(&root)?;
+    if current != expected_source {
+        return Err("devingpanel.yaml 已在编辑期间改变，请重新读取后再保存。".into());
+    }
+    let source = serialize(manifest);
+    let parsed = parse(&source)?;
+    validate_files(&root, &parsed)?;
+    if source.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err("devingpanel.yaml 超过 64 KiB。".into());
+    }
+    let path = root.join(FILE_NAME);
+    let temporary = root.join(format!(".devingpanel-{}.tmp", Uuid::new_v4()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| format!("无法创建临时配置文件：{error}"))?;
+    let result = file
+        .write_all(source.as_bytes())
+        .and_then(|_| file.sync_all());
+    drop(file);
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("写入 devingpanel.yaml 失败：{error}"));
+    }
+    let latest = read_source(&root);
+    if latest.as_deref() != Ok(expected_source) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(latest
+            .err()
+            .unwrap_or_else(|| "devingpanel.yaml 已在编辑期间改变，请重新读取后再保存。".into()));
+    }
+    let result = std::fs::rename(&temporary, &path);
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("替换 devingpanel.yaml 失败：{error}"));
+    }
+    Ok(())
 }
 
 pub fn resolve_targets(manifest: &Manifest, hosts: &[Host]) -> Result<Vec<i64>, String> {
@@ -410,7 +500,7 @@ pub fn export_legacy(project: &Project, hosts: &[Host]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Target, export_legacy, load, parse};
+    use super::{Target, export_legacy, load, parse, read_source, save, serialize};
     use crate::host_store::Host;
     use crate::project_store::Project;
 
@@ -462,6 +552,51 @@ deploy:
         assert!(parse(&collision).is_err());
         let collision = source.replace("service: worker", "service: web");
         assert!(parse(&collision).is_err());
+    }
+
+    #[test]
+    fn saves_full_manifest_and_rejects_external_changes() {
+        let root = std::env::temp_dir().join(format!("devingpanel-edit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(root.join("Dockerfile.worker"), "FROM scratch\n").unwrap();
+        std::fs::write(root.join("compose.yaml"), "services: {}\n").unwrap();
+        std::fs::write(root.join("compose.prod.yaml"), "services: {}\n").unwrap();
+        std::fs::write(root.join("devingpanel.yaml"), VALID).unwrap();
+        let original = read_source(&root).unwrap();
+        let mut manifest = parse(&original).unwrap();
+        manifest.builds.push(super::BuildSpec {
+            service: "worker".into(),
+            dockerfile: "Dockerfile.worker".into(),
+            image: "myapp-worker".into(),
+            platform: "linux/arm64".into(),
+            args: vec![("MODE".into(), "safe: value".into())],
+        });
+        manifest.targets.push(Target {
+            group: "prod".into(),
+            host: "web-2".into(),
+        });
+        save(&root, &original, &manifest).unwrap();
+        let saved = read_source(&root).unwrap();
+        assert_eq!(parse(&saved).unwrap().builds, manifest.builds);
+        assert_eq!(load(&root).unwrap().targets, manifest.targets);
+        assert_eq!(serialize(&parse(&saved).unwrap()), saved);
+        std::fs::write(
+            root.join("devingpanel.yaml"),
+            "# changed outside the app\n".to_owned() + &saved,
+        )
+        .unwrap();
+        assert!(
+            save(&root, &saved, &manifest)
+                .unwrap_err()
+                .contains("已在编辑期间改变")
+        );
+        let changed = read_source(&root).unwrap();
+        assert!(changed.starts_with("# changed outside the app"));
+        manifest.builds[1].dockerfile = "missing".into();
+        assert!(save(&root, &changed, &manifest).is_err());
+        assert_eq!(read_source(&root).unwrap(), changed);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

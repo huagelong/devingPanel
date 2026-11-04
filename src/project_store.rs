@@ -181,6 +181,47 @@ pub fn effective(id: i64) -> Result<Project, String> {
     Ok(project)
 }
 
+pub fn save_manifest(
+    id: i64,
+    expected_source: &str,
+    manifest: &project_config::Manifest,
+) -> Result<Project, String> {
+    let conn = connect()?;
+    let transaction = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let project = list_in(&transaction)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|project| project.id == id && project.manifest_mode)
+        .ok_or("YAML 项目不存在。")?;
+    let duplicate: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM projects WHERE name = ?1 AND id <> ?2",
+            params![manifest.name, id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if duplicate != 0 {
+        return Err("项目名已存在。".into());
+    }
+    let hosts = crate::host_store::list_in(&transaction).map_err(|error| error.to_string())?;
+    project_config::resolve_targets(manifest, &hosts)?;
+    project_config::save(Path::new(&project.path), expected_source, manifest)?;
+    if project.name != manifest.name {
+        transaction
+            .execute(
+                "UPDATE projects SET name = ?1 WHERE id = ?2",
+                params![manifest.name, id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    list()?
+        .into_iter()
+        .find(|item| item.id == id)
+        .ok_or("项目不存在。".into())
+}
+
 fn resolve_manifest_project(
     project: &Project,
     hosts: &[crate::host_store::Host],
@@ -330,7 +371,7 @@ fn ensure_editable(conn: &Connection, id: i64) -> Result<(), String> {
         )
         .map_err(|_| "项目不存在。")?;
     if mode != 0 {
-        return Err("项目已使用 devingpanel.yaml；请编辑文件后重新校验。".into());
+        return Err("项目已使用 devingpanel.yaml；请在项目页编辑配置。".into());
     }
     Ok(())
 }

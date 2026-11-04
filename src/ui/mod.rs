@@ -134,6 +134,78 @@ struct BuildArgRow {
     value: Entity<InputState>,
 }
 
+struct ManifestBuildRow {
+    service: Entity<InputState>,
+    dockerfile: Entity<InputState>,
+    image: Entity<InputState>,
+    platform: String,
+    args: Vec<BuildArgRow>,
+}
+
+struct ManifestTargetRow {
+    group: Entity<InputState>,
+    host: Entity<InputState>,
+}
+
+struct ManifestForm {
+    project_id: i64,
+    source: String,
+    name: Entity<InputState>,
+    tag: Entity<InputState>,
+    builds: Vec<ManifestBuildRow>,
+    compose: Vec<Entity<InputState>>,
+    targets: Vec<ManifestTargetRow>,
+}
+
+impl ManifestForm {
+    fn new(
+        project: &Project,
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+    ) -> Result<Self, String> {
+        let source = crate::project_config::read_source(std::path::Path::new(&project.path))?;
+        let manifest = crate::project_config::parse(&source)?;
+        Ok(Self {
+            project_id: project.id,
+            source,
+            name: cx.new(|cx| InputState::new(window, cx).default_value(manifest.name)),
+            tag: cx.new(|cx| InputState::new(window, cx).default_value(manifest.tag_rule)),
+            builds: manifest
+                .builds
+                .into_iter()
+                .map(|build| ManifestBuildRow {
+                    service: cx.new(|cx| InputState::new(window, cx).default_value(build.service)),
+                    dockerfile: cx
+                        .new(|cx| InputState::new(window, cx).default_value(build.dockerfile)),
+                    image: cx.new(|cx| InputState::new(window, cx).default_value(build.image)),
+                    platform: build.platform,
+                    args: build
+                        .args
+                        .into_iter()
+                        .map(|(key, value)| BuildArgRow {
+                            key: cx.new(|cx| InputState::new(window, cx).default_value(key)),
+                            value: cx.new(|cx| InputState::new(window, cx).default_value(value)),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            compose: manifest
+                .compose_files
+                .into_iter()
+                .map(|file| cx.new(|cx| InputState::new(window, cx).default_value(file)))
+                .collect(),
+            targets: manifest
+                .targets
+                .into_iter()
+                .map(|target| ManifestTargetRow {
+                    group: cx.new(|cx| InputState::new(window, cx).default_value(target.group)),
+                    host: cx.new(|cx| InputState::new(window, cx).default_value(target.host)),
+                })
+                .collect(),
+        })
+    }
+}
+
 struct TargetForm {
     project_id: i64,
     group: String,
@@ -518,6 +590,8 @@ pub(crate) struct AppView {
     project_id: Option<i64>,
     project_tab: ProjectTab,
     build_form: Option<BuildForm>,
+    manifest_form: Option<ManifestForm>,
+    manifest_saving: bool,
     build_saving: bool,
     target_form: Option<TargetForm>,
     target_saving: bool,
@@ -810,6 +884,8 @@ impl AppView {
             project_id: None,
             project_tab: ProjectTab::Build,
             build_form: None,
+            manifest_form: None,
+            manifest_saving: false,
             build_saving: false,
             target_form: None,
             target_saving: false,
@@ -1243,6 +1319,135 @@ fn mono_font() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{Palette, ThemeChoice};
+
+    #[gpui_kit::test]
+    #[ignore = "requires a fresh isolated APPDATA under target/isolated-tests"]
+    fn isolated_manifest_editor_saves_yaml(cx: &mut gpui_kit::TestAppContext) {
+        use super::{AppView, ManifestForm, Page, ProjectTab};
+        use gpui_kit::{AppContext as _, WindowOptions};
+
+        let appdata = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .canonicalize()
+            .unwrap();
+        let allowed = std::env::current_dir()
+            .unwrap()
+            .join("target/isolated-tests")
+            .canonicalize()
+            .unwrap();
+        assert_eq!(appdata.parent(), Some(allowed.as_path()));
+        assert!(
+            appdata
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ui-yaml-edit-")
+        );
+        assert!(std::fs::read_dir(&appdata).unwrap().next().is_none());
+        let project_dir = appdata
+            .parent()
+            .unwrap()
+            .join(format!("yaml-project-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&project_dir).unwrap();
+        let fixture = std::env::current_dir()
+            .unwrap()
+            .join("tests/fixtures/stack-v2-success");
+        for file in [
+            "devingpanel.yaml",
+            "compose.yaml",
+            "Dockerfile.web",
+            "Dockerfile.worker",
+        ] {
+            std::fs::copy(fixture.join(file), project_dir.join(file)).unwrap();
+        }
+        let conn = crate::database::connect().unwrap();
+        conn.execute("INSERT INTO hosts (id, name, address, port, username, auth, group_name, credential_id)
+            VALUES (1, 'vps-smoke', '127.0.0.1', 22, 'test', 'password', 'test', 'missing-test-vault')", []).unwrap();
+        let project = crate::project_store::create_from_manifest(&project_dir).unwrap();
+        let original = crate::project_config::read_source(&project_dir).unwrap();
+        cx.update(gpui_kit::init);
+        let (handle, view_entity) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| AppView::new(window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            view_entity.update(cx, |view, cx| {
+                view.page = Page::Projects;
+                view.projects = vec![project.clone()];
+                view.project_loaded = true;
+                view.project_id = Some(project.id);
+                view.project_tab = ProjectTab::Compose;
+                view.manifest_form = Some(ManifestForm::new(&project, window, cx).unwrap());
+                let form = view.manifest_form.as_ref().unwrap();
+                form.name.update(cx, |name, cx| {
+                    name.set_value("renamed-ui-project", window, cx)
+                });
+                form.tag.update(cx, |tag, cx| {
+                    tag.set_value("edited-{timestamp}", window, cx)
+                });
+            });
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            view_entity.update(cx, |view, cx| view.save_manifest_form(window, cx));
+        })
+        .unwrap();
+        for _ in 0..20 {
+            cx.run_until_parked();
+            if crate::project_config::read_source(&project_dir).unwrap() != original {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let saved = crate::project_config::load(&project_dir).unwrap();
+        assert_eq!(saved.name, "renamed-ui-project");
+        assert_eq!(saved.tag_rule, "edited-{timestamp}");
+        cx.run_until_parked();
+        cx.update_window(handle, |_, _, cx| {
+            view_entity.update(cx, |view, _| {
+                assert!(!view.manifest_saving);
+                assert_eq!(view.projects[0].name, "renamed-ui-project");
+                assert_eq!(view.projects[0].tag_rule, "edited-{timestamp}");
+            });
+        })
+        .unwrap();
+        conn.execute("INSERT INTO hosts (id, name, address, port, username, auth, group_name, credential_id)
+            VALUES (2, 'vps-second', '127.0.0.2', 22, 'test', 'password', 'test', 'missing-test-vault-2')", []).unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            view_entity.update(cx, |view, cx| {
+                view.manifest_form.as_ref().unwrap().targets[0]
+                    .host
+                    .update(cx, |host, cx| host.set_value("vps-second", window, cx));
+                view.save_manifest_form(window, cx);
+            });
+        })
+        .unwrap();
+        for _ in 0..20 {
+            cx.run_until_parked();
+            if crate::project_config::load(&project_dir).unwrap().targets[0].host == "vps-second" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        cx.run_until_parked();
+        assert_eq!(
+            crate::project_config::load(&project_dir).unwrap().targets[0].host,
+            "vps-second"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT host_id FROM project_hosts WHERE project_id = ?1",
+                [project.id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert!(crate::project_store::effective(project.id).is_err());
+        std::fs::remove_dir_all(project_dir).unwrap();
+    }
 
     #[gpui_kit::test]
     #[ignore = "headless GUI test requires an explicit isolated APPDATA under target/isolated-tests"]
