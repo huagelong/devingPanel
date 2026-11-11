@@ -1,6 +1,0 @@
-#!/bin/sh
-set -eu
-
-cd "$(git rev-parse --show-toplevel)"
-printf '%s\n' 'Running tests before push...'
-cargo test --locked

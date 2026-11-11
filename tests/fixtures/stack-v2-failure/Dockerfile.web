@@ -1,4 +1,0 @@
-FROM redis:7-alpine
-COPY probe-web.txt /probe-web.txt
-HEALTHCHECK --interval=2s --timeout=2s --retries=3 CMD test -s /probe-web.txt
-CMD ["sh", "-c", "sleep 3600"]

@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=devingPanel
-Comment=Manage Docker deployments over SSH
-Exec=deving-panel
-Icon=deving-panel
-Categories=Development;System;
-Terminal=false
