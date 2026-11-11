@@ -168,7 +168,7 @@ const projects = [
 const history = [
   {
     id: 1,
-    time: "2026-10-24 14:32",
+    time: "2026-10-24 14:32:00",
     projectId: 1,
     project: "myapp",
     tag: "20261024-143200",
@@ -180,7 +180,7 @@ const history = [
   },
   {
     id: 2,
-    time: "2026-10-24 11:08",
+    time: "2026-10-24 11:08:00",
     projectId: 1,
     project: "myapp",
     tag: "20261024-110800",
@@ -192,7 +192,7 @@ const history = [
   },
   {
     id: 3,
-    time: "2026-10-23 18:40",
+    time: "2026-10-23 18:40:00",
     projectId: 1,
     project: "myapp",
     tag: "20261023-184000",
@@ -419,14 +419,8 @@ function render() {
   theme(state.theme);
   const isDark = document.documentElement.classList.contains("dark");
   const title = state.docker ? navItems.find((n) => n[0] === state.route)[1] : "安装 Docker";
-  const entity = ["hosts", "containers"].includes(state.route)
-    ? hosts.find((h) => h.id === state.id)
-    : state.route === "projects"
-      ? projects.find((p) => p.id === state.id)
-      : null;
-  const detailLabel = state.docker ? settingsLabel || (state.id && entity ? entity.name : "") : "";
   $("#sidebar").innerHTML =
-    I18n.html`<a class="brand" href="#/dashboard"><svg class="brand-mark" viewBox="0 0 36 36" aria-hidden="true"><rect x="5" y="9" width="11" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 14h5M8 18h5M8 22h4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path class="brand-transfer" d="M17.5 18h5m-2.5-2.5L22.5 18 20 20.5" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><rect x="24" y="8" width="8" height="20" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M27 13h2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle class="brand-transfer-dot" cx="28" cy="23" r="1.25"/></svg>devingPanel</a><nav>${navItems
+    I18n.html`<nav>${navItems
       .filter((n) => state.stage !== "p0" || n[0] !== "containers")
       .map(
         ([id, label, symbol]) =>
@@ -438,7 +432,7 @@ function render() {
         "",
       )}</nav><div class="sidebar-foot"><span class="row">${icon("shield")}仅 SSH · 无远端 Agent</span><p>交互原型 · 所有数值均为演示</p>${button("原型预览选项", "preview", "ghost")}<p>v0.1 · 本地构建，远端运行</p></div>`;
   $("#topbar").innerHTML =
-    I18n.html`<div class="row">${ib("menu", "打开导航", "menu")}${state.docker ? I18n.html`<a class="muted" href="#/${state.route}">${I18n.t(title)}</a>` : I18n.html`<span class="muted">${I18n.t(title)}</span>`}${detailLabel ? I18n.html`${icon("chevron")}<span>${esc(settingsLabel ? I18n.t(detailLabel) : detailLabel)}</span>` : ""}</div><div class="top-actions"><span class="row"><span class="dot ${state.docker ? "success" : "destructive"}"></span><span class="docker-label">${state.docker ? I18n.t("本地 Docker 可用") : I18n.t("Docker 不可用")}</span></span>${ScreenLock.isEnabled() ? ib("lock", "立即锁屏", "screen-lock") : ""}${button(icon(isDark ? "sun" : "moon"), "theme", "ghost icon-btn", `aria-label="${I18n.t(isDark ? "切换至浅色" : "切换至深色")}" title="${I18n.t(isDark ? "切换至浅色" : "切换至深色")}"`)}</div>${state.deploy?.running ? I18n.t('<div class="global-progress" aria-label="发布进行中"></div>') : ""}`;
+    I18n.html`<div class="row">${ib("menu", "打开导航", "menu")}<a class="brand" href="#/dashboard"><svg class="brand-mark" viewBox="0 0 36 36" aria-hidden="true"><rect x="5" y="9" width="11" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 14h5M8 18h5M8 22h4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path class="brand-transfer" d="M17.5 18h5m-2.5-2.5L22.5 18 20 20.5" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><rect x="24" y="8" width="8" height="20" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M27 13h2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle class="brand-transfer-dot" cx="28" cy="23" r="1.25"/></svg>devingPanel</a></div><div class="top-actions"><span class="row"><span class="dot ${state.docker ? "success" : "destructive"}"></span><span class="docker-label">${state.docker ? I18n.t("本地 Docker 可用") : I18n.t("Docker 不可用")}</span></span>${ScreenLock.isEnabled() ? ib("lock", "立即锁屏", "screen-lock") : ""}${button(icon(isDark ? "sun" : "moon"), "theme", "ghost icon-btn", `aria-label="${I18n.t(isDark ? "切换至浅色" : "切换至深色")}" title="${I18n.t(isDark ? "切换至浅色" : "切换至深色")}"`)}</div>${state.deploy?.running ? I18n.t('<div class="global-progress" aria-label="发布进行中"></div>') : ""}`;
   $('#topbar [data-action="menu"]').classList.add("mobile-menu");
   if (!state.docker) {
     $("#content").innerHTML = dockerSetup();
@@ -1060,6 +1054,10 @@ function settingsPage() {
 function timestamp() {
   return new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
 }
+function historyTime(date = new Date()) {
+  const two = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${two(date.getMonth() + 1)}-${two(date.getDate())} ${two(date.getHours())}:${two(date.getMinutes())}:${two(date.getSeconds())}`;
+}
 function deployLocked() {
   const d = state.deploy;
   return !!(
@@ -1580,7 +1578,7 @@ function finishDeploy(d) {
 function saveDeployRecord(d) {
   const record = {
     id: d.recordId || Date.now(),
-    time: new Date().toLocaleString(I18n.locale, { hour12: false }),
+    time: historyTime(),
     project: d.project,
     projectId: d.projectId,
     tag: d.tag,
@@ -2377,7 +2375,7 @@ document.addEventListener("click", async (e) => {
     }));
     history.unshift({
       id: Date.now(),
-      time: new Date().toLocaleString(I18n.locale, { hour12: false }),
+      time: historyTime(),
       project: r.project,
       projectId: r.projectId,
       tag: "rollback-" + timestamp(),

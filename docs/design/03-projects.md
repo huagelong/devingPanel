@@ -74,7 +74,7 @@ deploy:
 ```
 内容区
 |
-|-- 页头: 面包屑(项目 / myapp)  右侧: [发布] (variant=default)
+|-- 页头: "myapp"  右侧: [发布] (variant=default)
 |
 |-- 配置卡: devingpanel.yaml [配置已读取/需管理员处理] [重新读取配置]
 |

@@ -22,9 +22,8 @@ test("each settings section is a separate addressable page with only its own con
     await expect(
       page.locator(`.settings-nav a[href="#/settings/${key}"]`),
     ).toHaveAttribute("aria-current", "page");
-    await expect(page.locator("#topbar")).toContainText(
-      key === "registry" ? "镜像仓库" : title,
-    );
+    await expect(page.locator("#topbar")).not.toContainText(title);
+    await expect(page.locator(".page-head h1")).toHaveText("设置");
     await page.reload();
     await expect(page.locator(".settings-content h2")).toHaveText(title);
     await page.screenshot({

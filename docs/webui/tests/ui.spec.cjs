@@ -6,6 +6,37 @@ test.beforeEach(async ({ page }) => {
 test.afterEach(async ({ page }) => {
   expect(page.scriptErrors).toEqual([]);
 });
+test("page title appears in content without a duplicate topbar label", async ({ page }) => {
+  for (const [route, title] of [["deploy", "发布"], ["hosts", "主机"], ["projects", "项目"]]) {
+    await page.goto(`/#/${route}`);
+    await expect(page.locator(".page-head h1")).toHaveText(title);
+    await expect(page.locator("#topbar")).not.toContainText(title);
+  }
+});
+test("brand and global controls share a full-width header above navigation", async ({ page }) => {
+  await page.goto("/#/deploy");
+  const desktop = await page.evaluate(() => {
+    const box = (selector) => document.querySelector(selector).getBoundingClientRect();
+    return { header: box("#topbar"), brand: box("#topbar .brand"), sidebar: box("#sidebar"), content: box("#content"), actions: box("#topbar .top-actions") };
+  });
+  expect(desktop.header.left).toBe(0);
+  expect(desktop.header.width).toBe(1440);
+  expect(desktop.brand.top).toBeLessThan(desktop.header.bottom);
+  expect(desktop.actions.right).toBeLessThanOrEqual(desktop.header.right);
+  expect(desktop.sidebar.top).toBe(desktop.header.bottom);
+  expect(desktop.content.left).toBeGreaterThanOrEqual(desktop.sidebar.right);
+  await page.screenshot({ path: "test-results/deploy-full-header-desktop.png" });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.locator("#topbar .brand")).toBeVisible();
+  await expect(page.locator('#topbar [data-action="menu"]')).toBeVisible();
+  await expect(page.locator("#sidebar")).not.toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  await page.screenshot({ path: "test-results/deploy-full-header-mobile.png" });
+  await page.locator('[data-action="theme"]').click();
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await page.screenshot({ path: "test-results/deploy-full-header-mobile-dark.png" });
+});
 test("theme values match both documented base palettes", async ({ page }) => {
   const fs = require("node:fs");
   const path = require("node:path");
@@ -569,6 +600,10 @@ test("deployment succeeds and records history", async ({ page }) => {
   await page.getByRole("tab", { name: "历史", exact: true }).click();
   await expect(page.locator("tbody tr")).toHaveCount(4);
   await expect(page.locator("tbody tr").first()).toContainText(tag);
+  for (const time of await page.locator("tbody tr td:first-child").allTextContents()) {
+    expect(time).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+  }
+  await page.screenshot({ path: "test-results/deploy-history-time.png" });
 });
 
 test("history explains success and failure evidence", async ({ page }) => {
