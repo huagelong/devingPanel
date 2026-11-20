@@ -321,7 +321,7 @@ test("YAML preview requires directory authorization before saving", async ({ pag
   await page.getByRole("button", { name: "原型预览选项" }).click();
   await page.locator('[name="preview-yaml-project"]').check();
   await page.getByRole("button", { name: "应用", exact: true }).click();
-  await expect(page.getByText("开发者维护的非秘密发布方案")).toBeVisible();
+  await expect(page.getByText("开发者维护的发布配置；请勿写入密码或令牌")).toBeVisible();
   await expect(page.locator("#build-form")).toHaveCount(0);
   await page.locator('[name="manifest-tag"]').fill("release-{timestamp}");
   await page.getByRole("tab", { name: "Compose" }).click();

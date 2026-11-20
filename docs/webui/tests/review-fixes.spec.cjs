@@ -1,5 +1,75 @@
 const { test, expect } = require("@playwright/test");
 
+test("host dialog and history empty states follow page specifications", async ({ page }) => {
+  await page.goto("/#/hosts");
+  await page.getByRole("button", { name: "添加主机" }).click();
+  await expect(page.locator("#dialog.host-dialog")).toHaveCSS("max-width", "512px");
+  await page.locator('#dialog [data-action="close"]').first().click();
+
+  await page.goto("/#/dashboard");
+  await page.getByRole("button", { name: "原型预览选项" }).click();
+  await page.locator('[name="preview-view"]').selectOption("empty");
+  await page.getByRole("button", { name: "应用", exact: true }).click();
+  await expect(page.getByText("暂无发布记录")).toBeVisible();
+  await expect(page.locator("main .empty")).toHaveCount(1);
+
+  await page.goto("/#/deploy/0/history");
+  await page.getByRole("button", { name: "原型预览选项" }).click();
+  await page.locator('[name="preview-view"]').selectOption("empty");
+  await page.getByRole("button", { name: "应用", exact: true }).click();
+  await expect(page.locator("main .empty")).toContainText("暂无发布记录");
+  await expect(page.locator("main .empty").getByRole("button", { name: "去发布" })).toBeVisible();
+});
+
+test("permission preview shows a return path without claiming a real permission check", async ({ page }) => {
+  await page.goto("/#/hosts");
+  await page.getByRole("button", { name: "原型预览选项" }).click();
+  await page.locator('[name="preview-view"]').selectOption("denied");
+  await page.getByRole("button", { name: "应用", exact: true }).click();
+  await expect(page.locator("main .empty")).toContainText("无权访问此页面");
+  await page.getByRole("button", { name: "返回总览" }).click();
+  await expect(page).toHaveURL(/#\/dashboard$/);
+  await expect(page.locator(".page-head h1")).toHaveText("总览");
+
+  await page.getByRole("button", { name: "原型预览选项" }).click();
+  await page.locator('[name="preview-view"]').selectOption("denied");
+  await page.getByRole("button", { name: "应用", exact: true }).click();
+  await page.getByRole("button", { name: "返回总览" }).click();
+  await expect(page.locator("main .hosts-grid")).toBeVisible();
+});
+
+test("tabs retain focus after keyboard navigation and rerender", async ({ page }) => {
+  await page.goto("/#/deploy");
+  await page.getByRole("tab", { name: "执行" }).focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(page.getByRole("tab", { name: "历史" })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("tab", { name: "历史" })).toBeFocused();
+  await expect(page.getByRole("tab", { name: "执行" })).toHaveAttribute("tabindex", "-1");
+  await page.keyboard.press("Home");
+  await expect(page.getByRole("tab", { name: "执行" })).toBeFocused();
+
+  await page.goto("/#/settings/backup");
+  await page.getByRole("tab", { name: "本地备份" }).focus();
+  await page.keyboard.press("End");
+  await expect(page.getByRole("tab", { name: "S3 备份" })).toBeFocused();
+  await expect(page.getByRole("tab", { name: "S3 备份" })).toHaveAttribute("aria-selected", "true");
+});
+
+test("core pages fit measured widths and forced colors keep tab selection visible", async ({ page }) => {
+  for (const width of [1440, 1024, 768, 700, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    for (const route of ["dashboard", "hosts", "projects/1/build", "deploy", "settings/appearance"]) {
+      await page.goto("/#/" + route);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+    }
+  }
+  await page.emulateMedia({ forcedColors: "active" });
+  await page.goto("/#/deploy");
+  const selectedBorder = await page.getByRole("tab", { name: "执行" }).evaluate((tab) => getComputedStyle(tab).borderBottomColor);
+  const otherBorder = await page.getByRole("tab", { name: "历史" }).evaluate((tab) => getComputedStyle(tab).borderBottomColor);
+  expect(selectedBorder).not.toBe(otherBorder);
+});
+
 async function freeze(page) {
   await page.clock.install({ time: new Date("2026-10-24T04:00:00Z") });
   await page.clock.pauseAt(new Date("2026-10-24T04:00:01Z"));

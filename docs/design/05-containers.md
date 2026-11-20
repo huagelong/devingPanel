@@ -53,6 +53,7 @@ SheetHeader: web-1 (mono)  [跟随] Switch  [停止] [重启]
 ## 6. 状态与确认
 
 - 加载：表格 Skeleton；主机 SSH 不可达：Card 内错误态 + [重试]。
+- 无主机或空数据时显示“当前没有容器或镜像”。
 - 停止 / 删除 / 重启：AlertDialog 二次确认（删除为 destructive 按钮）；执行中行内 loading，完成 Toast。
 - 容器列表的数据来源与刷新间隔见 `docs/technical-architecture.md`；正在操作的行禁用操作按钮防止重复提交。
 - 镜像列表中当前运行或受发布保留策略保护的镜像禁用删除，显示保护原因；删除镜像也需二次确认。

@@ -16,7 +16,7 @@ const BackupUI = (() => {
   const snapshot = () => PanelBackup.create(hosts, projects, state);
   const targetKey = () => JSON.stringify(state.s3);
   const warning =
-    "备份必须使用密码加密（AES-256-GCM）。不包含 SSH 密码/私钥、Registry/S3 凭据、环境变量值、构建参数值、镜像、卷、发布历史或回滚材料。加密密码不写入文件，忘记密码无法恢复。";
+    "备份使用 AES-256-GCM 密码加密。文件不包含 SSH 密码或私钥、Registry/S3 凭据、环境变量值、构建参数值、镜像、卷、发布历史和回滚材料。密码不写入文件；丢失密码后无法恢复备份。";
   function status(text, error = false) {
     message = { text, tone: error ? "destructive" : "info" };
     if (state.route === "settings") render();
@@ -55,7 +55,7 @@ const BackupUI = (() => {
           }</div>`;
     return card(
       "备份与恢复",
-      "备份客户端配置，不是 VPS 业务数据备份。",
+      "只备份客户端配置，不包含 VPS 上的业务数据。",
       I18n.html`<div class="stack"><div class="notice"><div class="row between wrap"><div><h3>备份加密密码</h3><p>${encryptionPassword ? badge("已设置 · 仅本次会话", "success") : badge("未设置，无法创建备份", "warning")}</p></div><div class="actions">${button(encryptionPassword ? I18n.t("更改加密密码") : I18n.t("设置加密密码"), "backup-password")}${encryptionPassword ? button("清除密码", "backup-password-clear", "ghost") : ""}</div></div><p class="muted">密码不持久化，刷新后需重新设置。更改密码仅用于新备份，旧备份仍需旧密码；忘记密码无法找回。</p></div>${tabs(
         [
           ["local", "本地备份"],

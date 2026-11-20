@@ -55,8 +55,8 @@ const I18N_EN = Object.freeze({
   "已配置（会话演示）": "Configured (session demo)",
   "尚未配置": "Not configured",
   "实际客户端使用系统凭据管理器；原型不保存认证信息或验证登录。": "The desktop client uses the OS credential store. This prototype does not save credentials or verify login.",
-  "未启用时演示 SSH 直连；启用后演示 push + 远端 pull。": "The release demo shows SSH transfer until the registry is enabled, then shows image push and pull.",
-  "P2 配置预览；浏览器原型不采样或发送通知。": "P2 configuration preview. The browser prototype does not sample metrics or send notifications.",
+  "不使用镜像仓库时演示 SSH 传输；启用后演示镜像推送和远端拉取。": "Without a registry, the demo shows SSH transfer. With one enabled, it shows an image push and a remote pull.",
+  "仅预览 P2 告警设置；此原型不会采集数据或发送通知。": "P2 alert settings preview only. This prototype does not collect data or send notifications.",
   "清理悬空镜像需先接入发布历史保护；无标签镜像仍可能用于回滚。": "Dangling image cleanup requires release history protection. Untagged images may still be needed for rollback.",
   "多构建页面仅供流程评审；当前原型发布动画只模拟单构建，开始发布已禁用。": "The multi-build editor is for workflow review. The current release animation models one build only, so Start Release is disabled.",
   "需先接入发布历史保护，避免删除回滚镜像": "Release history protection is required to avoid deleting rollback images",
@@ -64,8 +64,8 @@ const I18N_EN = Object.freeze({
   未启用: "Not enabled",
   已启用: "Enabled",
   配置损坏: "Configuration damaged",
-  "无操作达到设定时间后自动锁定；刷新或重新打开应用也需解锁。这只是本机界面锁，不替代操作系统登录、磁盘加密或服务器认证。":
-    "Locks after the configured idle time. Refreshing or reopening also requires the password. This is a local UI lock, not a substitute for OS login, disk encryption or server authentication.",
+  "达到设定的无操作时长后会锁屏；刷新或重新打开也要输入密码。锁屏只限制本机界面操作，不能代替操作系统登录、磁盘加密或服务器认证。":
+    "The screen locks after the chosen idle time. Refreshing or reopening requires the password. This local UI lock cannot replace OS login, disk encryption, or server authentication.",
   新锁屏密码: "New lock password",
   确认新密码: "Confirm new password",
   当前锁屏密码: "Current lock password",
@@ -109,8 +109,8 @@ const I18N_EN = Object.freeze({
     "Screen-lock configuration is damaged. Check local browser storage in a trusted environment. The screen will not unlock automatically.",
   "关闭后不会再自动锁屏；请确认这是您的设备。":
     "Auto-lock will stop. Confirm this is your device.",
-  "密码不以明文存储；丢失密码无法通过此原型找回。请妥善保存。锁屏时会清除尚未提交的敏感输入和当前会话的备份加密密码。":
-    "The password is not stored in plaintext and cannot be recovered in this prototype. Locking clears unsaved secret inputs and this session's backup encryption password.",
+  "浏览器不保存明文密码。忘记密码后无法通过原型找回。锁屏会清除未提交的敏感输入和本次会话的备份加密密码。":
+    "The browser does not store the password in plaintext. This prototype cannot recover a forgotten password. Locking clears unsaved sensitive inputs and this session's backup encryption password.",
   "本机界面锁不替代系统账户、磁盘加密或服务器权限。":
     "This local UI lock does not replace OS accounts, disk encryption or server permissions.",
   "{0} 台主机": "Hosts: {0}",
@@ -149,8 +149,8 @@ const I18N_EN = Object.freeze({
   "主题已保存。": "Theme saved.",
   "切换主题，当前": "Change theme; current: ",
   "主题：": "Theme: ",
-  "与顶部栏主题切换同步。":
-    "Synchronized with the theme control in the top bar.",
+  "也可在顶部栏切换主题。":
+    "You can also change the theme from the top bar.",
   "仅 SSH · 无远端 Agent": "SSH only · No remote agent",
   "交互原型 · 所有数值均为演示": "Interactive prototype · Sample data",
   "v0.1 · 本地构建，远端运行": "v0.1 · Build locally, run remotely",
@@ -180,9 +180,12 @@ const I18N_EN = Object.freeze({
   不可用: "Unavailable",
   可用: "Available",
   最近发布: "Recent deployments",
-  "最近 5 条发布记录": "The five most recent deployments",
+  "最近 5 次发布": "The five most recent deployments",
   查看全部: "View all",
   暂无发布记录: "No deployment history",
+  无权限: "No access",
+  无权访问此页面: "You do not have access to this page",
+  返回总览: "Back to overview",
   填充演示记录: "Add sample deployment history",
   "添加你的第一台 VPS": "Add your first VPS",
   时间: "Time",
@@ -210,7 +213,7 @@ const I18N_EN = Object.freeze({
     "Developers can deliver the project configuration in devingpanel.yaml.",
   "改用 devingpanel.yaml": "Switch to devingpanel.yaml",
   "devingpanel.yaml": "devingpanel.yaml",
-  "开发者维护的非秘密发布方案": "Developer-maintained non-secret release plan",
+  "开发者维护的发布配置；请勿写入密码或令牌": "Developer-maintained deployment configuration. Do not add passwords or tokens.",
   重新读取配置: "Reload configuration",
   "迁移后项目技术配置由 YAML 唯一决定，敏感环境变量仍由本机安全存储管理。":
     "After migration, YAML is the only source for technical project settings; secrets remain in local secure storage.",
@@ -317,7 +320,7 @@ const I18N_EN = Object.freeze({
   资源趋势: "Resource trends",
   打开容器管理: "Manage containers",
   镜像管理: "Manage images",
-  "SSH 连接配置与远端环境": "SSH configuration and remote environment",
+  "SSH 连接设置和远端信息": "SSH settings and remote host details",
   登录用户: "Login user",
   "私钥（已安全保存 · 演示）": "Private key (securely saved · demo)",
   "系统 / 内核": "OS / Kernel",
@@ -450,7 +453,7 @@ const I18N_EN = Object.freeze({
   下一页: "Next",
   执行: "Run",
   历史: "History",
-  先创建项目: "Create a project first",
+  还没有可发布的项目: "No projects available to deploy",
   并行度: "Concurrency",
   已选: "Selected: ",
   台: " hosts",
@@ -597,7 +600,7 @@ const I18N_EN = Object.freeze({
   "演示发布：": "Demo deployment: ",
   清理磁盘: "Clean up disk",
   "每 10s 刷新 · 原型使用演示数据": "Refresh every 10s · Sample data only",
-  暂无容器或镜像: "No containers or images",
+  当前没有容器或镜像: "No containers or images to show",
   "主机 SSH 不可达": "Host unreachable over SSH",
   重试: "Retry",
   "仓库名:tag": "Repository:tag",
@@ -645,8 +648,8 @@ const I18N_EN = Object.freeze({
     "This may affect other projects. Use the separate Settings action for managed release cleanup.",
   "演示清理完成：实际释放 308 MB（模拟数据）。":
     "Demo cleanup complete: 308 MB reclaimed (simulated).",
-  "按每项目 / 每主机计算已完成版本，保护当前运行与可回滚版本。":
-    "Retain completed releases per project and host, protecting running and rollback versions.",
+  "按项目和主机保留已完成版本；当前运行版本和可回滚版本受保护。":
+    "Retain completed releases by project and host. Running and rollback versions are protected.",
   已完成版本保留数: "Completed releases to retain",
   自定义: "Custom",
   自定义数量: "Custom count",
@@ -673,8 +676,8 @@ const I18N_EN = Object.freeze({
   "1 分钟": "1 minute",
   "5 分钟": "5 minutes",
   "10 分钟": "10 minutes",
-  "以下路径及检测结果均为演示。":
-    "Paths and detection results below are examples.",
+  "路径和检测结果为演示数据。":
+    "Paths and detection results are demo data.",
   重新检测: "Detect again",
   打开所在文件夹: "Open folder",
   清理托管历史镜像: "Clean up managed release images",
@@ -725,8 +728,8 @@ const I18N_EN = Object.freeze({
     "Finish the deployment before changing the demo scenario.",
   "加载失败：SSH 连接超时，请检查网络与主机地址。":
     "Loading failed: SSH connection timed out. Check the network and host address.",
-  "备份客户端配置，不是 VPS 业务数据备份。":
-    "Back up client configuration, not VPS application data.",
+  "只备份客户端配置，不包含 VPS 上的业务数据。":
+    "Backups contain client configuration only, with no application data from the VPS.",
   备份加密密码: "Backup encryption password",
   "已设置 · 仅本次会话": "Set · This session only",
   "未设置，无法创建备份": "Not set; backup creation unavailable",
@@ -776,8 +779,8 @@ const I18N_EN = Object.freeze({
     "Set an encryption password and complete the demo connection test to create an encrypted snapshot.",
   "发布运行中、暂停或待核实时，禁止导入和恢复；仍可导出配置。":
     "Import and restore are blocked while a deployment is running, paused or awaiting verification. Configuration export is still available.",
-  "备份必须使用密码加密（AES-256-GCM）。不包含 SSH 密码/私钥、Registry/S3 凭据、环境变量值、构建参数值、镜像、卷、发布历史或回滚材料。加密密码不写入文件，忘记密码无法恢复。":
-    "Backups require password encryption (AES-256-GCM). SSH passwords/keys, registry/S3 credentials, variable and build argument values, images, volumes, history and rollback data are excluded. The password is not stored in the file. A lost password makes recovery impossible.",
+  "备份使用 AES-256-GCM 密码加密。文件不包含 SSH 密码或私钥、Registry/S3 凭据、环境变量值、构建参数值、镜像、卷、发布历史和回滚材料。密码不写入文件；丢失密码后无法恢复备份。":
+    "Backups use AES-256-GCM password encryption. The file excludes SSH passwords and private keys, registry/S3 credentials, environment variable and build argument values, images, volumes, deployment history, and rollback materials. The password is not stored in the file; without it, the backup cannot be restored.",
   "格式 v": "Format v",
   "（北京时间）": " (Beijing time)",
   "来源：": "Source: ",

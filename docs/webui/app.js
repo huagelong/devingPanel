@@ -90,7 +90,7 @@ const table = (headers, rows) =>
 const row = (cells) =>
   I18n.html`<tr>${cells.map((c, i) => I18n.html`<td${i === cells.length - 1 && String(c).includes('class="actions"') ? ' class="action-col"' : ""}>${c?.i18nParts ? I18n.t(c) : c}</td>`).join("")}</tr>`;
 const tabs = (items, active, action = "tab") =>
-  I18n.html`<div class="tabs" role="tablist">${items.map(([id, label]) => button(label, `${action}:${id}`, "", `role="tab" aria-selected="${id === active}"`)).join("")}</div>`;
+  I18n.html`<div class="tabs" role="tablist">${items.map(([id, label]) => button(label, `${action}:${id}`, "", `role="tab" aria-selected="${id === active}" tabindex="${id === active ? 0 : -1}"`)).join("")}</div>`;
 const menu = (items) =>
   I18n.html`<details class="menu"><summary aria-label="更多操作">${icon("more")}</summary><div class="menu-list">${items.join("")}</div></details>`;
 const head = (title, actions = "", localize = true) =>
@@ -100,6 +100,8 @@ const go = (label, path, style = "", symbol = "") =>
   I18n.html`<a class="btn ${style}" href="#/${path}">${symbol ? icon(symbol) : ""}${I18n.t(label)}</a>`;
 const empty = (text, label, action, symbol = "folder") =>
   I18n.html`<div class="empty">${icon(symbol)}<h2>${I18n.t(text)}</h2>${label ? button(label, action, "primary") : ""}</div>`;
+const permissionDenied = () =>
+  I18n.html`<section class="card">${empty("无权访问此页面", "返回总览", "nav:dashboard", "shield")}</section>`;
 const hosts = [
   {
     id: 1,
@@ -304,6 +306,8 @@ const state = {
   follow: true,
 };
 let logTimer;
+let pendingTabFocus = "";
+let renderedHash = "";
 try {
   state.theme = localStorage.getItem("devingpanel-theme") || "system";
 } catch {}
@@ -393,6 +397,7 @@ function parseRoute() {
   state.view = "normal";
   state.historyPage = 0;
   render();
+  renderedHash = location.hash;
   $("#sidebar").classList.remove("open");
 }
 function dockerSetup() {
@@ -406,7 +411,7 @@ function render() {
       state.settingsSection = "retention";
     const canonical = `#/settings/${state.settingsSection}`;
     if (location.hash !== canonical)
-      window.history.replaceState(null, "", canonical);
+      location.replace(canonical);
     settingsLabel = settingsSections().find(
       ([key]) => key === state.settingsSection,
     )[1];
@@ -447,15 +452,19 @@ function render() {
     containers: containersPage,
     settings: settingsPage,
   };
-  $("#content").innerHTML = pages[state.route]();
-  if (state.view === "loading")
-    $("#content").innerHTML =
-      head(title) +
-      I18n.html`<div class="grid hosts-grid">${Array.from({ length: 3 }, () => '<div class="card pad stack"><div class="skeleton"></div><div class="skeleton"></div></div>').join("")}</div><div class="card">${Array.from({ length: 5 }, () => '<div class="skeleton-row"><div class="skeleton"></div></div>').join("")}</div>`;
-  if (state.view === "error")
-    $("#content").innerHTML =
-      head(title) +
-      I18n.html`<div class="card">${empty("加载失败：SSH 连接超时，请检查网络与主机地址。", "重试", "retry", "alert")}</div>`;
+  if (state.view === "denied") {
+    $("#content").innerHTML = head(title) + permissionDenied();
+  } else {
+    $("#content").innerHTML = pages[state.route]();
+    if (state.view === "loading")
+      $("#content").innerHTML =
+        head(title) +
+        I18n.html`<div class="grid hosts-grid">${Array.from({ length: 3 }, () => '<div class="card pad stack"><div class="skeleton"></div><div class="skeleton"></div></div>').join("")}</div><div class="card">${Array.from({ length: 5 }, () => '<div class="skeleton-row"><div class="skeleton"></div></div>').join("")}</div>`;
+    if (state.view === "error")
+      $("#content").innerHTML =
+        head(title) +
+        I18n.html`<div class="card">${empty("加载失败：SSH 连接超时，请检查网络与主机地址。", "重试", "retry", "alert")}</div>`;
+  }
   document.title = ScreenLock.isLocked
     ? `${I18n.t("已锁定")} · devingPanel`
     : `${settingsLabel ? I18n.t(settingsLabel) + " · " : ""}${I18n.t(title)} · devingPanel`;
@@ -465,10 +474,16 @@ function render() {
       newLog.closest("details").open = logOpen;
     newLog.scrollTop = followLog ? newLog.scrollHeight : oldScroll;
   }
+  if (pendingTabFocus) {
+    $$('[role="tab"]', $("#content")).find((tab) => tab.dataset.action === pendingTabFocus)?.focus();
+    pendingTabFocus = "";
+  }
 }
 function historyTable(records, compact = false, projectScoped = false) {
   if (!records.length)
-    return I18n.t('<div class="pad muted">暂无发布记录</div>');
+    return compact
+      ? I18n.t('<div class="pad muted">暂无发布记录</div>')
+      : empty("暂无发布记录", projectScoped ? "填充演示记录" : "去发布", projectScoped ? "history-demo" : "nav:deploy", "rocket");
   return table(
     compact
       ? ["时间", "项目", "发布标识", "结果", "耗时"]
@@ -505,7 +520,7 @@ function dashboard() {
     (items.length
       ? I18n.html`<div class="grid hosts-grid ${items.length > 8 ? "scroll-limited" : ""}">${items.map((h) => I18n.html`<a href="#/hosts/${h.id}" class="card compact host-card"><div class="row between"><div class="row"><span class="dot ${h.online ? "success" : "destructive"}"></span><strong>${esc(h.name)}</strong></div><span class="mono muted">${esc(h.address)}</span></div>${state.stage !== "p0" ? I18n.html`<div class="grid two" style="margin-top:16px">${["cpu", "memory"].map((key, i) => I18n.html`<div><div class="row between"><small>${i ? I18n.t("内存") : "CPU"}</small><span>${h.online ? h[key] + "%" : "--"}</span></div>${h.online ? progress(h[key]) : ""}</div>`).join("")}</div><p class="row between muted"><span>容器 ${h.online ? h.containers + I18n.t(" 运行") : "--"}</span><span>磁盘 ${h.online ? h.disk + "%" : "--"}</span></p>` : I18n.html`<p class="muted">Docker ${h.online ? I18n.t("已连接") : I18n.t("不可达")}</p>`}</a>`).join("")}</div>`
       : I18n.html`<section class="card">${empty("添加你的第一台 VPS", "添加主机", "host-new", "server")}</section>`) +
-    I18n.html`<section class="card"><div class="card-head"><h2>最近发布</h2><p class="muted">最近 5 条发布记录</p></div>${historyTable(state.view === "empty" ? [] : history.slice(0, 5), true)}<div class="table-foot">${go("查看全部", "deploy/0/history", "ghost")}</div></section>`
+    I18n.html`<section class="card"><div class="card-head"><h2>最近发布</h2><p class="muted">最近 5 次发布</p></div>${historyTable(state.view === "empty" ? [] : history.slice(0, 5), true)}<div class="table-foot">${go("查看全部", "deploy/0/history", "ghost")}</div></section>`
   );
 }
 function hostsPage() {
@@ -567,7 +582,7 @@ function hostDetail() {
   if (tab === "info")
     body = card(
       "基本信息",
-      "SSH 连接配置与远端环境",
+      "SSH 连接设置和远端信息",
       I18n.html`<dl class="info-list">${[
         ["地址", h.address],
         ["SSH 端口", h.port],
@@ -739,7 +754,7 @@ function projectDetail() {
     const records = history.filter((h) => h.projectId === p.id);
     const lastPage = Math.max(0, Math.ceil(records.length / 20) - 1);
     state.historyPage = Math.min(state.historyPage, lastPage);
-    body = I18n.html`<section class="card">${!records.length ? I18n.html`<div class="pad">${button("填充演示记录", "history-demo", "ghost")}</div>` : ""}${historyTable(
+    body = I18n.html`<section class="card">${historyTable(
       records.slice(state.historyPage * 20, (state.historyPage + 1) * 20),
       false,
       true,
@@ -758,7 +773,7 @@ function projectDetail() {
     ) +
     (yamlMode ? card(
       "devingpanel.yaml",
-      "开发者维护的非秘密发布方案",
+      "开发者维护的发布配置；请勿写入密码或令牌",
       I18n.html`<div class="stack"><p>${p.directoryHandle ? I18n.t("已读取项目目录中的 devingpanel.yaml") : I18n.t("尚未授权项目目录")}</p>${button("选择项目目录", "manifest-connect")}${button("重新读取配置", "manifest-reload", "", !p.directoryHandle ? "disabled" : "")}${manifestFor(p).builds.length > 1 ? I18n.t('<div class="notice warning">多构建页面仅供流程评审；当前原型发布动画只模拟单构建，开始发布已禁用。</div>') : ""}<small class="muted">保存会写入所选项目目录的 devingpanel.yaml；授权仅在当前页面会话有效。请勿在未核对文件内容时确认覆盖。</small></div>`,
     ) : "") +
     tabs(
@@ -817,7 +832,7 @@ function deployPage() {
   if (!projects.length || state.view === "empty")
     return (
       head("发布") +
-      I18n.html`<div class="card">${empty("先创建项目", "新建项目", "project-new")}</div>`
+      I18n.html`<div class="card">${empty("还没有可发布的项目", "新建项目", "project-new")}</div>`
     );
   const d = state.deploy;
   const locked = deployLocked();
@@ -902,7 +917,7 @@ function containersPage() {
   if (!h || state.view === "empty")
     return (
       prefix +
-      I18n.html`<div class="card">${empty("暂无容器或镜像", "", "", "box")}</div>`
+      I18n.html`<div class="card">${empty("当前没有容器或镜像", "", "", "box")}</div>`
     );
   if (!h.online)
     return (
@@ -969,13 +984,13 @@ function settingsPage() {
     retention: () =>
       card(
         "发布保留策略",
-        "按每项目 / 每主机计算已完成版本，保护当前运行与可回滚版本。",
+        "按项目和主机保留已完成版本；当前运行版本和可回滚版本受保护。",
         I18n.html`<div class="stack">${field("已完成版本保留数", select("retention", ["1", "2", "3", "5", "10", ["custom", "自定义"]], ["1", "2", "3", "5", "10"].includes(String(state.keep)) ? state.keep : "custom"))}${!["1", "2", "3", "5", "10"].includes(String(state.keep)) ? field("自定义数量", input("retention-custom", state.keep, 'type="number" min="1" required')) : ""}${state.keep === 1 ? I18n.t('<div class="notice warning">仅保留当前版本，该主机无法回滚到上一版本。</div>') : ""}<label class="row"><input type="checkbox" name="auto-cleanup" ${state.autoCleanup ? "checked" : ""}>自动清理策略（演示设置）</label><p class="muted">${state.autoCleanup ? I18n.t("本原型不运行定时清理；桌面客户端在线时每日检查。") : I18n.t("自动清理已关闭；可预览会话内历史材料。")}</p>${button("立即清理托管的历史镜像", "managed-clean")}</div>`,
       ),
     appearance: () =>
       card(
         "外观",
-        "与顶部栏主题切换同步。",
+        "也可在顶部栏切换主题。",
         I18n.html`<div class="stack"><div class="row wrap" role="radiogroup" aria-label="主题">${[
           ["light", "浅色"],
           ["dark", "深色"],
@@ -1001,13 +1016,13 @@ function settingsPage() {
     registry: () =>
       card(
         "镜像仓库（可选）",
-        "未启用时演示 SSH 直连；启用后演示 push + 远端 pull。",
-        I18n.html`<div class="stack">${field("Registry 地址", input("registry", state.registryDraftAddress, 'placeholder="registry.example.com" class="mono"'))}<div class="form-grid">${field("用户名", input("registry-user", state.registryDraftUser, 'autocomplete="off"'))}${field("访问令牌", input("registry-token", "", 'type="password" autocomplete="off" placeholder="原型中请勿输入真实凭据"'))}</div><small>实际客户端使用系统凭据管理器；原型不保存认证信息或验证登录。</small><div class="actions">${button("测试登录（演示）", "registry-test")}${button("保存配置（演示）", "registry-save", "primary", deployLocked() ? "disabled" : "")}${state.registryConfigured ? button("移除配置", "registry-remove", "ghost destructive", deployLocked() ? "disabled" : "") : ""}</div><label class="row"><input type="checkbox" name="registry-enabled" ${state.registry ? "checked" : ""} ${!state.registryConfigured || deployLocked() ? "disabled" : ""}>发布使用镜像仓库</label><small class="muted">${state.registryConfigured ? I18n.t("已配置（会话演示）") : I18n.t("尚未配置")}</small></div>`,
+        "不使用镜像仓库时演示 SSH 传输；启用后演示镜像推送和远端拉取。",
+        I18n.html`<form id="registry-form" class="stack">${field("Registry 地址", input("registry", state.registryDraftAddress, 'placeholder="registry.example.com" class="mono"'))}<div class="form-grid">${field("用户名", input("registry-user", state.registryDraftUser, 'autocomplete="off"'))}${field("访问令牌", input("registry-token", "", 'type="password" autocomplete="off" placeholder="原型中请勿输入真实凭据"'))}</div><small>实际客户端使用系统凭据管理器；原型不保存认证信息或验证登录。</small><div class="actions">${button("测试登录（演示）", "registry-test")}${button("保存配置（演示）", "registry-save", "primary", deployLocked() ? "disabled" : "")}${state.registryConfigured ? button("移除配置", "registry-remove", "ghost destructive", deployLocked() ? "disabled" : "") : ""}</div><label class="row"><input type="checkbox" name="registry-enabled" ${state.registry ? "checked" : ""} ${!state.registryConfigured || deployLocked() ? "disabled" : ""}>发布使用镜像仓库</label><small class="muted">${state.registryConfigured ? I18n.t("已配置（会话演示）") : I18n.t("尚未配置")}</small></form>`,
       ),
     alerts: () =>
       card(
         "告警",
-        "P2 配置预览；浏览器原型不采样或发送通知。",
+        "仅预览 P2 告警设置；此原型不会采集数据或发送通知。",
         I18n.html`<div class="form-grid">${[
           ["cpu", "CPU"],
           ["memory", "内存"],
@@ -1031,7 +1046,7 @@ function settingsPage() {
     environment: () =>
       card(
         "本地环境",
-        "以下路径及检测结果均为演示。",
+        "路径和检测结果为演示数据。",
         I18n.html`<div class="stack"><div class="row between environment-row"><span class="environment-details"><span>Docker：</span><span class="mono environment-path" title="/usr/local/bin/docker">/usr/local/bin/docker</span>${badge(state.docker ? I18n.t("可用") : I18n.t("不可用"), state.docker ? "success" : "destructive")}</span>${button("重新检测", "docker-detect")}</div><div class="row between environment-row"><span class="mono environment-path" title="~/devingPanel/devingpanel.sqlite">~/devingPanel/devingpanel.sqlite</span>${button("打开所在文件夹", "native-folder")}</div>${field("主机数据采集间隔", select("host-collection-interval", [["10", "10 秒"], ["30", "30 秒"], ["60", "1 分钟"], ["300", "5 分钟"], ["custom", "自定义"]], state.hostCollectionCustom || ![10, 30, 60, 300].includes(state.hostCollectionIntervalSeconds) ? "custom" : state.hostCollectionIntervalSeconds), "桌面客户端在线时按此间隔采集主机数据并写入 SQLite；原型不实际采集或写入。")}${state.hostCollectionCustom || ![10, 30, 60, 300].includes(state.hostCollectionIntervalSeconds) ? field("自定义间隔（秒）", input("host-collection-custom", state.hostCollectionIntervalSeconds, 'type="number" min="10" max="3600" step="1" required')) : ""}</div>`,
       ),
     security: () =>
@@ -1658,11 +1673,20 @@ document.addEventListener("input", (e) => {
 document.addEventListener("change", (e) => {
   if (e.target.name?.startsWith("manifest-")) e.target.dispatchEvent(new Event("input", { bubbles: true }));
 });
+document.addEventListener("click", (e) => {
+  const link = e.target.closest("#sidebar nav a");
+  if (!link || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  e.preventDefault();
+  if (ScreenLock.isLocked) return;
+  if (location.hash !== link.hash) location.hash = link.hash;
+  parseRoute();
+});
 document.addEventListener("click", async (e) => {
   const el = e.target.closest("[data-action]");
   if (!el || el.disabled) return;
   if (ScreenLock.isLocked) return;
   const [action, ...parts] = el.dataset.action.split(":");
+  if (el.getAttribute("role") === "tab") pendingTabFocus = el.dataset.action;
   if (action.startsWith("screen-")) return ScreenLock.handleAction(action);
   if (!state.docker && !["preview", "preview-apply", "theme", "menu", "close", "docker-setup", "docker-detect"].includes(action)) return;
   const arg = parts.join(":");
@@ -1680,11 +1704,15 @@ document.addEventListener("click", async (e) => {
   if (action === "close") return close();
   if (action === "menu") return $("#sidebar").classList.toggle("open");
   if (action === "nav") {
-    location.hash = "#/" + arg;
+    const hash = "#/" + arg;
+    if (location.hash === hash) parseRoute();
+    else location.hash = hash;
     return;
   }
   if (action === "tab") {
-    location.hash = `#/${state.route}/${state.id}/${arg}`;
+    const hash = `#/${state.route}/${state.id}/${arg}`;
+    if (location.hash === hash) pendingTabFocus = "";
+    location.hash = hash;
     return;
   }
   if (action === "theme") {
@@ -1721,6 +1749,7 @@ document.addEventListener("click", async (e) => {
             ["loading", "加载"],
             ["empty", "空状态"],
             ["error", "错误"],
+            ["denied", "无权限"],
           ],
           state.view,
         ),
@@ -2698,6 +2727,19 @@ document.addEventListener("click", (e) => {
   });
 });
 document.addEventListener("keydown", (e) => {
+  const tab = e.target.closest('.tabs [role="tab"]');
+  if (tab && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) {
+    const items = $$('[role="tab"]', tab.parentElement).filter((item) => !item.disabled);
+    const index = items.indexOf(tab);
+    let next = index;
+    if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = items.length - 1;
+    else if (e.key === "ArrowRight") next = (index + 1) % items.length;
+    else next = (index - 1 + items.length) % items.length;
+    e.preventDefault();
+    items[next].click();
+    return;
+  }
   if (e.key === "Escape") {
     $$("details.menu[open]").forEach((m) => (m.open = false));
     $("#sidebar").classList.remove("open");
@@ -2716,6 +2758,8 @@ $$("dialog").forEach((d) =>
 );
 $("#dialog").addEventListener("cancel", () => BackupUI.onClose());
 $("#dialog").addEventListener("cancel", () => ScreenLock.onDialogDismiss());
-window.addEventListener("hashchange", parseRoute);
+window.addEventListener("hashchange", () => {
+  if (location.hash !== renderedHash) parseRoute();
+});
 parseRoute();
 ScreenLock.init();

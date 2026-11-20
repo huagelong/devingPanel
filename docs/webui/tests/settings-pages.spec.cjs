@@ -51,6 +51,28 @@ test("navigation and browser back/forward retain non-secret settings", async ({
     "registry.example.com/project",
   );
 });
+test("sidebar settings link repairs a stale page at the same hash", async ({ page }) => {
+  await page.goto("/#/containers");
+  await page.evaluate(() => window.history.replaceState(null, "", "#/settings"));
+  await expect(page.locator("#content h1")).toHaveText("容器");
+  await page.locator('#sidebar nav a[href="#/settings"]').click();
+  await expect(page).toHaveURL(/#\/settings\/retention$/);
+  await expect(page.locator("#content h1")).toHaveText("设置");
+  await expect(page.locator("#content h2")).toHaveText("发布保留策略");
+});
+test("settings loads when an injected history wrapper throws", async ({ page }) => {
+  await page.addInitScript(() => {
+    window.history.replaceState = () => {
+      throw new TypeError("Illegal invocation");
+    };
+  });
+  await page.goto("/#/settings");
+  await expect(page).toHaveURL(/#\/settings\/retention$/);
+  await expect(page.locator("#content h1")).toHaveText("设置");
+  await page.goto("/#/containers");
+  await page.locator('#sidebar nav a[href="#/settings"]').click();
+  await expect(page.locator("#content h2")).toHaveText("发布保留策略");
+});
 test("browser back dismisses a dialog belonging to the previous settings page", async ({
   page,
 }) => {

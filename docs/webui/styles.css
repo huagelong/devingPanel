@@ -843,7 +843,7 @@ dialog.wide {
   max-width: 672px;
 }
 dialog.host-dialog {
-  max-width: 448px;
+  max-width: 512px;
   padding: 16px;
 }
 dialog.terminal-dialog {
@@ -1258,6 +1258,18 @@ fieldset {
   *::before,
   *::after {
     animation: none !important;
+  }
+}
+@media (forced-colors: active) {
+  .tabs button {
+    border-bottom: 2px solid transparent;
+  }
+  .tabs button[aria-selected="true"] {
+    border-bottom-color: Highlight;
+  }
+  nav a.active:not(:focus-visible) {
+    outline: 1px solid Highlight;
+    outline-offset: -2px;
   }
 }
 
