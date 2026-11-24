@@ -557,6 +557,17 @@ label.field {
   gap: 8px;
   font-weight: 500;
 }
+.directory-field {
+  display: grid;
+  gap: 8px;
+  font-weight: 500;
+}
+.directory-field .row input {
+  flex: 1;
+}
+.directory-field .row button {
+  flex: none;
+}
 input:not([type="checkbox"]):not([type="radio"]),
 select,
 textarea {

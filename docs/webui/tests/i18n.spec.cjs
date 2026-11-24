@@ -326,19 +326,17 @@ test("new project placeholders and invalid Compose states are localized", async 
   await page.goto("/#/projects");
   await page.locator('[data-action="project-new"]').click();
   await page.locator('[name="name"]').fill("example");
-  await page.locator('[name="path"]').fill("D:\\example");
   await page.locator('[data-action="project-save"]').click();
-  await expect(page.locator('[name="service"] option')).toHaveText([
-    "Select a service",
-  ]);
+  await page.getByRole("tab", { name: "Build configuration" }).click();
+  await expect(page.locator('[name="manifest-service-0"]')).toHaveValue("web");
+  await page.getByRole("tab", { name: "Basic information" }).click();
+  await noChineseUI(page);
   await page.getByRole("tab", { name: "Compose", exact: true }).click();
-  await expect(
-    page.getByText("No Compose files configured.", { exact: true }),
-  ).toBeVisible();
+  await expect(page.getByRole("button", { name: "Add Compose file" })).toBeVisible();
   await noChineseUI(page);
   await page.goto("/#/projects/1/compose");
   await page.evaluate(() => {
-    projects[0].files = ["sub/prod.yml"];
+    manifestFor(projects[0]).files = ["sub/prod.yml"];
     render();
   });
   await expect(

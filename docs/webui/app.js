@@ -165,6 +165,8 @@ const projects = [
     args: [["NODE_ENV", "production"]],
     env: [],
     ready: true,
+    demo: true,
+    demoName: "myapp",
   },
 ];
 const history = [
@@ -670,10 +672,10 @@ function projectsPage() {
                 p.hostIds.length,
                 p.ready ? I18n.t("2 小时前 · 20261024-143200") : "—",
                 badge(
-                  p.ready ? I18n.t("就绪") : p.manifest && p.manifest.targets.some((t) => hosts.filter((h) => h.group === t.group && h.name === t.host).length !== 1) ? I18n.t("需管理员处理") : I18n.t("待完善"),
+                  p.ready ? I18n.t("就绪") : targetDraftFor(p).some((t) => hosts.filter((h) => h.group === t.group && h.name === t.host).length !== 1) ? I18n.t("需管理员处理") : I18n.t("待完善"),
                   p.ready ? "success" : "warning",
                 ),
-                I18n.html`<div class="actions">${button("发布", `project-deploy:${p.id}`, "primary", !projectReady(p) ? I18n.t('disabled title="请完善 Compose、部署服务和目标主机"') : "")}${menu([go("详情", `projects/${p.id}`, "ghost"), ...(p.manifest ? [] : [button("编辑", `project-edit:${p.id}`, "ghost")]), button("删除", `project-delete:${p.id}`, "ghost destructive")])}</div>`,
+                I18n.html`<div class="actions">${button("发布", `project-deploy:${p.id}`, "primary", !projectReady(p) ? I18n.t('disabled title="请完善 Compose、部署服务和目标主机"') : "")}${menu([go("编辑", `projects/${p.id}/basic`, "ghost"), button("删除", `project-delete:${p.id}`, "ghost destructive")])}</div>`,
               ]),
             ),
           )
@@ -688,25 +690,45 @@ function manifestFor(p) {
     tag: p.tag,
     builds: [{ service: p.service || "web", dockerfile: p.dockerfile, image: p.image, platform: p.platform, args: structuredClone(p.args) }],
     files: [...p.files],
-    targets: p.hostIds.map((id) => {
-      const h = hosts.find((item) => item.id === id);
-      return { group: h?.group || "", host: h?.name || "" };
-    }),
   };
   if (!p.manifestDraft) p.manifestDraft = structuredClone(p.manifest);
   return p.manifestDraft;
 }
+function targetRowsFor(p) {
+  return p.hostIds.map((id) => {
+    const host = hosts.find((item) => item.id === id);
+    return { group: host?.group || "", host: host?.name || "" };
+  });
+}
+function targetDraftFor(p) {
+  if (!p.targetDraft) p.targetDraft = targetRowsFor(p);
+  return p.targetDraft;
+}
+function targetIdsFor(p) {
+  const targets = targetDraftFor(p);
+  if (targets.length > 100) throw new Error("目标主机不能超过 100 台。");
+  if (new Set(targets.map((target) => target.group)).size > 1) throw new Error("目标主机必须属于同一分组。");
+  const ids = targets.map((target) => {
+    const matches = hosts.filter((host) => host.group === target.group && host.name === target.host);
+    if (matches.length !== 1) throw new Error("目标主机缺失或名称不唯一；请先由管理员处理。");
+    return matches[0].id;
+  });
+  if (new Set(ids).size !== ids.length || state.previewYamlError) throw new Error("目标主机重复或缺失；请先由管理员处理。");
+  return ids;
+}
+function commitTargets(p, ids) {
+  p.hostIds = [...ids];
+  p.targetDraft = targetRowsFor(p);
+  updateProjectReadiness(p);
+}
 function useManifest(p, loaded, directory) {
   p.directoryHandle = directory;
+  p.path = directory.name;
   p.manifestSource = loaded.source;
   p.manifestName = loaded.name;
   p.name = loaded.name;
   p.manifest = loaded.manifest;
   p.manifestDraft = structuredClone(loaded.manifest);
-  p.hostIds = loaded.manifest.targets.flatMap((target) => {
-    const match = hosts.filter((h) => h.group === target.group && h.name === target.host);
-    return match.length === 1 ? [match[0].id] : [];
-  });
   p.files = [...loaded.manifest.files];
   const first = loaded.manifest.builds[0];
   Object.assign(p, { tag: loaded.manifest.tag, image: first.image, service: first.service, dockerfile: first.dockerfile, platform: first.platform, args: structuredClone(first.args) });
@@ -714,41 +736,30 @@ function useManifest(p, loaded, directory) {
 }
 function manifestEditor(p, tab) {
   const m = manifestFor(p);
-  const save = button("保存到 devingpanel.yaml", "manifest-save", "primary", !p.directoryHandle ? 'disabled title="请先选择项目目录"' : "");
-  if (tab === "build") return card("构建配置", "多个服务共用项目根目录作为构建上下文。", I18n.html`<div class="stack">${field("项目名", input("manifest-name", p.name, 'required'))}${field("Tag 规则", input("manifest-tag", m.tag, 'class="mono"'))}${m.builds.map((b, i) => I18n.html`<div class="manifest-item"><div class="row between"><h3>${I18n.t(I18n.msg`构建 ${i + 1}`)}</h3><div class="actions">${ib("up", "上移", `manifest-build-up:${i}`, i === 0 ? "disabled" : "")}${ib("down", "下移", `manifest-build-down:${i}`, i === m.builds.length - 1 ? "disabled" : "")}${ib("trash", "删除构建", `manifest-build-remove:${i}`, m.builds.length === 1 ? "disabled" : "")}</div></div><div class="form-grid">${field("构建服务", input(`manifest-service-${i}`, b.service, 'class="mono"'))}${field("Dockerfile", input(`manifest-dockerfile-${i}`, b.dockerfile, 'class="mono"'))}${field("镜像名", input(`manifest-image-${i}`, b.image, 'class="mono"'))}${field("目标平台", select(`manifest-platform-${i}`, [["auto", "按主机自动（默认）"], "linux/amd64", "linux/arm64"], b.platform))}</div><div><h3>Build args</h3>${(b.args || []).map(([key, value], j) => I18n.html`<div class="kv-row">${input(`manifest-arg-key-${i}-${j}`, key, 'placeholder="KEY" class="mono"')}${input(`manifest-arg-value-${i}-${j}`, value, 'placeholder="VALUE"')}${ib("trash", "删除行", `manifest-arg-remove:${i}:${j}`)}</div>`).join("")}${button(icon("plus") + "添加参数", `manifest-arg-add:${i}`)}</div></div>`).join("")}${button(icon("plus") + "添加构建", "manifest-build-add")}<div class="notice muted">Build args 以明文写入项目文件，不要填写密码或令牌。</div>${save}</div>`);
-  if (tab === "compose") return card("Compose", "按列表顺序合并；首个文件必须位于项目根目录。", I18n.html`<div class="stack">${m.files.map((file, i) => I18n.html`<div class="file-row"><span>${i + 1}.</span>${input(`manifest-file-${i}`, file, 'class="mono grow"')}${ib("up", "上移", `manifest-file-up:${i}`, i === 0 ? "disabled" : "")}${ib("down", "下移", `manifest-file-down:${i}`, i === m.files.length - 1 ? "disabled" : "")}${ib("trash", "移除", `manifest-file-remove:${i}`)}</div>`).join("")}${button(icon("plus") + "添加 Compose 文件", "manifest-file-add")}<div class="notice muted">每个服务在 Compose 中使用自己的 DEVINGPANEL_IMAGE_服务名变量；保存前会读取并校验项目文件。</div>${save}</div>`);
-  if (tab === "targets") return card("目标主机", "按 YAML 顺序发布；组名和别名须在本机唯一匹配。", I18n.html`<div class="stack">${m.targets.map((target, i) => I18n.html`<div class="manifest-target"><span>${i + 1}.</span>${field("主机组", input(`manifest-group-${i}`, target.group))}${field("主机别名", input(`manifest-host-${i}`, target.host))}${ib("up", "上移", `manifest-target-up:${i}`, i === 0 ? "disabled" : "")}${ib("down", "下移", `manifest-target-down:${i}`, i === m.targets.length - 1 ? "disabled" : "")}${ib("trash", "移除", `manifest-target-remove:${i}`)}</div>`).join("")}${button(icon("plus") + "添加目标", "manifest-target-add")}${m.targets.some((t) => hosts.filter((h) => h.group === t.group && h.name === t.host).length !== 1) || state.previewYamlError ? I18n.t('<div class="notice warning">目标主机缺失或名称不唯一；需管理员先配置主机和可信指纹，发布保持禁用。</div>') : ""}<div class="notice muted">变更目标绑定可能清理取消绑定主机的本地专属变量，保存前需确认。保存会写入项目文件，不修改主机配置。</div>${save}</div>`);
+  const save = I18n.html`<div class="actions">${button("保存", "manifest-save", "primary", !p.directoryHandle ? 'disabled title="请在基本信息选择本地代码目录"' : "")}${button("全部保存", "manifest-save-all", "", !p.directoryHandle ? 'disabled title="请在基本信息选择本地代码目录"' : "")}</div>`;
+  if (tab === "basic") {
+    const status = p.directoryHandle ? p.manifestSource === null ? "目录中尚无 devingpanel.yaml，保存时创建" : "已读取 devingpanel.yaml" : "尚未授权本地代码目录";
+    return card("基本信息", "", I18n.html`<div class="stack">${field("项目名", input("manifest-name", p.name, 'required'))}<div class="directory-field"><label for="local-directory">${I18n.t("本地代码目录")}</label><div class="row">${input("path", p.directoryHandle?.name || p.path, 'id="local-directory" readonly class="mono grow"')}${button(icon("folder") + I18n.t("选择目录"), "manifest-connect", "", "", false)}</div><small class="muted">${I18n.t(status)}</small></div>${save}</div>`);
+  }
+  if (tab === "build") return card("构建配置", "多个服务共用项目根目录作为构建上下文。", I18n.html`<div class="stack">${p.restoreNeedsReview ? I18n.t('<div class="notice warning">该项目来自配置备份。请核对本地路径和 Compose 文件、补齐构建参数值，再保存确认；连接凭据和环境变量需重新配置。</div>') : ""}${m.builds.length > 1 ? I18n.t('<div class="notice warning">多构建页面仅供流程评审；当前原型发布动画只模拟单构建，开始发布已禁用。</div>') : ""}${field("Tag 规则", input("manifest-tag", m.tag, 'class="mono"'))}${m.builds.map((b, i) => I18n.html`<div class="manifest-item"><div class="row between"><h3>${I18n.t(I18n.msg`构建 ${i + 1}`)}</h3><div class="actions">${ib("up", "上移", `manifest-build-up:${i}`, i === 0 ? "disabled" : "")}${ib("down", "下移", `manifest-build-down:${i}`, i === m.builds.length - 1 ? "disabled" : "")}${ib("trash", "删除构建", `manifest-build-remove:${i}`, m.builds.length === 1 ? "disabled" : "")}</div></div><div class="form-grid">${field("构建服务", input(`manifest-service-${i}`, b.service, 'class="mono"'))}${field("Dockerfile", input(`manifest-dockerfile-${i}`, b.dockerfile, 'class="mono"'))}${field("镜像名", input(`manifest-image-${i}`, b.image, 'class="mono"'))}${field("目标平台", select(`manifest-platform-${i}`, [["auto", "按主机自动（默认）"], "linux/amd64", "linux/arm64"], b.platform))}</div><div><h3>Build args</h3>${(b.args || []).map(([key, value], j) => I18n.html`<div class="kv-row">${input(`manifest-arg-key-${i}-${j}`, key, 'placeholder="KEY" class="mono"')}${input(`manifest-arg-value-${i}-${j}`, value, 'placeholder="VALUE"')}${ib("trash", "删除行", `manifest-arg-remove:${i}:${j}`)}</div>`).join("")}${button(icon("plus") + "添加参数", `manifest-arg-add:${i}`)}</div></div>`).join("")}${button(icon("plus") + "添加构建", "manifest-build-add")}<div class="notice muted">Build args 以明文写入项目文件，不要填写密码或令牌。</div>${save}</div>`);
+  if (tab === "compose") return card("Compose", "按列表顺序合并；首个文件必须位于项目根目录。", I18n.html`<div class="stack">${m.files.map((file, i) => I18n.html`<div class="file-row"><span>${i + 1}.</span>${input(`manifest-file-${i}`, file, 'class="mono grow"')}${ib("up", "上移", `manifest-file-up:${i}`, i === 0 ? "disabled" : "")}${ib("down", "下移", `manifest-file-down:${i}`, i === m.files.length - 1 ? "disabled" : "")}${ib("trash", "移除", `manifest-file-remove:${i}`)}</div>`).join("")}${button(icon("plus") + "添加 Compose 文件", "manifest-file-add")}${m.files[0]?.includes("/") || m.files[0]?.includes("\\") ? I18n.t('<div class="notice warning">首个 Compose 文件必须位于项目根目录。</div>') : ""}<div class="notice muted">每个服务在 Compose 中使用自己的 DEVINGPANEL_IMAGE_服务名变量；保存前会读取并校验项目文件。</div>${save}</div>`);
+  if (tab === "targets") {
+    const targets = targetDraftFor(p);
+    const targetSave = I18n.html`<div class="actions">${button("保存", "target-save", "primary")}${button("全部保存", "manifest-save-all", "", !p.directoryHandle ? 'disabled title="请在基本信息选择本地代码目录"' : "")}</div>`;
+    return card("目标主机", "按本地绑定顺序发布；组名和别名须在本机唯一匹配。", I18n.html`<div class="stack">${targets.map((target, i) => I18n.html`<div class="manifest-target"><span>${i + 1}.</span>${field("主机组", input(`manifest-group-${i}`, target.group))}${field("主机别名", input(`manifest-host-${i}`, target.host))}${ib("up", "上移", `manifest-target-up:${i}`, i === 0 ? "disabled" : "")}${ib("down", "下移", `manifest-target-down:${i}`, i === targets.length - 1 ? "disabled" : "")}${ib("trash", "移除", `manifest-target-remove:${i}`)}</div>`).join("")}${button(icon("plus") + "添加目标", "manifest-target-add")}${targets.some((t) => hosts.filter((h) => h.group === t.group && h.name === t.host).length !== 1) || state.previewYamlError ? I18n.t('<div class="notice warning">目标主机缺失或名称不唯一；需管理员先配置主机和可信指纹，发布保持禁用。</div>') : ""}<div class="notice muted">目标绑定不写入 devingpanel.yaml。原型保存后仅在当前会话有效；正式客户端写入本机 SQLite。</div>${targetSave}</div>`);
+  }
   return "";
 }
 function projectDetail() {
   const p = projects.find((p) => p.id === state.id);
   if (!p) return empty("项目不存在", "返回项目列表", "nav:projects");
   const tab = state.tab || "build";
-  const yamlMode = !!p.manifest || (state.previewYamlProject && p.id === 1);
   let body = "";
-  if (tab === "build")
-    body = card(
-      "构建配置",
-      "镜像在开发机构建，不占用 VPS 编译资源。",
-      I18n.html`<form id="build-form" class="stack">${p.restoreNeedsReview ? I18n.t('<div class="notice warning">该项目来自配置备份。请核对本地路径和 Compose 文件、补齐构建参数值，再保存确认；连接凭据和环境变量需重新配置。</div>') : ""}<div class="form-grid">${field("镜像名", input("image", p.image, 'required class="mono"'))}${field("Tag 规则", input("tag", "{git-sha}", 'readonly class="mono"'))}${field("目标平台", select("platform", [["auto", "按主机自动（默认）"], "linux/amd64", "linux/arm64"], p.platform))}${field("部署服务", select("service", [["", "请选择部署服务"], ...(p.files.length ? [["web", "web"]] : [])], p.service))}</div><div><h3>Build args</h3><p class="muted">构建参数不是秘密传输机制，请勿填写密码或令牌。</p>${kvRows(p.args)}</div>${button("保存", "build-save", "primary")}</form>`,
-    );
-  if (tab === "compose")
-    body = card(
-      "Compose",
-      "支持多个 compose 文件，按顺序合并（后者覆盖前者）。",
-      I18n.html`<div class="stack"><div>${p.files.map((f, i) => I18n.html`<div class="file-row"><span class="muted">${i + 1}.</span><span class="mono grow">${esc(f)}</span>${ib("up", "上移", `file-up:${i}`, i === 0 ? "disabled" : "")}${ib("down", "下移", `file-down:${i}`, i === p.files.length - 1 ? "disabled" : "")}${ib("trash", "移除", `file-remove:${i}`)}</div>`).join("")}</div>${button(icon("plus") + "添加 compose 文件", "file-add")}${composeIssue(p) ? I18n.html`<div class="notice warning">${I18n.t(composeIssue(p))}</div>` : ""}<details><summary>查看部署配置摘要</summary><div class="notice mono">服务 web · 镜像 \${DEVINGPANEL_IMAGE}<br>端口 8080:3000 · 卷 app-data:/data<br>环境变量：已脱敏（演示摘要，非文件解析结果）</div></details></div>`,
-    );
   if (tab === "env")
     body = card(
       "环境变量",
-      "主机专属值覆盖项目通用值；敏感值不写入 SQLite。",
-      I18n.html`<form id="env-form" class="stack">${field("配置范围", select("env-scope", [["common", "项目通用"], ...p.hostIds.map((id) => [id, hosts.find((h) => h.id === id)?.name || id])], "common"))}<div id="env-rows">${kvRows([], true)}</div>${button("保存", "env-save", "primary")}</form>`,
-    );
-  if (tab === "targets")
-    body = card(
-      "目标主机",
-      "只能选择同一主机组内的主机。",
-      I18n.html`<div class="stack">${field("主机组", select("project-group", [...new Set(hosts.map((h) => h.group))], hosts.find((h) => p.hostIds.includes(h.id))?.group || hosts[0]?.group))}<div id="target-list">${targetTable(p.hostIds)}</div>${button("保存", "targets-save", "primary")}</div>`,
+      "主机专属值覆盖项目通用值。正式客户端将普通变量写入本机 SQLite，敏感值存入系统凭据管理器；都不写入 devingpanel.yaml。",
+      I18n.html`<form id="env-form" class="stack">${field("配置范围", select("env-scope", [["common", "项目通用"], ...p.hostIds.map((id) => [id, hosts.find((h) => h.id === id)?.name || id])], "common"))}<div id="env-rows">${kvRows([], true)}</div><div class="actions">${button("保存", "env-save", "primary")}${button("全部保存", "manifest-save-all", "", !p.directoryHandle ? 'disabled title="请在基本信息选择本地代码目录"' : "")}</div></form>`,
     );
   if (tab === "history") {
     const records = history.filter((h) => h.projectId === p.id);
@@ -760,7 +771,7 @@ function projectDetail() {
       true,
     )}<div class="table-foot"><small>每页 20 条 · 共 ${records.length} 条 · 第 ${state.historyPage + 1} / ${lastPage + 1} 页</small><div class="actions">${button("上一页", "history-prev", "", state.historyPage === 0 ? "disabled" : "")}${button("下一页", "history-next", "", state.historyPage === lastPage ? "disabled" : "")}</div></div></section>`;
   }
-  if (yamlMode && ["build", "compose", "targets"].includes(tab)) body = manifestEditor(p, tab);
+  if (["basic", "build", "compose", "targets"].includes(tab)) body = manifestEditor(p, tab);
   return (
     dataHead(
       esc(p.name),
@@ -771,13 +782,9 @@ function projectDetail() {
         !projectReady(p) ? 'disabled title="请保存并核对项目配置"' : "",
       ),
     ) +
-    (yamlMode ? card(
-      "devingpanel.yaml",
-      "开发者维护的发布配置；请勿写入密码或令牌",
-      I18n.html`<div class="stack"><p>${p.directoryHandle ? I18n.t("已读取项目目录中的 devingpanel.yaml") : I18n.t("尚未授权项目目录")}</p>${button("选择项目目录", "manifest-connect")}${button("重新读取配置", "manifest-reload", "", !p.directoryHandle ? "disabled" : "")}${manifestFor(p).builds.length > 1 ? I18n.t('<div class="notice warning">多构建页面仅供流程评审；当前原型发布动画只模拟单构建，开始发布已禁用。</div>') : ""}<small class="muted">保存会写入所选项目目录的 devingpanel.yaml；授权仅在当前页面会话有效。请勿在未核对文件内容时确认覆盖。</small></div>`,
-    ) : "") +
     tabs(
       [
+        ["basic", "基本信息"],
         ["build", "构建配置"],
         ["compose", "Compose"],
         ["env", "环境变量"],
@@ -785,8 +792,7 @@ function projectDetail() {
         ["history", "发布历史"],
       ],
       tab,
-    ) +
-    body
+    ) + body
   );
 }
 function targetTable(ids, deploy = false) {
@@ -1111,7 +1117,7 @@ function composeIssue(p) {
   return "";
 }
 function groupReference(name) {
-  return projects.some((project) => [project.manifest, project.manifestDraft].some((manifest) => manifest?.targets?.some((target) => target.group === name)));
+  return projects.some((project) => [...targetRowsFor(project), ...targetDraftFor(project)].some((target) => target.group === name));
 }
 function groupNameIssue(name, current = "") {
   if (!name) return "请输入分组名称。";
@@ -1218,14 +1224,11 @@ function testHost(id) {
   render();
   toast("连接成功，Docker 已就绪（演示）。");
 }
-function projectForm(id = 0) {
-  const p = projects.find((p) => p.id === id);
+function projectForm() {
   modal(
-    p ? "编辑项目" : "新建项目",
-    I18n.html`<form id="project-form" class="stack" data-id="${id}">${field("项目名", input("name", p?.name, "required"))}${field("本地代码目录", I18n.html`<div class="row">${input("path", p?.path, 'required class="mono" placeholder="D:\\code\\myapp"')}${button("浏览", "browse-directory")}</div>`)}${field("Dockerfile 路径", input("dockerfile", p?.dockerfile || "Dockerfile", 'required class="mono"'), "相对于本地代码目录")}</form>`,
-    button("取消", "close") +
-      button(p ? "保存" : "创建项目", "project-save", "primary"),
-    true,
+    "新建项目",
+    I18n.html`<form id="project-form" class="stack">${field("项目名", input("name", "", "required"))}</form>`,
+    button("取消", "close") + button("创建项目", "project-save", "primary"),
   );
 }
 function historyDetail(id) {
@@ -1637,10 +1640,10 @@ function updateProjectReadiness(p) {
 }
 function projectReady(p) {
   if (!p.ready) return false;
-  if (!(p.manifest || (state.previewYamlProject && p.id === 1))) return true;
   const m = manifestFor(p);
-  return !!p.directoryHandle && p.manifestName === p.name && m.builds.length === 1 && !state.previewYamlError && JSON.stringify(m) === JSON.stringify(p.manifest) &&
-    m.targets.every((t) => hosts.filter((h) => h.group === t.group && h.name === t.host).length === 1);
+  if (p.demo && !p.directoryHandle && !state.previewYamlProject) return JSON.stringify(m) === JSON.stringify(p.manifest) && JSON.stringify(targetDraftFor(p)) === JSON.stringify(targetRowsFor(p)) && p.name === p.demoName;
+  return !!p.directoryHandle && p.manifestSource !== null && p.manifestName === p.name && m.builds.length === 1 && !state.previewYamlError && JSON.stringify(m) === JSON.stringify(p.manifest) &&
+    JSON.stringify(targetDraftFor(p)) === JSON.stringify(targetRowsFor(p));
 }
 function selectedDeployHosts(p) {
   return state.selectedHosts.filter(
@@ -1666,7 +1669,7 @@ document.addEventListener("input", (e) => {
   if (name === "manifest-name") p.name = e.target.value;
   else if (name === "manifest-tag") m.tag = e.target.value;
   else if (parts[1] === "file") m.files[Number(parts[2])] = e.target.value;
-  else if (parts[1] === "group" || parts[1] === "host") m.targets[Number(parts[2])][parts[1]] = e.target.value;
+  else if (parts[1] === "group" || parts[1] === "host") targetDraftFor(p)[Number(parts[2])][parts[1]] = e.target.value;
   else if (["service", "dockerfile", "image", "platform"].includes(parts[1])) m.builds[Number(parts[2])][parts[1]] = e.target.value;
   else if (parts[1] === "arg") m.builds[Number(parts[3])].args[Number(parts[4])][parts[2] === "key" ? 0 : 1] = e.target.value;
 });
@@ -1765,7 +1768,7 @@ document.addEventListener("click", async (e) => {
           ],
           state.scenario,
         ),
-      )}<label class="row"><input name="preview-docker" type="checkbox" ${state.docker ? "checked" : ""}>本地 Docker 可用</label><label class="row"><input name="preview-host-docker-missing" type="checkbox" ${state.previewDockerMissing ? "checked" : ""}>web-1 的 Docker 未安装</label><label class="row"><input name="preview-mirrors" type="checkbox" ${state.previewMirrors ? "checked" : ""}>主机镜像源配置</label><label class="row"><input name="preview-yaml-project" type="checkbox" ${state.previewYamlProject ? "checked" : ""}>开发者配置项目</label><label class="row"><input name="preview-yaml-error" type="checkbox" ${state.previewYamlError ? "checked" : ""}>YAML 目标缺失</label><small>所有表格、进度和日志均为演示数据；刷新页面重置业务数据。</small></div>`,
+      )}<label class="row"><input name="preview-docker" type="checkbox" ${state.docker ? "checked" : ""}>本地 Docker 可用</label><label class="row"><input name="preview-host-docker-missing" type="checkbox" ${state.previewDockerMissing ? "checked" : ""}>web-1 的 Docker 未安装</label><label class="row"><input name="preview-mirrors" type="checkbox" ${state.previewMirrors ? "checked" : ""}>主机镜像源配置</label><label class="row"><input name="preview-yaml-project" type="checkbox" ${state.previewYamlProject ? "checked" : ""}>开发者配置项目</label><label class="row"><input name="preview-yaml-error" type="checkbox" ${state.previewYamlError ? "checked" : ""}>目标主机缺失</label><small>所有表格、进度和日志均为演示数据；刷新页面重置业务数据。</small></div>`,
       button("应用", "preview-apply", "primary"),
     );
   if (action === "preview-apply") {
@@ -1824,7 +1827,7 @@ document.addEventListener("click", async (e) => {
   if (action === "group-rename" || action === "group-rename-save" || action === "group-delete") {
     const name = hostGroups[id];
     if (!name) return;
-    if (groupReference(name)) return toast("该分组已被项目 YAML 目标引用，请先调整项目目标。", true);
+    if (groupReference(name)) return toast("该分组已被项目目标引用，请先调整项目目标。", true);
     if (action === "group-rename") return manageHostGroups(id);
     if (action === "group-delete") {
       if (hosts.some((host) => host.group === name)) return toast("请先将组内主机移至其他分组。", true);
@@ -2008,14 +2011,29 @@ document.addEventListener("click", async (e) => {
   if (action === "project-import" || action === "manifest-connect") {
     try {
       const directory = await ManifestIO.pick();
-      const loaded = await ManifestIO.read(directory);
-      await ManifestIO.verifyFiles(directory, loaded.manifest);
+      let loaded;
+      try {
+        loaded = await ManifestIO.read(directory);
+      } catch (error) {
+        if (action !== "manifest-connect" || error.name !== "NotFoundError") throw error;
+      }
+      if (loaded) await ManifestIO.verifyFiles(directory, loaded.manifest);
+      if (!loaded) {
+        const p = project();
+        p.directoryHandle = directory;
+        p.path = directory.name;
+        p.manifestSource = null;
+        manifestFor(p);
+        render();
+        toast("项目目录中没有 devingpanel.yaml；完善配置后保存即可创建。");
+        return;
+      }
       if (projects.some((item) => item.name === loaded.name && (action === "project-import" || item !== project()))) throw new Error("项目名已存在。");
       const p = action === "project-import" ? { id: Date.now(), name: loaded.name, path: directory.name, dockerfile: "", image: "", tag: "", platform: "auto", service: "", hostIds: [], files: [], args: [], env: [], ready: false } : project();
       if (action === "project-import") projects.push(p);
       useManifest(p, loaded, directory);
       close();
-      location.hash = `#/projects/${p.id}`;
+      location.hash = action === "manifest-connect" ? `#/projects/${p.id}/${state.tab || "build"}` : `#/projects/${p.id}`;
       render();
       toast("已读取项目目录中的 devingpanel.yaml。");
     } catch (error) {
@@ -2023,28 +2041,17 @@ document.addEventListener("click", async (e) => {
     }
     return;
   }
-  if (action === "manifest-reload") {
-    const p = project();
-    try {
-      const loaded = await ManifestIO.read(p.directoryHandle);
-      await ManifestIO.verifyFiles(p.directoryHandle, loaded.manifest);
-      useManifest(p, loaded, p.directoryHandle);
-      render();
-      toast("已重新读取项目配置。");
-    } catch (error) { toast(error.message || "重新读取配置失败。", true); }
-    return;
-  }
   if (action === "manifest-target-demo")
     return toast("请由管理员预先配置并确认本机目标主机与凭据。");
   if (action.startsWith("manifest-build-") || action.startsWith("manifest-file-") || action.startsWith("manifest-target-") || action.startsWith("manifest-arg-")) {
     const m = manifestFor(project());
-    const [, operation, op, indexText, rowText] = action.split("-");
-    const list = operation === "build" ? m.builds : operation === "file" ? m.files : m.targets;
-    const index = Number(indexText);
+    const [operation, op] = action.slice("manifest-".length).split("-");
+    const list = operation === "build" ? m.builds : operation === "file" ? m.files : targetDraftFor(project());
+    const index = Number(parts[0]);
     if (operation === "arg") {
       const args = m.builds[index]?.args;
       if (op === "add") args.push(["", ""]);
-      else args.splice(Number(rowText), 1);
+      else args.splice(Number(parts[1]), 1);
     } else if (op === "add") {
       list.push(operation === "build" ? { service: "", dockerfile: "Dockerfile", image: "", platform: "auto", args: [] } : operation === "target" ? { group: "", host: "" } : "");
     } else if (op === "remove") {
@@ -2057,75 +2064,106 @@ document.addEventListener("click", async (e) => {
     render();
     return;
   }
-  if (action === "manifest-save") {
-    const p = project(), m = manifestFor(p);
-    if (!p.name.trim() || projects.some((item) => item !== p && item.name === p.name.trim())) return toast("项目名为空或已存在。", true);
+  if (action === "target-save") {
+    const p = project();
+    try { p.pendingTargetIds = targetIdsFor(p); }
+    catch (error) { return toast(error.message, true); }
+    if (JSON.stringify(p.pendingTargetIds) !== JSON.stringify(p.hostIds)) return confirmAction("确认目标绑定变更", "取消绑定的主机专属环境变量可能被清理；请核对目标顺序与主机身份。", "target-commit", "确认保存");
+    el.dataset.action = "target-commit";
+    return el.click();
+  }
+  if (action === "target-commit") {
+    const p = project();
+    if (!p.pendingTargetIds) return;
+    commitTargets(p, p.pendingTargetIds);
+    delete p.pendingTargetIds;
+    close();
+    render();
+    toast("目标主机已保存（仅当前会话）；未写入 devingpanel.yaml。");
+    return;
+  }
+  if (action === "manifest-save" || action === "manifest-save-all") {
+    const p = project(), draft = manifestFor(p);
+    const tab = action === "manifest-save-all" ? "all" : state.tab || "build";
+    const m = tab === "all" ? structuredClone(draft) : structuredClone(p.manifest);
+    if (tab === "build") { m.tag = draft.tag; m.builds = structuredClone(draft.builds); }
+    if (tab === "compose") m.files = structuredClone(draft.files);
+    const name = tab === "all" || tab === "basic" ? p.name.trim() : p.manifestName || p.name.trim();
+    if (!name || projects.some((item) => item !== p && item.name === name)) return toast("项目名为空或已存在。", true);
     const services = m.builds.map((b) => b.service.trim());
     if (!m.tag.trim() || !m.builds.length || services.some((name) => !/^[A-Za-z][A-Za-z0-9_-]*$/.test(name)) || new Set(services).size !== services.length || m.builds.some((b) => !b.image.trim() || !b.dockerfile.trim() || b.dockerfile.startsWith("/") || b.dockerfile.includes("..") || (b.args || []).some(([key]) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)))) return toast("请检查 Tag、唯一服务、镜像、Dockerfile 和构建参数。", true);
     if (!m.files.length || m.files.some((file, i) => !/\.ya?ml$/i.test(file) || file.startsWith("/") || file.includes(":") || file.split(/[\\/]/).includes("..") || (i === 0 && /[\\/]/.test(file))) || new Set(m.files).size !== m.files.length) return toast("Compose 文件路径无效；首个文件须位于项目根目录。", true);
-    const keys = m.targets.map((t) => `${t.group}/${t.host}`);
-    if (!keys.length || new Set(keys).size !== keys.length || m.targets.some((t) => hosts.filter((h) => h.group === t.group && h.name === t.host).length !== 1) || state.previewYamlError) return toast("目标主机缺失或名称不唯一；请先由管理员处理。", true);
-    if (!p.directoryHandle) return toast("请先选择项目目录。", true);
-    if (JSON.stringify(m.targets) !== JSON.stringify(p.manifest.targets)) return confirmAction("确认目标绑定变更", "取消绑定的主机专属环境变量可能被清理；请核对目标顺序与主机身份。", "manifest-commit", "确认保存");
+    if (!p.directoryHandle) return toast("请在基本信息选择本地代码目录。", true);
+    if (p.restoreNeedsReview && m.builds.some((build) => build.args.some(([key, value]) => key && !value))) return toast("请补齐导入后清空的构建参数值，或明确删除不需要的参数。", true);
+    let targetIds = null;
+    if (tab === "all") {
+      try { targetIds = targetIdsFor(p); }
+      catch (error) { return toast(error.message, true); }
+    }
+    p.pendingManifestSave = { m, name, tab, sourceTab: state.tab, targetIds };
+    if (targetIds && JSON.stringify(targetIds) !== JSON.stringify(p.hostIds)) return confirmAction("确认目标绑定变更", "取消绑定的主机专属环境变量可能被清理；请核对目标顺序与主机身份。", "manifest-commit", "确认保存");
     el.dataset.action = "manifest-commit";
     return el.click();
   }
   if (action === "manifest-commit") {
-    const p = project(), m = manifestFor(p);
+    const p = project(), pending = p.pendingManifestSave;
+    if (!pending) return;
+    const { m, name, tab, sourceTab, targetIds } = pending;
     if (p.manifestSaving) return;
     p.manifestSaving = true;
     try {
-      const source = await ManifestIO.save(p.directoryHandle, p.manifestSource, p.name, m);
-      useManifest(p, { name: p.name, manifest: structuredClone(m), source }, p.directoryHandle);
+      const draft = structuredClone(manifestFor(p));
+      const draftName = p.name;
+      const source = await ManifestIO.save(p.directoryHandle, p.manifestSource, name, m);
+      p.restoreNeedsReview = false;
+      useManifest(p, { name, manifest: structuredClone(m), source }, p.directoryHandle);
+      if (targetIds) commitTargets(p, targetIds);
+      if (tab !== "all") {
+        p.manifestDraft = draft;
+        if (tab === "build") {
+          p.manifestDraft.tag = m.tag;
+          p.manifestDraft.builds = structuredClone(m.builds);
+        } else if (tab === "compose") p.manifestDraft.files = structuredClone(m.files);
+        if (tab !== "basic") p.name = draftName;
+      }
+      delete p.pendingManifestSave;
+      const envForm = sourceTab === "env" ? $("#env-form") : null;
       close();
       render();
-      toast("已写入项目目录中的 devingpanel.yaml。");
+      if (envForm) $("#env-form").replaceWith(envForm);
+      toast(sourceTab === "env" ? "YAML 配置已保存；环境变量值未保存。" : "已写入项目目录中的 devingpanel.yaml。");
     } catch (error) { toast(error.message || "保存项目配置失败。", true); }
     finally { p.manifestSaving = false; }
     return;
   }
-  if (action === "project-new" || action === "project-edit")
-    return projectForm(id);
-  if (action === "browse-directory")
-    return toast(
-      "静态浏览器不能读取完整本地目录路径，请手动填写；桌面版将调用系统选择器。",
-    );
+  if (action === "project-new") return projectForm();
   if (action === "project-save") {
     const f = $("#project-form");
     if (!f.reportValidity()) return;
     const data = new FormData(f);
     const name = data.get("name").trim();
     if (!name) return toast("项目名不能为空。", true);
-    let p = projects.find((p) => p.id === Number(f.dataset.id));
-    if (projects.some((x) => x !== p && x.name === name))
+    if (projects.some((x) => x.name === name))
       return toast("项目名已存在。", true);
-    if (p)
-      Object.assign(p, {
-        name,
-        path: data.get("path"),
-        dockerfile: data.get("dockerfile"),
-      });
-    else {
-      p = {
-        id: Date.now(),
-        name,
-        path: data.get("path"),
-        dockerfile: data.get("dockerfile"),
-        image: name.toLowerCase(),
-        tag: "{git-sha}",
-        platform: "auto",
-        service: "",
-        hostIds: [],
-        files: [],
-        args: [],
-        env: [],
-        ready: false,
-      };
-      projects.push(p);
-    }
+    const p = {
+      id: Date.now(),
+      name,
+      path: "",
+      dockerfile: "Dockerfile",
+      image: name.toLowerCase(),
+      tag: "{git-sha}",
+      platform: "auto",
+      service: "",
+      hostIds: [],
+      files: [],
+      args: [],
+      env: [],
+      ready: false,
+    };
+    manifestFor(p);
+    projects.push(p);
     close();
-    location.hash = `#/projects/${p.id}`;
-    render();
+    location.hash = `#/projects/${p.id}/basic`;
     toast("项目已保存，请完善部署配置。");
     return;
   }
@@ -2163,34 +2201,7 @@ document.addEventListener("click", async (e) => {
     location.hash = "#/deploy";
     return;
   }
-  if (action === "build-save") {
-    const f = $("#build-form");
-    if (!f.reportValidity()) return;
-    const data = new FormData(f),
-      p = project();
-    const args = $$(".kv-row", f).map((r) => [
-      $('[name="key"]', r).value.trim(),
-      $('[name="value"]', r).value,
-    ]);
-    if (p.restoreNeedsReview && args.some(([key, value]) => key && !value))
-      return toast(
-        "请补齐导入后清空的构建参数值，或明确删除不需要的参数。",
-        true,
-      );
-    Object.assign(p, {
-      image: data.get("image"),
-      tag: "{git-sha}",
-      platform: data.get("platform"),
-      service: data.get("service"),
-      args,
-      restoreNeedsReview: false,
-    });
-    updateProjectReadiness(p);
-    render();
-    toast("构建配置已保存（演示）。");
-    return;
-  }
-  if (action === "arg-add" || action === "env-add") {
+  if (action === "env-add") {
     const temp = document.createElement("div");
     temp.innerHTML = kvRows([["", ""]], action === "env-add");
     el.previousElementSibling.append(temp.querySelector(".kv-row"));
@@ -2217,72 +2228,19 @@ document.addEventListener("click", async (e) => {
         true,
       );
     $$('[name="value"]', $("#env-form")).forEach((i) => (i.value = ""));
-    toast("已验证变量格式；原型不保存敏感值，输入已清空。");
+    toast("已验证变量格式；原型不保存变量值，输入已清空。");
     return;
   }
-  if (action === "file-add")
-    return modal(
-      "添加 Compose 文件",
-      I18n.html`<form id="file-form" class="stack">${field("相对于项目根目录的路径", input("file", "", 'required placeholder="docker-compose.yml" class="mono"'))}<p class="muted">原型只维护文件列表，不读取磁盘或执行 Compose 校验。</p></form>`,
-      button("取消", "close") + button("添加", "file-save", "primary"),
-    );
-  if (action === "file-save") {
-    const f = $("#file-form");
-    if (!f.reportValidity()) return;
-    const name = $('[name="file"]').value.trim().replaceAll("\\", "/");
-    const p = project();
-    if (
-      !/\.ya?ml$/i.test(name) ||
-      name.startsWith("/") ||
-      name.includes(":") ||
-      name.split("/").includes("..") ||
-      (!p.files.length && name.includes("/"))
-    )
-      return toast(
-        "必须是项目内 YAML 文件，且首个文件必须位于项目根目录。",
-        true,
-      );
-    if (p.files.includes(name)) return toast("文件已存在。", true);
-    p.files.push(name);
-    close();
-    render();
-    toast("文件列表已更新（尚未检查文件内容）。");
-    return;
-  }
-  if (
-    action === "file-up" ||
-    action === "file-down" ||
-    action === "file-remove"
-  ) {
-    const p = project();
-    if (action === "file-remove") p.files.splice(id, 1);
-    else {
-      const to = id + (action === "file-up" ? -1 : 1);
-      [p.files[id], p.files[to]] = [p.files[to], p.files[id]];
-    }
-    updateProjectReadiness(p);
-    render();
-    return;
-  }
-  if (action === "targets-save" || action === "deploy-targets-save") {
-    if (action === "deploy-targets-save" && deployLocked())
+  if (action === "deploy-targets-save") {
+    if (deployLocked())
       return toast("发布配置已锁定。", true);
-    const ids = $$(
-      '[name="target"]:checked',
-      action === "targets-save" ? $("#content") : $("#dialog"),
-    ).map((i) => Number(i.value));
-    if (action === "targets-save") {
-      project().hostIds = ids;
-      updateProjectReadiness(project());
-      toast("目标主机已保存。");
-    } else {
-      if (state.stage === "p0" && ids.length > 1)
-        return toast("P0 仅支持单台 VPS。", true);
-      state.selectedHosts = ids;
-      state.parallel = Math.min(state.parallel, ids.length || 1);
-      state.deploy = null;
-      close();
-    }
+    const ids = $$('[name="target"]:checked', $("#dialog")).map((i) => Number(i.value));
+    if (state.stage === "p0" && ids.length > 1)
+      return toast("P0 仅支持单台 VPS。", true);
+    state.selectedHosts = ids;
+    state.parallel = Math.min(state.parallel, ids.length || 1);
+    state.deploy = null;
+    close();
     render();
     return;
   }

@@ -1,4 +1,5 @@
 const { test, expect } = require("@playwright/test");
+const { installProjectDirectory, connectProjectDirectory } = require("./project-directory.cjs");
 test.beforeEach(async ({ page }) => {
   page.scriptErrors = [];
   page.on("pageerror", (e) => page.scriptErrors.push(e.message));
@@ -141,9 +142,12 @@ test("all specified pages render without errors and fit desktop/mobile", async (
 test("platform mismatch and invalid Compose ordering block deployment", async ({
   page,
 }) => {
+  await installProjectDirectory(page);
   await page.goto("/#/projects/1/build");
-  await page.locator('[name="platform"]').selectOption("linux/arm64");
+  await connectProjectDirectory(page);
+  await page.locator('[name="manifest-platform-0"]').selectOption("linux/arm64");
   await page.getByRole("button", { name: "保存", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => window.testFiles["devingpanel.yaml"])).toContain("linux/arm64");
   await page.locator('nav a[href="#/deploy"]').click();
   await page.getByRole("button", { name: "开始发布", exact: true }).click();
   await expect(
@@ -152,11 +156,10 @@ test("platform mismatch and invalid Compose ordering block deployment", async ({
   await page.locator('nav a[href="#/projects"]').click();
   await page.getByRole("link", { name: "myapp", exact: true }).click();
   await page.getByRole("tab", { name: "Compose", exact: true }).click();
-  await page.getByRole("button", { name: "添加 compose 文件" }).click();
-  await page.locator('[name="file"]').fill("sub/prod.yml");
-  await page.getByRole("button", { name: "添加", exact: true }).click();
-  await page.locator('[data-action="file-up:2"]').click();
-  await page.locator('[data-action="file-up:1"]').click();
+  await page.getByRole("button", { name: "添加 Compose 文件" }).click();
+  await page.locator('[name="manifest-file-2"]').fill("sub/prod.yml");
+  await page.locator('[data-action="manifest-file-up:2"]').click();
+  await page.locator('[data-action="manifest-file-up:1"]').click();
   await expect(
     page.getByText("首个 Compose 文件必须位于项目根目录。", { exact: true }),
   ).toBeVisible();
@@ -321,18 +324,28 @@ test("YAML preview requires directory authorization before saving", async ({ pag
   await page.getByRole("button", { name: "原型预览选项" }).click();
   await page.locator('[name="preview-yaml-project"]').check();
   await page.getByRole("button", { name: "应用", exact: true }).click();
-  await expect(page.getByText("开发者维护的发布配置；请勿写入密码或令牌")).toBeVisible();
+  await expect(page.locator("main > .card")).toHaveCount(1);
+  await page.getByRole("tab", { name: "基本信息" }).click();
+  await expect(page.locator("main > .card")).toHaveCount(1);
+  await expect(page.locator('[name="path"]')).toHaveAttribute("readonly", "");
+  await expect(page.getByText("尚未授权本地代码目录")).toBeVisible();
+  await expect(page.getByRole("button", { name: "选择目录" })).toBeVisible();
+  await page.setViewportSize({ width: 800, height: 1000 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(800);
+  await page.getByRole("tab", { name: "构建配置" }).click();
   await expect(page.locator("#build-form")).toHaveCount(0);
   await page.locator('[name="manifest-tag"]').fill("release-{timestamp}");
   await page.getByRole("tab", { name: "Compose" }).click();
   await page.getByRole("tab", { name: "构建配置" }).click();
   await expect(page.locator('[name="manifest-tag"]')).toHaveValue("release-{timestamp}");
-  await expect(page.getByRole("button", { name: "保存到 devingpanel.yaml" })).toBeDisabled();
-  await expect(page.getByRole("button", { name: "重新读取配置" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "保存", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "全部保存" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "保存", exact: true })).toHaveAttribute("title", "请在基本信息选择本地代码目录");
   await page.getByRole("button", { name: "原型预览选项" }).click();
   await page.locator('[name="preview-yaml-error"]').check();
   await page.getByRole("button", { name: "应用", exact: true }).click();
-  await expect(page.getByRole("button", { name: "选择项目目录" })).toBeVisible();
+  await page.getByRole("tab", { name: "基本信息" }).click();
+  await expect(page.getByRole("button", { name: "选择目录" })).toBeVisible();
 });
 test("YAML editor exposes multiple builds but does not publish an unsaved draft", async ({ page }) => {
   await page.goto("/#/projects/1/build");
@@ -384,11 +397,33 @@ test("host form and project creation are usable", async ({ page }) => {
   await expect(page.getByText("test-host", { exact: true })).toBeVisible();
   await page.goto("/#/projects");
   await page.getByRole("button", { name: "新建项目", exact: true }).click();
+  await expect(page.locator('#project-form [name="dockerfile"]')).toHaveCount(0);
   await page.locator('[name="name"]').fill("demo-app");
-  await page.locator('[name="path"]').fill("D:\\demo-app");
   await page.getByRole("button", { name: "创建项目", exact: true }).click();
   await expect(page.locator("h1")).toHaveText("demo-app");
+  await page.getByRole("tab", { name: "构建配置" }).click();
+  await expect(page.locator('[name="manifest-dockerfile-0"]')).toHaveValue("Dockerfile");
+  await page.locator('[name="manifest-dockerfile-0"]').fill("Dockerfile.prod");
+  await expect(page.locator('[name="manifest-dockerfile-0"]')).toHaveValue("Dockerfile.prod");
   await expect(page.locator('[data-action^="project-deploy:"]')).toBeDisabled();
+});
+test("default project Compose edits write YAML only after Save", async ({ page }) => {
+  await installProjectDirectory(page, false);
+  await page.goto("/#/projects/1/compose");
+  await expect(page.getByText("查看部署配置摘要")).toHaveCount(0);
+  await page.evaluate(() => { window.testFiles["compose.extra.yaml"] = "services:\n  web:\n    image: ${DEVINGPANEL_IMAGE_WEB}\n"; });
+  await connectProjectDirectory(page, false);
+  await page.getByRole("button", { name: "添加 Compose 文件" }).click();
+  await page.locator('[name="manifest-file-2"]').fill("compose.extra.yaml");
+  expect(await page.evaluate(() => projects[0].files)).not.toContain("compose.extra.yaml");
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => window.testFiles["devingpanel.yaml"])).toContain("compose.extra.yaml");
+  expect(await page.evaluate(() => projects[0].files)).toContain("compose.extra.yaml");
+  await page.locator('[data-action="manifest-file-remove:2"]').click();
+  expect(await page.evaluate(() => projects[0].files)).toContain("compose.extra.yaml");
+  await page.getByRole("button", { name: "全部保存" }).click();
+  await expect.poll(() => page.evaluate(() => window.testFiles["devingpanel.yaml"])).not.toContain("compose.extra.yaml");
+  expect(await page.evaluate(() => projects[0].files)).not.toContain("compose.extra.yaml");
 });
 test("SSH host form switches connection settings and validates the active mode", async ({ page }) => {
   await page.goto("/#/hosts");
@@ -515,7 +550,7 @@ test("host groups can be created, renamed, and removed when empty", async ({ pag
   await page.locator('#dialog .dialog-foot [data-action="close"]').click();
   await expect(page.getByRole("row").filter({ hasText: "192.0.2.80" })).toContainText("qa-new");
 });
-test("YAML project targets prevent host group renaming", async ({ page }) => {
+test("project target bindings prevent host group renaming", async ({ page }) => {
   await page.goto("/#/hosts");
   await page.getByRole("button", { name: "原型预览选项" }).click();
   await page.locator('[name="preview-yaml-project"]').check();
@@ -525,7 +560,7 @@ test("YAML project targets prevent host group renaming", async ({ page }) => {
   await page.goto("/#/hosts");
   await page.getByRole("button", { name: "管理分组" }).click();
   await page.locator('[data-action="group-rename:0"]').click();
-  await expect(page.getByText("该分组已被项目 YAML 目标引用，请先调整项目目标。")).toBeVisible();
+  await expect(page.getByText("该分组已被项目目标引用，请先调整项目目标。")).toBeVisible();
   await expect(page.locator('[name="rename-group"]')).toHaveCount(0);
 });
 
@@ -691,9 +726,12 @@ test("terminating a paused release removes retry and cancels pending hosts", asy
 test("partial release history preserves individual results and configured image", async ({
   page,
 }) => {
+  await installProjectDirectory(page);
   await page.goto("/#/projects/1/build");
-  await page.locator('[name="image"]').fill("custom-web");
+  await connectProjectDirectory(page);
+  await page.locator('[name="manifest-image-0"]').fill("custom-web");
   await page.getByRole("button", { name: "保存", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => window.testFiles["devingpanel.yaml"])).toContain("custom-web");
   await page.locator('nav a[href="#/deploy"]').click();
   await page.getByRole("button", { name: "原型预览选项" }).click();
   await page.locator('[name="preview-scenario"]').selectOption("failure");

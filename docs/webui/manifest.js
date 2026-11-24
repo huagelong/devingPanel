@@ -3,6 +3,7 @@ const ManifestIO = (() => {
   const filename = "devingpanel.yaml";
   const limit = 64 * 1024;
   const encoder = new TextEncoder();
+  const imageVariable = (service) => `DEVINGPANEL_IMAGE_${service.toUpperCase().replace(/-/g, "_")}`;
   const exact = (value, keys, label) => {
     if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some((key) => !keys.includes(key))) throw new Error(`${label} 包含未知字段或格式错误。`);
   };
@@ -32,18 +33,12 @@ const ManifestIO = (() => {
       return { service: build.service, dockerfile: build.dockerfile, image: build.image, platform: build.platform, args: Object.entries(build.args || {}) };
     });
     if (new Set(builds.map((build) => build.service)).size !== builds.length) throw new Error("构建服务名不能重复。");
-    exact(data.deploy, ["compose", "targets"], "部署配置");
+    if (new Set(builds.map((build) => imageVariable(build.service))).size !== builds.length) throw new Error("构建服务生成的镜像变量名不能重复。");
+    exact(data.deploy, ["compose"], "部署配置");
     exact(data.deploy.compose, ["files"], "Compose 配置");
     const files = data.deploy.compose.files;
     if (!Array.isArray(files) || !files.length || files.length > 30 || files.some((file, i) => { try { pathParts(file, i === 0); return !/\.ya?ml$/i.test(file); } catch { return true; } }) || new Set(files).size !== files.length) throw new Error("Compose 文件路径无效；首个文件须位于项目根目录。");
-    const targets = data.deploy.targets;
-    if (!Array.isArray(targets) || !targets.length || targets.length > 100) throw new Error("请配置目标主机。");
-    targets.forEach((target) => {
-      exact(target, ["group", "host"], "目标主机");
-      if (typeof target.group !== "string" || !target.group.trim() || typeof target.host !== "string" || !target.host.trim()) throw new Error("目标组和主机别名不能为空。");
-    });
-    if (new Set(targets.map((target) => `${target.group}\0${target.host}`)).size !== targets.length) throw new Error("目标主机不能重复。");
-    return { name: data.name, manifest: { tag: data.tag, builds, files: [...files], targets: targets.map((target) => ({ ...target })) } };
+    return { name: data.name, manifest: { tag: data.tag, builds, files: [...files] } };
   }
   function serialize(name, manifest) {
     const data = {
@@ -51,7 +46,7 @@ const ManifestIO = (() => {
       name,
       tag: manifest.tag,
       builds: manifest.builds.map((build) => ({ service: build.service, dockerfile: build.dockerfile, image: build.image, platform: build.platform, args: Object.fromEntries(build.args) })),
-      deploy: { compose: { files: manifest.files }, targets: manifest.targets },
+      deploy: { compose: { files: manifest.files } },
     };
     const source = jsyaml.dump(data, { lineWidth: -1, noRefs: true });
     parse(source);
@@ -59,16 +54,17 @@ const ManifestIO = (() => {
   }
   async function verifyFiles(directory, manifest) {
     for (const build of manifest.builds) await fileIn(directory, build.dockerfile);
-    for (const path of manifest.files) await fileIn(directory, path);
-    for (const build of manifest.builds) {
-      const variable = `DEVINGPANEL_IMAGE_${build.service.toUpperCase().replace(/-/g, "_")}`;
-      let found = false;
-      for (const path of manifest.files) {
-        const file = await fileIn(directory, path);
-        const compose = jsyaml.load(await (await file.getFile()).text(), { schema: jsyaml.JSON_SCHEMA });
-        if (compose?.services?.[build.service]?.image === `\${${variable}}`) found = true;
+    const images = new Map();
+    for (const path of manifest.files) {
+      const file = await fileIn(directory, path);
+      const compose = jsyaml.load(await (await file.getFile()).text(), { schema: jsyaml.JSON_SCHEMA });
+      for (const [service, config] of Object.entries(compose?.services || {})) {
+        if (config && Object.hasOwn(config, "image")) images.set(service, config.image);
       }
-      if (!found) throw new Error(`Compose 服务 ${build.service} 须使用 \${${variable}} 镜像变量。`);
+    }
+    for (const build of manifest.builds) {
+      const variable = imageVariable(build.service);
+      if (images.get(build.service) !== `\${${variable}}`) throw new Error(`Compose 服务 ${build.service} 最终须使用 \${${variable}} 镜像变量。`);
     }
   }
   async function read(directory) {
@@ -80,10 +76,10 @@ const ManifestIO = (() => {
     let current;
     try { current = await read(directory); } catch (error) {
       if (error.name !== "NotFoundError") throw error;
-      if (expectedSource !== null) throw new Error("项目配置文件已被删除，请重新读取配置。");
+      if (expectedSource !== null) throw new Error("项目配置文件已被删除，请重新选择项目目录读取配置。");
     }
-    if (current && current.source !== expectedSource) throw new Error("项目配置文件已被外部修改，请重新读取配置。");
-    if (!current && expectedSource !== null) throw new Error("项目配置文件已被删除，请重新读取配置。");
+    if (current && current.source !== expectedSource) throw new Error("项目配置文件已被外部修改，请重新选择项目目录读取配置。");
+    if (!current && expectedSource !== null) throw new Error("项目配置文件已被删除，请重新选择项目目录读取配置。");
     const source = serialize(name, manifest);
     if (encoder.encode(source).length > limit) throw new Error("devingpanel.yaml 不能超过 64 KiB。");
     await verifyFiles(directory, manifest);

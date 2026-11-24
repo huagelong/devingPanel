@@ -1,4 +1,5 @@
 const { test, expect } = require("@playwright/test");
+const { installProjectDirectory, connectProjectDirectory } = require("./project-directory.cjs");
 const fs = require("node:fs/promises");
 const PASSWORD = "test backup password 2026!";
 async function setPassword(page) {
@@ -94,6 +95,9 @@ test("local export downloads a credential-free, versioned JSON file", async ({
 test("import previews, requires consent, applies config and resets trust and readiness", async ({
   page,
 }) => {
+  await installProjectDirectory(page, false);
+  await page.reload();
+  await setPassword(page);
   const data = await fixture(page);
   data.hosts[0].name = "restored-host";
   data.projects[0].name = "restored-project";
@@ -134,10 +138,13 @@ test("import previews, requires consent, applies config and resets trust and rea
     .getByRole("link", { name: "restored-project", exact: true })
     .click();
   await expect(page.getByText(/该项目来自配置备份/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "保存", exact: true })).toBeDisabled();
+  await connectProjectDirectory(page, false);
   await page.getByRole("button", { name: "保存", exact: true }).click();
   await expect(page.getByText(/请补齐导入后清空的构建参数值/)).toBeVisible();
-  await page.locator('[name="value"]').fill("production");
+  await page.locator('[name="manifest-arg-value-0-0"]').fill("production");
   await page.getByRole("button", { name: "保存", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => window.testFiles["devingpanel.yaml"])).toContain('name: restored-project');
   await expect(page.locator('[data-action="project-deploy:1"]')).toBeEnabled();
 });
 test("cancelled import is non-destructive and repeat selection still opens preview", async ({

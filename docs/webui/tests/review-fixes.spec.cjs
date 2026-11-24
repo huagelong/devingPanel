@@ -1,4 +1,5 @@
 const { test, expect } = require("@playwright/test");
+const { installProjectDirectory, connectProjectDirectory } = require("./project-directory.cjs");
 
 test("host dialog and history empty states follow page specifications", async ({ page }) => {
   await page.goto("/#/hosts");
@@ -101,14 +102,19 @@ test("verification during stop waits for other active batch members", async ({
 test("next release target count matches execution after binding changes", async ({
   page,
 }) => {
+  await installProjectDirectory(page);
   await page.goto("/#/deploy");
   await freeze(page);
   await page.getByRole("button", { name: "开始发布", exact: true }).click();
   await page.clock.runFor(12600);
   await expect(page.locator("tbody .badge")).toHaveText(["成功", "成功"]);
   await page.goto("/#/projects/1/targets");
-  await page.locator('[name="target"][value="2"]').uncheck();
+  await connectProjectDirectory(page);
+  await expect(page.locator('[name="manifest-host-2"]')).toHaveValue("web-3");
+  await page.locator('[data-action="manifest-target-remove:2"]').click();
+  await page.locator('[data-action="manifest-target-remove:1"]').click();
   await page.getByRole("button", { name: "保存", exact: true }).click();
+  await page.getByRole("button", { name: "确认保存" }).click();
   await page.locator('nav a[href="#/deploy"]').click();
   await expect(page.getByText("已选 1 台", { exact: true })).toBeVisible();
   await expect(page.locator('[name="parallel"] option')).toHaveCount(1);
@@ -119,31 +125,35 @@ test("next release target count matches execution after binding changes", async 
   await expect(page.getByText("发布标识已存在，不允许覆盖历史版本。")).toBeVisible();
   await expect(page.locator("tbody tr")).toHaveCount(2);
 });
-test("form project tag rule is fixed to git-sha", async ({ page }) => {
+test("project tag rule saves to YAML after directory authorization", async ({ page }) => {
+  await installProjectDirectory(page);
   await page.goto("/#/projects/1/build");
-  const tag = page.locator('[name="tag"]');
+  await connectProjectDirectory(page);
+  const tag = page.locator('[name="manifest-tag"]');
   await expect(tag).toHaveValue("{git-sha}");
-  await expect(tag).toHaveAttribute("readonly", "");
-  await page.locator('[name="image"]').fill("updated-image");
+  await tag.fill("release-{timestamp}");
   await page.getByRole("button", { name: "保存", exact: true }).click();
-  await expect(tag).toHaveValue("{git-sha}");
-  await page.goto("/#/deploy");
-  await expect(page.locator("#release-tag")).toHaveText("a1b2c3d");
+  await expect.poll(() => page.evaluate(() => window.testFiles["devingpanel.yaml"])).toContain("release-{timestamp}");
 });
 test("renaming preserves history and a new same-name project inherits none", async ({
   page,
 }) => {
+  await installProjectDirectory(page);
   await page.goto("/#/projects");
   await page.locator("summary").click();
-  await page.locator('[data-action="project-edit:1"]').click();
-  await page.locator('[name="name"]').fill("renamed-app");
-  await page.locator('[data-action="project-save"]').click();
+  await expect(page.getByRole("link", { name: "详情", exact: true })).toHaveCount(0);
+  await page.getByRole("link", { name: "编辑" }).click();
+  await expect(page).toHaveURL(/#\/projects\/1\/basic$/);
+  await connectProjectDirectory(page);
+  await page.locator('[name="manifest-name"]').fill("renamed-app");
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(page.locator("h1")).toHaveText("renamed-app");
+  await expect(page.locator('[name="path"]')).toHaveAttribute("readonly", "");
   await page.getByRole("tab", { name: "发布历史", exact: true }).click();
   await expect(page.locator("tbody tr")).toHaveCount(3);
   await page.locator('nav a[href="#/projects"]').click();
   await page.getByRole("button", { name: "新建项目", exact: true }).click();
   await page.locator('[name="name"]').fill("myapp");
-  await page.locator('[name="path"]').fill("D:\\new-project");
   await page.locator('[data-action="project-save"]').click();
   await page.getByRole("tab", { name: "发布历史", exact: true }).click();
   await expect(page.getByText("暂无发布记录")).toBeVisible();
@@ -152,7 +162,6 @@ test("sample history belongs to the new project and opens its details", async ({
   await page.goto("/#/projects");
   await page.getByRole("button", { name: "新建项目", exact: true }).click();
   await page.locator('[name="name"]').fill("1111");
-  await page.locator('[name="path"]').fill("D:\\code\\1111");
   await page.locator('[data-action="project-save"]').click();
   await page.getByRole("tab", { name: "发布历史", exact: true }).click();
   await page.getByRole("button", { name: "填充演示记录" }).click();
