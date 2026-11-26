@@ -57,6 +57,17 @@
 - 正式客户端的界面变更，必须同步更新 `docs/webui` 中对应的 WebUI 原型页面和 `docs/design` 中对应的设计文档。
 - `docs/webui` 原型的界面或交互变更，必须同步更新 `docs/design` 中对应的设计文档。
 
+### Impeccable 使用规则
+
+- 涉及界面设计、布局、视觉样式、响应式或交互体验时，使用 `impeccable` Skill，按当前任务选择子命令；纯后端任务不使用。
+- Skill 安装在用户级目录 `~/.codex/skills/impeccable`。使用前读取其中的 `SKILL.md`；Windows 下通过该目录的 `scripts/impeccable.cmd` 执行工具，工作目录保持为当前项目。
+- 使用前读取 `DESIGN.md`、对应的 `docs/design` 文档和 `docs/webui` 原型。Skill 的通用建议应服从本项目已有规范，复用现有 Token、组件和页面结构。
+- 分析阶段可使用 `audit` 检查实现问题、使用 `critique` 评估设计，只输出问题和建议；遵守首次需求只分析的规则，不修改代码或设计文件。
+- 用户明确要求实施后，按需使用 `polish` 调整细节、`adapt` 处理不同窗口尺寸、`harden` 完善边界状态。修改范围以当前需求为准，不因 Skill 的建议自行扩大范围。
+- `init` 用于记录产品背景到 `PRODUCT.md`，`document` 用于从现有实现生成 `DESIGN.md`。只有用户明确要求建立或整理相应文档时才使用；不自动重写设计规范或启用 hooks。
+- 完成界面修改后核对桌面与窄窗口状态，同步对应原型和设计文档，并继续执行现有的文案检查、代码审查和验证流程。
+- 使用示例：`$impeccable audit docs/webui` 检查原型问题；`$impeccable polish 项目编辑页` 在已明确的实施范围内调整页面细节。
+
 ## 工程决策原则
 
 - 优先选择长期可维护的方案，而不是只能临时运行的解决方案。
