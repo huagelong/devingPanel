@@ -147,6 +147,7 @@ const BackupUI = (() => {
     containers.splice(0);
     Object.assign(state, structuredClone(data.settings), {
       hostCollectionCustom: ![10, 30, 60, 300].includes(data.settings.hostCollectionIntervalSeconds),
+      keepCustom: ![1, 2, 3, 5, 10].includes(data.settings.keep),
       registry: false,
       registryConfigured: !!data.settings.registryAddress,
       registryDraftAddress: data.settings.registryAddress || "",

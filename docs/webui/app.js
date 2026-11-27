@@ -45,6 +45,9 @@ const paths = {
   copy: '<rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V3H3v13h5"/>',
   shield:
     '<path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Z"/><path d="m8 12 3 3 5-6"/>',
+  panelLeft: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
+  dockBottom: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 14h18"/>',
 };
 const icon = (name) =>
   I18n.html`<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${paths[name] || paths.box}</svg>`;
@@ -87,15 +90,19 @@ const card = (title, description, content) =>
   I18n.html`<section class="card"><div class="card-head"><h2>${I18n.t(title)}</h2>${description ? I18n.html`<p class="muted">${I18n.t(description)}</p>` : ""}</div><div class="pad">${content}</div></section>`;
 const table = (headers, rows) =>
   I18n.html`<div class="table-wrap"><table><thead><tr>${headers.map((h) => I18n.html`<th ${h === "操作" ? 'class="action-col"' : ""}>${I18n.t(h)}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table></div>`;
-const row = (cells) =>
-  I18n.html`<tr>${cells.map((c, i) => I18n.html`<td${i === cells.length - 1 && String(c).includes('class="actions"') ? ' class="action-col"' : ""}>${c?.i18nParts ? I18n.t(c) : c}</td>`).join("")}</tr>`;
+const row = (cells, attrs = "") =>
+  I18n.html`<tr ${attrs}>${cells.map((c, i) => I18n.html`<td${i === cells.length - 1 && String(c).includes('class="actions"') ? ' class="action-col"' : ""}>${c?.i18nParts ? I18n.t(c) : c}</td>`).join("")}</tr>`;
 const tabs = (items, active, action = "tab") =>
-  I18n.html`<div class="tabs" role="tablist">${items.map(([id, label]) => button(label, `${action}:${id}`, "", `role="tab" aria-selected="${id === active}" tabindex="${id === active ? 0 : -1}"`)).join("")}</div>`;
+  I18n.html`<div class="tabs-wrap"><div class="tabs" role="tablist">${items.map(([id, label]) => button(label, `${action}:${id}`, "", `role="tab" aria-selected="${id === active}" tabindex="${id === active ? 0 : -1}"`)).join("")}</div><small class="muted tab-scroll-hint" hidden>横向滚动查看更多页签</small></div>`;
 const menu = (items) =>
   I18n.html`<details class="menu"><summary aria-label="更多操作">${icon("more")}</summary><div class="menu-list">${items.join("")}</div></details>`;
 const head = (title, actions = "", localize = true) =>
   I18n.html`<div class="page-head"><h1>${localize ? I18n.t(title) : title}</h1><div class="actions">${actions}</div></div>`;
 const dataHead = (title, actions = "") => head(title, actions, false);
+const editorSection = (title, description, content) =>
+  I18n.html`<section class="editor-section"><div class="section-head"><h2>${I18n.t(title)}</h2>${description ? I18n.html`<p class="muted">${I18n.t(description)}</p>` : ""}</div><div class="editor-fields">${content}</div></section>`;
+const resourceBar = (label, count, controls = "") =>
+  I18n.html`<div class="resource-bar"><span class="muted">${esc(I18n.t(I18n.msg`${label} · ${count} 项`))}</span><div class="actions">${controls}</div></div>`;
 const go = (label, path, style = "", symbol = "") =>
   I18n.html`<a class="btn ${style}" href="#/${path}">${symbol ? icon(symbol) : ""}${I18n.t(label)}</a>`;
 const empty = (text, label, action, symbol = "folder") =>
@@ -273,6 +280,8 @@ const state = {
   group: "all",
   containerHost: 1,
   theme: "system",
+  sidebarCollapsed: false,
+  dock: null,
   keep: 3,
   autoCleanup: false,
   hostCollectionIntervalSeconds: 60,
@@ -309,6 +318,7 @@ const state = {
 };
 let logTimer;
 let pendingTabFocus = "";
+let pendingManifestFocus = "";
 let renderedHash = "";
 try {
   state.theme = localStorage.getItem("devingpanel-theme") || "system";
@@ -340,6 +350,14 @@ function theme(value) {
       (value === "system" &&
         matchMedia("(prefers-color-scheme: dark)").matches),
   );
+  const dark = document.documentElement.classList.contains("dark");
+  const toggle = $('#topbar [data-action="theme"]');
+  if (toggle) {
+    toggle.innerHTML = icon(dark ? "sun" : "moon");
+    toggle.setAttribute("aria-label", I18n.t(dark ? "切换至浅色" : "切换至深色"));
+    toggle.title = toggle.getAttribute("aria-label");
+  }
+  $$('[name="theme"]').forEach((radio) => { radio.checked = radio.value === value; });
   try {
     localStorage.setItem("devingpanel-theme", value);
   } catch {}
@@ -369,6 +387,7 @@ function modal(
   el.setAttribute("aria-labelledby", el.id + "-title");
   el.innerHTML = I18n.html`<div class="dialog-head"><h2 id="${el.id}-title">${localizeTitle ? I18n.t(title) : title}</h2>${ib("close", "关闭", "close")}</div>${content}${footer ? I18n.html`<div class="dialog-foot">${footer}</div>` : ""}`;
   if (!el.open) el.showModal();
+  refreshLayout();
 }
 function close() {
   // Invalidate the current operation synchronously; a delayed close event must
@@ -405,8 +424,33 @@ function parseRoute() {
 function dockerSetup() {
   return I18n.html`<section class="docker-setup"><div class="docker-setup-icon">${icon("box")}</div><h1>请先安装本机 Docker</h1><p>构建和发布依赖本机 Docker。安装并启动 Docker，检测可用后才能使用主机、项目、发布等功能。</p><div class="row wrap">${button("查看安装指引", "docker-setup", "primary")}${button("重新检测", "docker-detect")}${button("原型预览选项", "preview", "ghost")}</div><small>此网页原型不检测本机软件；可在“原型预览选项”中模拟 Docker 可用状态。</small></section>`;
 }
+function refreshLayout() {
+  $$(".table-wrap table").forEach((table) => {
+    const wrap = table.closest(".table-wrap");
+    const resource = !!table.closest(".resource-table");
+    wrap.classList.toggle("records", innerWidth <= 1023 || (resource && wrap.clientWidth < 1080));
+    const headers = [...table.tHead.rows[0].cells].map((cell) => cell.textContent);
+    [...table.tBodies[0].rows].forEach((row) => [...row.cells].forEach((cell, index) => {
+      cell.dataset.label = headers[index] || "";
+    }));
+  });
+  $$('.tabs').forEach((strip) => {
+    const active = $('[aria-selected="true"]', strip);
+    if (!active) return;
+    const bounds = strip.getBoundingClientRect(), item = active.getBoundingClientRect();
+    if (item.left < bounds.left) strip.scrollLeft -= bounds.left - item.left + 4;
+    else if (item.right > bounds.right) strip.scrollLeft += item.right - bounds.right + 4;
+    strip.nextElementSibling.hidden = strip.scrollWidth <= strip.clientWidth + 1;
+  });
+}
+window.addEventListener("resize", refreshLayout);
 function render() {
+  const focused = document.activeElement;
+  const restore = location.hash === renderedHash && focused?.closest("#content") && focused.name
+    ? { name: focused.name, value: focused.value, type: focused.type, start: focused.selectionStart, end: focused.selectionEnd } : null;
   $("#sidebar").setAttribute("aria-label", I18n.t("主导航"));
+  $("#statusbar")?.setAttribute("aria-label", I18n.t("状态栏"));
+  $("#dock-pane")?.setAttribute("aria-label", I18n.t("底部工作区"));
   let settingsLabel = "";
   if (state.route === "settings") {
     if (!settingsSections().some(([key]) => key === state.settingsSection))
@@ -418,12 +462,15 @@ function render() {
       ([key]) => key === state.settingsSection,
     )[1];
   }
+  $("#content").dataset.page = state.route;
+  $("#content").dataset.detail = state.id ? "true" : "false";
   const oldLog = $("#build-log");
   const oldScroll = oldLog?.scrollTop || 0;
   const followLog =
     !oldLog || oldLog.scrollHeight - oldScroll - oldLog.clientHeight < 16;
   const logOpen = oldLog?.closest("details").open;
   theme(state.theme);
+  document.documentElement.classList.toggle("sidebar-collapsed", !!state.sidebarCollapsed);
   const isDark = document.documentElement.classList.contains("dark");
   const title = state.docker ? navItems.find((n) => n[0] === state.route)[1] : "安装 Docker";
   $("#sidebar").innerHTML =
@@ -432,15 +479,19 @@ function render() {
       .map(
         ([id, label, symbol]) =>
           state.docker
-            ? I18n.html`<a href="#/${id}" class="${id === state.route ? "active" : ""}" ${id === state.route ? 'aria-current="page"' : ""}>${icon(symbol)}${I18n.t(label)}${id === "deploy" && state.deploy?.running ? '<span class="dot info"></span>' : ""}</a>`
-            : I18n.html`<span class="nav-disabled" aria-disabled="true">${icon(symbol)}${I18n.t(label)}</span>`,
+            ? I18n.html`<a href="#/${id}" title="${esc(I18n.t(label))}" class="${id === state.route ? "active" : ""}" ${id === state.route ? 'aria-current="page"' : ""}>${icon(symbol)}<span class="nav-label">${I18n.t(label)}</span>${id === "deploy" && state.deploy?.running ? '<span class="dot info"></span>' : ""}</a>`
+            : I18n.html`<span class="nav-disabled" title="${esc(I18n.t(label))}" aria-disabled="true">${icon(symbol)}<span class="nav-label">${I18n.t(label)}</span></span>`,
       )
       .join(
         "",
-      )}</nav><div class="sidebar-foot"><span class="row">${icon("shield")}仅 SSH · 无远端 Agent</span><p>交互原型 · 所有数值均为演示</p>${button("原型预览选项", "preview", "ghost")}<p>v0.1 · 本地构建，远端运行</p></div>`;
+      )}</nav><div class="sidebar-foot"><div class="row between"><span class="row"><span class="dot success"></span>仅 SSH · 无 Agent</span><span>v0.1</span></div><div class="sidebar-foot-actions"><small>交互原型 · 演示数据</small>${button("原型预览选项", "preview", "ghost")}</div></div>`;
   $("#topbar").innerHTML =
-    I18n.html`<div class="row">${ib("menu", "打开导航", "menu")}<a class="brand" href="#/dashboard"><svg class="brand-mark" viewBox="0 0 36 36" aria-hidden="true"><rect x="5" y="9" width="11" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 14h5M8 18h5M8 22h4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path class="brand-transfer" d="M17.5 18h5m-2.5-2.5L22.5 18 20 20.5" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><rect x="24" y="8" width="8" height="20" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M27 13h2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle class="brand-transfer-dot" cx="28" cy="23" r="1.25"/></svg>devingPanel</a></div><div class="top-actions"><span class="row"><span class="dot ${state.docker ? "success" : "destructive"}"></span><span class="docker-label">${state.docker ? I18n.t("本地 Docker 可用") : I18n.t("Docker 不可用")}</span></span>${ScreenLock.isEnabled() ? ib("lock", "立即锁屏", "screen-lock") : ""}${button(icon(isDark ? "sun" : "moon"), "theme", "ghost icon-btn", `aria-label="${I18n.t(isDark ? "切换至浅色" : "切换至深色")}" title="${I18n.t(isDark ? "切换至浅色" : "切换至深色")}"`)}</div>${state.deploy?.running ? I18n.t('<div class="global-progress" aria-label="发布进行中"></div>') : ""}`;
+    I18n.html`<div class="row">${ib("menu", "打开导航", "menu")}${ib("panelLeft", "折叠侧栏", "sidebar-toggle", `aria-pressed="${!!state.sidebarCollapsed}"`)}<a class="brand" href="#/dashboard"><svg class="brand-mark" viewBox="0 0 36 36" aria-hidden="true"><rect x="5" y="9" width="11" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 14h5M8 18h5M8 22h4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path class="brand-transfer" d="M17.5 18h5m-2.5-2.5L22.5 18 20 20.5" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><rect x="24" y="8" width="8" height="20" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M27 13h2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle class="brand-transfer-dot" cx="28" cy="23" r="1.25"/></svg>devingPanel</a></div><div class="top-actions">${state.docker ? button(I18n.html`${icon("search")}<span>${I18n.t("快速跳转…")}</span><kbd>Ctrl+K</kbd>`, "command-palette", "command-trigger", "", false) : ""}<span class="row"><span class="dot ${state.docker ? "success" : "destructive"}"></span><span class="docker-label">${state.docker ? I18n.t("本地 Docker 可用") : I18n.t("Docker 不可用")}</span></span>${ScreenLock.isEnabled() ? ib("lock", "立即锁屏", "screen-lock") : ""}${button(icon(isDark ? "sun" : "moon"), "theme", "ghost icon-btn", `aria-label="${I18n.t(isDark ? "切换至浅色" : "切换至深色")}" title="${I18n.t(isDark ? "切换至浅色" : "切换至深色")}"`)}</div>${state.deploy?.running ? I18n.t('<div class="global-progress" aria-label="发布进行中"></div>') : ""}`;
   $('#topbar [data-action="menu"]').classList.add("mobile-menu");
+  $('#topbar [data-action="sidebar-toggle"]').classList.add("desktop-only");
+  const onlineCount = hosts.filter((h) => h.online).length;
+  $("#statusbar").innerHTML = I18n.html`<div class="row"><span class="row"><span class="dot ${state.docker ? "success" : "destructive"}"></span><span>${state.docker ? I18n.t("本地 Docker 可用") : I18n.t("Docker 不可用")}</span></span><span class="statusbar-sep"></span><span>${esc(I18n.t("在线主机"))} ${onlineCount}/${hosts.length}</span>${state.deploy?.running ? I18n.html`<span class="statusbar-sep"></span><a href="#/deploy" class="info">${esc(state.deploy.project)} · ${I18n.t("进行中")}</a>` : ""}</div><div class="row statusbar-right"><span class="muted">Ctrl+K ${I18n.t("快速跳转")}</span><span class="statusbar-sep"></span><span class="muted">v0.1</span></div>`;
+  renderDock();
   if (!state.docker) {
     $("#content").innerHTML = dockerSetup();
     document.title = `${I18n.t(title)} · devingPanel`;
@@ -476,6 +527,20 @@ function render() {
       newLog.closest("details").open = logOpen;
     newLog.scrollTop = followLog ? newLog.scrollHeight : oldScroll;
   }
+  if (restore) {
+    const control = $$('[name]', $('#content')).find((item) => item.name === restore.name && (restore.type !== "radio" || item.value === restore.value));
+    control?.focus({ preventScroll: true });
+    if (control && restore.start !== null && ["text", "password", "search", "url", "tel"].includes(control.type)) control.setSelectionRange(restore.start, restore.end);
+  }
+  if (state.route === "projects" && state.id) {
+    paintManifestErrors(project());
+    syncProjectDraft();
+  }
+  if (pendingManifestFocus) {
+    $$('[name]', $('#content')).find((item) => item.name === pendingManifestFocus)?.focus();
+    pendingManifestFocus = "";
+  }
+  refreshLayout();
   if (pendingTabFocus) {
     $$('[role="tab"]', $("#content")).find((tab) => tab.dataset.action === pendingTabFocus)?.focus();
     pendingTabFocus = "";
@@ -488,7 +553,7 @@ function historyTable(records, compact = false, projectScoped = false) {
       : empty("暂无发布记录", projectScoped ? "填充演示记录" : "去发布", projectScoped ? "history-demo" : "nav:deploy", "rocket");
   return table(
     compact
-      ? ["时间", "项目", "发布标识", "结果", "耗时"]
+      ? ["时间", "项目", "发布标识", "目标", "结果", "耗时", "操作"]
       : [
           "时间",
           ...(!projectScoped ? ["项目"] : []),
@@ -503,27 +568,66 @@ function historyTable(records, compact = false, projectScoped = false) {
         esc(r.time),
         ...(!projectScoped ? [esc(r.project)] : []),
         I18n.html`<span class="mono">${esc(r.tag)}</span>`,
-        ...(!compact ? [I18n.msg`${r.targets.length} 台`] : []),
+        I18n.msg`${r.targets.length} 台`,
         badge(r.result, r.tone),
         r.duration,
-        ...(!compact
-          ? [
-              I18n.html`<div class="actions">${button("详情", `history:${r.id}`, "ghost")}${!projectScoped ? button("回滚", `rollback:${r.id}`, "", state.keep === 1 ? I18n.t('disabled title="仅保留当前版本，无法回滚"') : "") : ""}</div>`,
-            ]
-          : []),
+        I18n.html`<div class="actions">${button("详情", `history:${r.id}`, "ghost")}${!compact && !projectScoped ? button("回滚", `rollback:${r.id}`, "", state.keep === 1 ? I18n.t('disabled title="仅保留当前版本，无法回滚"') : "") : ""}</div>`,
       ]),
     ),
   );
 }
+function dashboardTaskKey(d) {
+  return `${d.running}:${d.paused}:${d.rows.some((row) => row.status === "待核实")}`;
+}
+function dashboardTaskLabel(d) {
+  if (d.rows.some((row) => row.status === "待核实")) return "结果待核实";
+  if (d.paused) return "已暂停";
+  return "进行中";
+}
 function dashboard() {
   const items = state.view === "empty" ? [] : hosts;
-  return (
-    head("总览", go("去发布", "deploy", "primary")) +
-    (items.length
-      ? I18n.html`<div class="grid hosts-grid ${items.length > 8 ? "scroll-limited" : ""}">${items.map((h) => I18n.html`<a href="#/hosts/${h.id}" class="card compact host-card"><div class="row between"><div class="row"><span class="dot ${h.online ? "success" : "destructive"}"></span><strong>${esc(h.name)}</strong></div><span class="mono muted">${esc(h.address)}</span></div>${state.stage !== "p0" ? I18n.html`<div class="grid two" style="margin-top:16px">${["cpu", "memory"].map((key, i) => I18n.html`<div><div class="row between"><small>${i ? I18n.t("内存") : "CPU"}</small><span>${h.online ? h[key] + "%" : "--"}</span></div>${h.online ? progress(h[key]) : ""}</div>`).join("")}</div><p class="row between muted"><span>容器 ${h.online ? h.containers + I18n.t(" 运行") : "--"}</span><span>磁盘 ${h.online ? h.disk + "%" : "--"}</span></p>` : I18n.html`<p class="muted">Docker ${h.online ? I18n.t("已连接") : I18n.t("不可达")}</p>`}</a>`).join("")}</div>`
-      : I18n.html`<section class="card">${empty("添加你的第一台 VPS", "添加主机", "host-new", "server")}</section>`) +
-    I18n.html`<section class="card"><div class="card-head"><h2>最近发布</h2><p class="muted">最近 5 次发布</p></div>${historyTable(state.view === "empty" ? [] : history.slice(0, 5), true)}<div class="table-foot">${go("查看全部", "deploy/0/history", "ghost")}</div></section>`
-  );
+  const projectItems = state.view === "empty" ? [] : projects;
+  const records = state.view === "empty" ? [] : history;
+  const notices = items.filter((h) => !h.online).map((h) =>
+    I18n.html`<a class="attention-item" href="#/hosts/${h.id}">${icon("alert")}<span><strong>${esc(h.name)}</strong><small>主机离线，检查连接后再发布</small></span>${icon("chevron")}</a>`);
+  // A historical failure is not an active problem after a newer release succeeds.
+  const latest = new Map();
+  [...records].sort((a, b) => b.time.localeCompare(a.time)).forEach((r) => {
+    if (!latest.has(r.projectId)) latest.set(r.projectId, r);
+  });
+  latest.forEach((r) => {
+    if (["destructive", "warning"].includes(r.tone)) notices.push(
+      button(I18n.html`${icon("alert")}<span><strong>${esc(r.project)}</strong><small>${esc(I18n.t(r.result))}</small></span>${icon("chevron")}`, `history:${r.id}`, "attention-item ghost", "", false));
+  });
+  const d = state.view === "empty" ? null : state.deploy;
+  const onlineHosts = items.filter((h) => h.online);
+  const offlineCount = items.length - onlineHosts.length;
+  const readyProjects = projectItems.filter((p) => projectReady(p)).length;
+  const runningContainers = onlineHosts.reduce((sum, h) => sum + h.containers, 0);
+  const avgCpu = onlineHosts.length ? Math.round(onlineHosts.reduce((sum, h) => sum + h.cpu, 0) / onlineHosts.length) : null;
+  const avgMem = onlineHosts.length ? Math.round(onlineHosts.reduce((sum, h) => sum + h.memory, 0) / onlineHosts.length) : null;
+  const latestRecord = records[0];
+  const summaryStrip = I18n.html`<section class="overview-stats" aria-label="状态摘要"><div class="overview-stat"><div class="row between"><span class="muted">在线主机</span><small class="muted">${items.length ? (offlineCount ? I18n.t(I18n.msg`${offlineCount} 台离线`) : I18n.t("全部在线")) : I18n.t("暂无主机")}</small></div><strong>${onlineHosts.length} / ${items.length}</strong></div><div class="overview-stat"><div class="row between"><span class="muted">已配置项目</span><small class="muted">${esc(I18n.t(I18n.msg`${readyProjects} 个就绪`))}</small></div><strong>${projectItems.length}</strong></div><div class="overview-stat"><div class="row between"><span class="muted">${state.stage !== "p0" ? I18n.t("运行容器") : I18n.t("Docker 环境")}</span><small class="muted">${state.stage !== "p0" ? (avgCpu !== null ? esc(I18n.t(I18n.msg`均值 CPU ${avgCpu}% · 内存 ${avgMem}%`)) : I18n.t("暂无在线采样")) : I18n.t("本地可用")}</small></div><strong>${state.stage !== "p0" ? runningContainers : I18n.t("就绪")}</strong></div><div class="overview-stat"><div class="row between"><span class="muted">最近发布</span><small class="muted mono">${latestRecord ? esc(latestRecord.duration) : "—"}</small></div><div class="row between">${latestRecord ? badge(latestRecord.result, latestRecord.tone) + `<small class="muted mono truncate">${esc(latestRecord.project)} · ${esc(latestRecord.tag)}</small>` : `<span class="muted">${I18n.t("暂无记录")}</span>`}</div></div></section>`;
+  const projectPanel = projectItems.length
+    ? table(
+        ["项目", "本地路径", "目标", "状态", "操作"],
+        projectItems.slice(0, 5).map((p) =>
+          row([
+            I18n.html`<a href="#/projects/${p.id}"><strong>${esc(p.name)}</strong></a>`,
+            I18n.html`<span class="mono truncate" title="${esc(p.path)}">${esc(p.path)}</span>`,
+            I18n.msg`${p.hostIds.length} 台`,
+            badge(projectReady(p) ? "就绪" : "待完善", projectReady(p) ? "success" : "warning"),
+            I18n.html`<div class="actions">${button("发布", `project-deploy:${p.id}`, "ghost", !projectReady(p) ? I18n.t('disabled title="请完善 Compose、部署服务和目标主机"') : "")}</div>`,
+          ]),
+        ),
+      )
+    : I18n.html`<div class="pad muted">暂无项目，点击右上角或前往项目页创建。</div>`;
+  return head("总览", go("去发布", "deploy", "primary")) +
+    I18n.html`<p class="page-intro">查看发布结果和主机状态，继续当前工作。</p>` +
+    summaryStrip +
+    (notices.length ? I18n.html`<section class="attention"><div class="attention-head row between"><h2>需要处理</h2><small class="muted">${esc(I18n.t(I18n.msg`${notices.length} 项待确认`))}</small></div><div class="attention-list">${notices.slice(0, 4).join("")}</div>${notices.length > 4 ? I18n.html`<div class="attention-more"><span>${esc(I18n.t(I18n.msg`还有 ${notices.length - 4} 项，请查看主机和发布历史。`))}</span>${go("主机", "hosts", "link")}${go("发布历史", "deploy/0/history", "link")}</div>` : ""}</section>` : "") +
+    (d && (d.running || d.paused) ? I18n.html`<a href="#/deploy" class="current-task" id="dashboard-task" data-state="${dashboardTaskKey(d)}"><div>${badge(dashboardTaskLabel(d), d.paused ? "warning" : "info")}<strong>${esc(d.project)}</strong><span class="mono">${esc(d.tag)}</span></div><span>继续查看${icon("chevron")}</span></a>` : "") +
+    I18n.html`<div class="overview-layout"><div class="overview-main"><section class="activity-section"><div class="section-head row between"><div><h2>最近发布</h2><p class="muted">最近 6 次发布</p></div>${go("查看全部", "deploy/0/history", "ghost")}</div><div class="activity-card">${historyTable(records.slice(0, 6), true)}</div></section><section class="overview-projects"><div class="section-head row between"><h2>项目状态</h2>${go("全部项目", "projects", "ghost")}</div><div class="activity-card">${projectPanel}</div></section></div><section class="host-overview"><div class="section-head row between"><h2>主机概览</h2>${go("查看全部", "hosts", "ghost")}</div>${items.length ? I18n.html`<div class="hosts-grid host-summary-list ${items.length > 8 ? "scroll-limited" : ""}">${items.map((h) => I18n.html`<a href="#/hosts/${h.id}" class="host-summary"><div class="row between"><strong>${esc(h.name)}</strong>${badge(h.online ? "在线" : "离线", h.online ? "success" : "destructive")}</div><div class="row between muted"><span class="mono">${esc(h.address)}</span>${state.stage !== "p0" ? I18n.html`<small>${h.online ? esc(I18n.t(I18n.msg`${h.containers} 容器`)) : "--"}</small>` : ""}</div>${state.stage !== "p0" ? I18n.html`<div class="host-readings"><span>CPU <b>${h.online ? h.cpu + "%" : "--"}</b></span><span>内存 <b>${h.online ? h.memory + "%" : "--"}</b></span><span>磁盘 <b>${h.online ? h.disk + "%" : "--"}</b></span></div>${h.online ? progress(Math.max(h.cpu, h.memory), Math.max(h.cpu, h.memory) > 80 ? "warning" : "") : ""}` : I18n.html`<p class="muted">Docker ${h.online ? I18n.t("已连接") : I18n.t("不可达")}</p>`}</a>`).join("")}</div>` : empty("添加你的第一台 VPS", "添加主机", "host-new", "server")}</section></div>`;
 }
 function hostsPage() {
   if (state.id) return hostDetail();
@@ -533,7 +637,7 @@ function hostsPage() {
       : hosts.filter((h) => state.group === "all" || h.group === state.group);
   return (
     head("主机", button(icon("plus") + "添加主机", "host-new", "primary")) +
-    I18n.html`<div class="row wrap">${select("host-group", [["all", "全部分组"], ...hostGroups, ...(hosts.some((host) => host.group === "未分组") ? ["未分组"] : [])], state.group, 'class="inline-select" aria-label="主机分组"')}${button(icon("settings") + I18n.t("管理分组"), "host-groups", "", "", false)}</div><section class="card">${
+    I18n.html`<div class="resource-bar"><div class="row wrap">${select("host-group", [["all", "全部分组"], ...hostGroups, ...(hosts.some((host) => host.group === "未分组") ? ["未分组"] : [])], state.group, 'class="inline-select" aria-label="主机分组"')}${button(icon("settings") + I18n.t("管理分组"), "host-groups", "", "", false)}</div><small class="muted">${esc(I18n.t(I18n.msg`共 ${items.length} 台主机`))}</small></div><section class="card resource-table">${
       items.length
         ? table(
             [
@@ -568,13 +672,20 @@ function hostsPage() {
                 ),
                 missing ? I18n.t("SSH 已连接") : h.online ? I18n.t("2 分钟前") : I18n.t("连接超时"),
                 I18n.html`<div class="actions">${ib("refresh", "测试连接", `host-test:${h.id}`)}${menu([go("详情", `hosts/${h.id}`, "ghost", "eye"), button(icon("terminal") + I18n.t("连接"), `host-connect:${h.id}`, "ghost", "", false), button(icon("pencil") + I18n.t("编辑"), `host-edit:${h.id}`, "ghost", "", false), button(icon("copy") + I18n.t("复制"), `host-copy:${h.id}`, "ghost", "", false), button(icon("trash") + I18n.t("删除"), `host-delete:${h.id}`, "ghost destructive", "", false)])}</div>`,
-              ]);
+              ], `data-context="host:${h.id}"`);
             }),
           )
         : empty("还没有主机", "添加主机", "host-new", "server")
     }</section>`
   );
 }
+
+function cpuTrend(h) {
+  const samples = [30, 36, 28, 62, 53, 68, 43, 55, 48, 78, 64, 70, h.cpu];
+  const summary = I18n.t(I18n.msg`当前 ${h.cpu}% · 峰值 ${Math.max(...samples)}%`);
+  return I18n.html`<svg class="chart" viewBox="0 0 600 200" role="img" aria-label="${esc(I18n.t(I18n.msg`CPU 使用率，近 10 分钟，演示数据。${summary}`))}">${[0, 50, 100].map((value) => `<line x1="80" y1="${170 - value * 1.5}" x2="590" y2="${170 - value * 1.5}"/><text x="2" y="${175 - value * 1.5}">${value}%</text>`).join("")}<polyline points="${samples.map((value, i) => `${80 + i * 510 / (samples.length - 1)},${170 - value * 1.5}`).join(" ")}"/></svg><div class="row between wrap muted"><small>10 分钟前 → 现在</small><small>${esc(summary)}</small></div>`;
+}
+
 function hostDetail() {
   const h = hosts.find((h) => h.id === state.id);
   if (!h) return empty("主机不存在", "返回主机列表", "nav:hosts", "server");
@@ -589,10 +700,10 @@ function hostDetail() {
         ["地址", h.address],
         ["SSH 端口", h.port],
         ["登录用户", h.user],
-        ["认证方式", I18n.t("私钥（已安全保存 · 演示）")],
+        ["认证方式", I18n.t(h.auth === "key" ? "使用凭据（演示）" : h.auth === "none" ? "无密码（演示）" : "密码（演示）")],
         ["分组", h.group],
-        ["系统 / 内核", "Ubuntu 24.04 / Linux 6.8"],
-        ["Docker 版本", "27.3.1 / Compose v2.29"],
+        ["系统 / 内核", h.online ? I18n.t("Ubuntu 24.04 / Linux 6.8（演示）") : I18n.t("未检测")],
+        ["Docker 版本", missingDocker ? I18n.t("未安装") : h.online ? I18n.t("27.3.1 / Compose v2.29（演示）") : I18n.t("未检测")],
         ["架构", "linux/" + h.arch],
         ["Agent", I18n.t("无")],
       ]
@@ -607,7 +718,7 @@ function hostDetail() {
   else if (!h.online)
     body = I18n.html`<div class="card">${empty("连接已断开", "重连", `host-test:${h.id}`, "alert")}</div>`;
   else
-    body = I18n.html`<div class="grid metrics">${[
+    body = I18n.html`<div class="grid metrics metric-strip">${[
       ["CPU", h.cpu + "%", h.cpu],
       ["内存", "2.1 / 3.7 GB", h.memory],
       ["磁盘", h.disk + "%", h.disk],
@@ -615,11 +726,11 @@ function hostDetail() {
     ]
       .map(
         ([label, value, p]) =>
-          I18n.html`<div class="card compact"><h3 class="muted">${I18n.t(label)}</h3><div class="stat ${p > 90 ? "destructive" : p > 80 ? "warning" : ""}">${value}</div>${p !== null ? progress(p) : "<small>↓ 300 KB/s</small>"}</div>`,
+          I18n.html`<div class="metric-reading"><h3 class="muted">${I18n.t(label)}</h3><div class="stat ${p > 90 ? "destructive" : p > 80 ? "warning" : ""}">${value}</div>${p !== null ? progress(p) : "<small>↓ 300 KB/s</small>"}</div>`,
       )
       .join(
         "",
-      )}</div>${state.stage === "p2" ? card("资源趋势", "近 10 分钟 · 演示数据，仅客户端在线期间采样", I18n.html`<svg class="chart" viewBox="0 0 600 180" role="img" aria-label="CPU 使用率趋势"><line x1="0" y1="40" x2="600" y2="40"/><line x1="0" y1="90" x2="600" y2="90"/><line x1="0" y1="140" x2="600" y2="140"/><polyline points="0,125 50,115 100,128 150,75 200,90 250,65 300,104 350,83 400,95 450,48 500,70 550,60 600,78"/></svg><div class="row between muted"><small>10 分钟前</small><small>CPU · 现在</small></div>`) : ""}<section class="card"><div class="card-head row between"><h2>运行的容器</h2><small>每 5s 刷新 · 原型不实际采样</small></div>${table(
+      )}</div><div class="monitor-layout ${state.stage === "p2" ? "with-trend" : ""}">${state.stage === "p2" ? editorSection("资源趋势", "近 10 分钟 · 演示数据，仅客户端在线期间采样", cpuTrend(h)) : ""}<section class="resource-section"><div class="section-head row between"><h2>运行的容器</h2><small>每 5s 刷新 · 原型不实际采样</small></div>${table(
       ["名称", "镜像", "状态", "CPU", "内存", "操作"],
       containers
         .filter((c) => c.host === h.id && c.state === "running")
@@ -631,15 +742,17 @@ function hostDetail() {
             c.cpu,
             c.memory,
             containerActions(c),
-          ]),
+          ], `data-context="container:${c.id}"`),
         ),
-    )}</section>`;
+    )}</section></div>`;
   return (
+    I18n.html`<div class="breadcrumb">${go("主机", "hosts", "link")}${icon("chevron")}<span>${esc(h.name)}</span></div>` +
     dataHead(
       esc(h.name),
       button(icon("terminal") + I18n.t("连接"), `host-connect:${h.id}`, "", "", false) + button("编辑", `host-edit:${h.id}`) +
         (state.stage !== "p0" ? go("打开容器管理", `containers/${h.id}`) + go("镜像管理", `containers/${h.id}/images`) : ""),
     ) +
+    I18n.html`<div class="object-meta">${badge(missingDocker ? "Docker 未安装" : h.online ? "在线" : "离线", missingDocker ? "warning" : h.online ? "success" : "destructive")}<span class="mono">${esc(h.address)}:${h.port}</span><span>${esc(h.group)}</span></div>` +
     tabs(
       [
         ...(state.stage !== "p0" ? [["monitor", "资源监控"]] : []),
@@ -660,7 +773,8 @@ function projectsPage() {
   if (state.id) return projectDetail();
   return (
     head("项目", button("导入已配置项目", "project-import") + button(icon("plus") + "新建项目", "project-new", "primary")) +
-    I18n.html`<section class="card">${
+    resourceBar(I18n.t("项目"), state.view === "empty" ? 0 : projects.length) +
+    I18n.html`<section class="card resource-table">${
       state.view === "empty" || !projects.length
         ? empty("还没有项目", "新建项目", "project-new")
         : table(
@@ -672,11 +786,11 @@ function projectsPage() {
                 p.hostIds.length,
                 p.ready ? I18n.t("2 小时前 · 20261024-143200") : "—",
                 badge(
-                  p.ready ? I18n.t("就绪") : targetDraftFor(p).some((t) => hosts.filter((h) => h.group === t.group && h.name === t.host).length !== 1) ? I18n.t("需管理员处理") : I18n.t("待完善"),
-                  p.ready ? "success" : "warning",
+                  manifestDirty(p) ? I18n.t("未保存") : p.ready ? I18n.t("就绪") : targetDraftFor(p).some((t) => hosts.filter((h) => h.group === t.group && h.name === t.host).length !== 1) ? I18n.t("需管理员处理") : I18n.t("待完善"),
+                  p.ready && !manifestDirty(p) ? "success" : "warning",
                 ),
                 I18n.html`<div class="actions">${button("发布", `project-deploy:${p.id}`, "primary", !projectReady(p) ? I18n.t('disabled title="请完善 Compose、部署服务和目标主机"') : "")}${menu([go("编辑", `projects/${p.id}/basic`, "ghost"), button("删除", `project-delete:${p.id}`, "ghost destructive")])}</div>`,
-              ]),
+              ], `data-context="project:${p.id}"`),
             ),
           )
     }</section>`
@@ -692,6 +806,7 @@ function manifestFor(p) {
     files: [...p.files],
   };
   if (!p.manifestDraft) p.manifestDraft = structuredClone(p.manifest);
+  if (p.nameDraft === undefined) p.nameDraft = p.name;
   return p.manifestDraft;
 }
 function targetRowsFor(p) {
@@ -727,6 +842,8 @@ function useManifest(p, loaded, directory) {
   p.manifestSource = loaded.source;
   p.manifestName = loaded.name;
   p.name = loaded.name;
+  p.nameDraft = loaded.name;
+  p.manifestErrors = [];
   p.manifest = loaded.manifest;
   p.manifestDraft = structuredClone(loaded.manifest);
   p.files = [...loaded.manifest.files];
@@ -734,19 +851,149 @@ function useManifest(p, loaded, directory) {
   Object.assign(p, { tag: loaded.manifest.tag, image: first.image, service: first.service, dockerfile: first.dockerfile, platform: first.platform, args: structuredClone(first.args) });
   updateProjectReadiness(p);
 }
+
+function manifestDirty(p) {
+  return (p.nameDraft !== undefined && p.nameDraft !== p.name) ||
+    (p.manifestDraft && JSON.stringify(p.manifestDraft) !== JSON.stringify(p.manifest)) ||
+    (p.targetDraft && JSON.stringify(p.targetDraft) !== JSON.stringify(targetRowsFor(p)));
+}
+function syncProjectDraft() {
+  const p = project();
+  if (!p || state.route !== "projects" || !state.id) return;
+  const status = $("#project-draft");
+  if (status) status.hidden = !manifestDirty(p);
+  const readiness = $("#project-readiness");
+  if (readiness) readiness.innerHTML = badge(projectReady(p) ? "就绪" : "待完善", projectReady(p) ? "success" : "warning");
+  for (const [id, value] of [["project-build-count", manifestFor(p).builds.length], ["project-file-count", manifestFor(p).files.length], ["project-target-count", targetDraftFor(p).length]]) {
+    const node = document.getElementById(id);
+    if (node) node.textContent = value;
+  }
+  $$('[data-action="manifest-save"], [data-action="manifest-save-all"]').forEach((button) => {
+    button.disabled = !!p.manifestSaving || !p.directoryHandle;
+    button.setAttribute("aria-busy", String(!!p.manifestSaving));
+  });
+  $$('[data-action="manifest-connect"], [data-action="manifest-discard"], [data-action="target-save"]').forEach((button) => { button.disabled = !!p.manifestSaving; });
+  const deploy = $(`[data-action="project-deploy:${p.id}"]`);
+  if (deploy) deploy.disabled = !projectReady(p);
+}
+function paintManifestErrors(p) {
+  const summary = $("#manifest-errors");
+  if (!summary || !p) return;
+  $$(".field-error", $("#content")).forEach((error) => error.remove());
+  $$('[aria-invalid="true"]', $("#content")).forEach((control) => {
+    control.removeAttribute("aria-invalid");
+    control.removeAttribute("aria-describedby");
+  });
+  const issues = p.manifestErrors || [];
+  summary.hidden = !issues.length;
+  summary.innerHTML = issues.length ? `<strong>${I18n.t("请修正以下问题后重试")}</strong><ul>${issues.map((issue) => `<li>${esc(I18n.t(issue.message))}</li>`).join("")}</ul>` : "";
+  issues.forEach((issue, index) => {
+    const control = $$('[name]', $('#content')).find((item) => item.name === issue.field);
+    if (!control) return;
+    control.setAttribute("aria-invalid", "true");
+    const error = document.createElement("small");
+    error.id = `manifest-error-${index}`;
+    error.className = "field-error destructive";
+    error.textContent = I18n.t(issue.message);
+    control.setAttribute("aria-describedby", [control.getAttribute("aria-describedby"), error.id].filter(Boolean).join(" "));
+    control.insertAdjacentElement("afterend", error);
+  });
+}
+function showManifestErrors(p, issues) {
+  p.manifestErrors = issues;
+  if (state.route !== "projects" || state.id !== p.id) return;
+  const first = issues[0];
+  const control = $$('[name]', $('#content')).find((item) => item.name === first.field);
+  // Keep DOM-only environment values intact when Save all finds an error on another tab.
+  if (!control && state.tab !== "env" && first.tab && first.tab !== state.tab) {
+    pendingManifestFocus = first.field;
+    location.hash = `#/projects/${p.id}/${first.tab}`;
+  } else {
+    paintManifestErrors(p);
+    if (control) control.focus();
+    else { $('#manifest-errors').tabIndex = -1; $('#manifest-errors').focus(); }
+  }
+}
+function validateManifest(p, name, m) {
+  const issues = [];
+  const add = (field, tab, message) => issues.push({ field, tab, message });
+  if (!name || projects.some((item) => item !== p && item.name === name)) add("manifest-name", "basic", "项目名为空或已存在。");
+  if (!m.tag.trim()) add("manifest-tag", "build", "Tag 规则不能为空。");
+  if (!m.builds.length || m.builds.length > 30) add("manifest-tag", "build", "请配置 1–30 个构建服务。");
+  const services = new Set(), variables = new Set();
+  m.builds.forEach((build, i) => {
+    const service = build.service;
+    const variable = service.toUpperCase().replace(/-/g, "_");
+    if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(service) || services.has(service) || variables.has(variable)) add(`manifest-service-${i}`, "build", I18n.msg`构建 ${i + 1}：服务名须以字母开头，且服务名和生成的镜像变量名不能重复。`);
+    services.add(service); variables.add(variable);
+    if (!build.image.trim()) add(`manifest-image-${i}`, "build", I18n.msg`构建 ${i + 1}：请填写镜像名。`);
+    if (!build.dockerfile || /[\\:]/.test(build.dockerfile) || build.dockerfile.startsWith("/") || build.dockerfile.split("/").some((part) => !part || part === "." || part === "..")) add(`manifest-dockerfile-${i}`, "build", I18n.msg`构建 ${i + 1}：请填写项目内的 Dockerfile 相对路径。`);
+    const keys = new Set();
+    build.args.forEach(([key, value], j) => {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) add(`manifest-arg-key-${i}-${j}`, "build", "参数名须以字母或下划线开头，只能包含字母、数字和下划线。");
+      else if (keys.has(key)) add(`manifest-arg-key-${i}-${j}`, "build", "同一构建内的参数名不能重复。");
+      keys.add(key);
+      if (p.restoreNeedsReview && key && !value) add(`manifest-arg-value-${i}-${j}`, "build", "请补齐导入后清空的构建参数值，或明确删除不需要的参数。");
+    });
+  });
+  if (!m.files.length || m.files.length > 30) add("manifest-file-0", "compose", "请配置 1–30 个 Compose 文件。");
+  const files = new Set();
+  m.files.forEach((file, i) => {
+    if (!/\.ya?ml$/i.test(file) || /[\\:]/.test(file) || file.startsWith("/") || file.split("/").some((part) => !part || part === "." || part === "..") || (i === 0 && file.includes("/")) || files.has(file)) add(`manifest-file-${i}`, "compose", "Compose 文件路径无效或重复；请使用项目内相对路径，首个文件须位于项目根目录。");
+    files.add(file);
+  });
+  if (!p.directoryHandle) add("path", "basic", "请在基本信息选择本地代码目录。");
+  return issues;
+}
+async function commitManifest(p) {
+  const pending = p.pendingManifestSave;
+  if (!pending || p.manifestSaving) return;
+  const { m, name, targetIds } = pending;
+  const directory = p.directoryHandle;
+  const route = location.hash;
+  p.manifestSaving = true;
+  close();
+  syncProjectDraft();
+  try {
+    const source = await ManifestIO.save(directory, p.manifestSource, name, m);
+    // Inputs remain editable during disk I/O. Preserve the latest drafts, including later edits.
+    const draft = structuredClone(manifestFor(p));
+    const draftName = p.nameDraft;
+    const targets = structuredClone(targetDraftFor(p));
+    p.restoreNeedsReview = false;
+    useManifest(p, { name, manifest: structuredClone(m), source }, directory);
+    p.manifestDraft = draft;
+    p.nameDraft = draftName.trim() === name ? name : draftName;
+    if (targetIds) commitTargets(p, targetIds);
+    p.targetDraft = targets;
+    if (location.hash === route) {
+      const envForm = $("#env-form");
+      render();
+      if (envForm) $("#env-form")?.replaceWith(envForm);
+    }
+    toast(pending.sourceTab === "env" ? "YAML 配置已保存；环境变量值未保存。" : "已写入项目目录中的 devingpanel.yaml。");
+  } catch (error) {
+    const message = error.message || "保存项目配置失败。";
+    showManifestErrors(p, [{ field: error.manifestField || "", tab: error.manifestTab || "", message }]);
+    toast(message, true);
+  } finally {
+    p.manifestSaving = false;
+    delete p.pendingManifestSave;
+    syncProjectDraft();
+  }
+}
+
 function manifestEditor(p, tab) {
   const m = manifestFor(p);
-  const save = I18n.html`<div class="actions">${button("保存", "manifest-save", "primary", !p.directoryHandle ? 'disabled title="请在基本信息选择本地代码目录"' : "")}${button("全部保存", "manifest-save-all", "", !p.directoryHandle ? 'disabled title="请在基本信息选择本地代码目录"' : "")}</div>`;
   if (tab === "basic") {
     const status = p.directoryHandle ? p.manifestSource === null ? "目录中尚无 devingpanel.yaml，保存时创建" : "已读取 devingpanel.yaml" : "尚未授权本地代码目录";
-    return card("基本信息", "", I18n.html`<div class="stack">${field("项目名", input("manifest-name", p.name, 'required'))}<div class="directory-field"><label for="local-directory">${I18n.t("本地代码目录")}</label><div class="row">${input("path", p.directoryHandle?.name || p.path, 'id="local-directory" readonly class="mono grow"')}${button(icon("folder") + I18n.t("选择目录"), "manifest-connect", "", "", false)}</div><small class="muted">${I18n.t(status)}</small></div>${save}</div>`);
+    return editorSection("基本信息", "", I18n.html`<div class="stack">${field("项目名", input("manifest-name", p.nameDraft, 'required'))}<div class="directory-field"><label for="local-directory">${I18n.t("本地代码目录")}</label><div class="row">${input("path", p.directoryHandle?.name || p.path, 'id="local-directory" readonly class="mono grow"')}${button(icon("folder") + I18n.t("选择目录"), "manifest-connect", "", "", false)}</div><small class="muted">${I18n.t(status)}</small></div></div>`);
   }
-  if (tab === "build") return card("构建配置", "多个服务共用项目根目录作为构建上下文。", I18n.html`<div class="stack">${p.restoreNeedsReview ? I18n.t('<div class="notice warning">该项目来自配置备份。请核对本地路径和 Compose 文件、补齐构建参数值，再保存确认；连接凭据和环境变量需重新配置。</div>') : ""}${m.builds.length > 1 ? I18n.t('<div class="notice warning">多构建页面仅供流程评审；当前原型发布动画只模拟单构建，开始发布已禁用。</div>') : ""}${field("Tag 规则", input("manifest-tag", m.tag, 'class="mono"'))}${m.builds.map((b, i) => I18n.html`<div class="manifest-item"><div class="row between"><h3>${I18n.t(I18n.msg`构建 ${i + 1}`)}</h3><div class="actions">${ib("up", "上移", `manifest-build-up:${i}`, i === 0 ? "disabled" : "")}${ib("down", "下移", `manifest-build-down:${i}`, i === m.builds.length - 1 ? "disabled" : "")}${ib("trash", "删除构建", `manifest-build-remove:${i}`, m.builds.length === 1 ? "disabled" : "")}</div></div><div class="form-grid">${field("构建服务", input(`manifest-service-${i}`, b.service, 'class="mono"'))}${field("Dockerfile", input(`manifest-dockerfile-${i}`, b.dockerfile, 'class="mono"'))}${field("镜像名", input(`manifest-image-${i}`, b.image, 'class="mono"'))}${field("目标平台", select(`manifest-platform-${i}`, [["auto", "按主机自动（默认）"], "linux/amd64", "linux/arm64"], b.platform))}</div><div><h3>Build args</h3>${(b.args || []).map(([key, value], j) => I18n.html`<div class="kv-row">${input(`manifest-arg-key-${i}-${j}`, key, 'placeholder="KEY" class="mono"')}${input(`manifest-arg-value-${i}-${j}`, value, 'placeholder="VALUE"')}${ib("trash", "删除行", `manifest-arg-remove:${i}:${j}`)}</div>`).join("")}${button(icon("plus") + "添加参数", `manifest-arg-add:${i}`)}</div></div>`).join("")}${button(icon("plus") + "添加构建", "manifest-build-add")}<div class="notice muted">Build args 以明文写入项目文件，不要填写密码或令牌。</div>${save}</div>`);
-  if (tab === "compose") return card("Compose", "按列表顺序合并；首个文件必须位于项目根目录。", I18n.html`<div class="stack">${m.files.map((file, i) => I18n.html`<div class="file-row"><span>${i + 1}.</span>${input(`manifest-file-${i}`, file, 'class="mono grow"')}${ib("up", "上移", `manifest-file-up:${i}`, i === 0 ? "disabled" : "")}${ib("down", "下移", `manifest-file-down:${i}`, i === m.files.length - 1 ? "disabled" : "")}${ib("trash", "移除", `manifest-file-remove:${i}`)}</div>`).join("")}${button(icon("plus") + "添加 Compose 文件", "manifest-file-add")}${m.files[0]?.includes("/") || m.files[0]?.includes("\\") ? I18n.t('<div class="notice warning">首个 Compose 文件必须位于项目根目录。</div>') : ""}<div class="notice muted">每个服务在 Compose 中使用自己的 DEVINGPANEL_IMAGE_服务名变量；保存前会读取并校验项目文件。</div>${save}</div>`);
+  if (tab === "build") return editorSection("构建配置", "多个服务共用项目根目录作为构建上下文。", I18n.html`<div class="stack">${p.restoreNeedsReview ? I18n.t('<div class="notice warning">该项目来自配置备份。请核对本地路径和 Compose 文件、补齐构建参数值，再保存确认；连接凭据和环境变量需重新配置。</div>') : ""}${m.builds.length > 1 ? I18n.t('<div class="notice warning">多构建页面仅供流程评审；当前原型发布动画只模拟单构建，开始发布已禁用。</div>') : ""}${field("Tag 规则", input("manifest-tag", m.tag, 'class="mono"'))}${m.builds.map((b, i) => I18n.html`<div class="manifest-item"><div class="row between"><h3>${I18n.t(I18n.msg`构建 ${i + 1}`)}</h3><div class="actions">${ib("up", "上移", `manifest-build-up:${i}`, i === 0 ? "disabled" : "")}${ib("down", "下移", `manifest-build-down:${i}`, i === m.builds.length - 1 ? "disabled" : "")}${ib("trash", "删除构建", `manifest-build-remove:${i}`, m.builds.length === 1 ? "disabled" : "")}</div></div><div class="form-grid">${field("构建服务", input(`manifest-service-${i}`, b.service, 'class="mono"'))}${field("Dockerfile", input(`manifest-dockerfile-${i}`, b.dockerfile, 'class="mono"'))}${field("镜像名", input(`manifest-image-${i}`, b.image, 'class="mono"'))}${field("目标平台", select(`manifest-platform-${i}`, [["auto", "按主机自动（默认）"], "linux/amd64", "linux/arm64"], b.platform))}</div><div><h3>Build args</h3>${(b.args || []).map(([key, value], j) => I18n.html`<div class="kv-row">${input(`manifest-arg-key-${i}-${j}`, key, I18n.msg`placeholder="KEY" class="mono" aria-label="${esc(I18n.t(I18n.msg`构建 ${i + 1} 参数 ${j + 1} 名称`))}"`)}${input(`manifest-arg-value-${i}-${j}`, value, I18n.msg`placeholder="VALUE" aria-label="${esc(I18n.t(I18n.msg`构建 ${i + 1} 参数 ${j + 1} 值`))}"`)}${ib("trash", "删除行", `manifest-arg-remove:${i}:${j}`)}</div>`).join("")}${button(icon("plus") + "添加参数", `manifest-arg-add:${i}`)}</div></div>`).join("")}${button(icon("plus") + "添加构建", "manifest-build-add")}<div class="notice muted">Build args 以明文写入项目文件，不要填写密码或令牌。</div></div>`);
+  if (tab === "compose") return editorSection("Compose", "按列表顺序合并；首个文件必须位于项目根目录。", I18n.html`<div class="stack">${m.files.map((file, i) => I18n.html`<div class="file-row"><span>${i + 1}.</span>${input(`manifest-file-${i}`, file, I18n.msg`class="mono grow" aria-label="${esc(I18n.t(I18n.msg`Compose 文件 ${i + 1}`))}"`)}${ib("up", "上移", `manifest-file-up:${i}`, i === 0 ? "disabled" : "")}${ib("down", "下移", `manifest-file-down:${i}`, i === m.files.length - 1 ? "disabled" : "")}${ib("trash", "移除", `manifest-file-remove:${i}`)}</div>`).join("")}${button(icon("plus") + "添加 Compose 文件", "manifest-file-add")}${m.files[0]?.includes("/") || m.files[0]?.includes("\\") ? I18n.t('<div class="notice warning">首个 Compose 文件必须位于项目根目录。</div>') : ""}<div class="notice muted">每个服务在 Compose 中使用自己的 DEVINGPANEL_IMAGE_服务名变量；保存前会读取并校验项目文件。</div></div>`);
   if (tab === "targets") {
     const targets = targetDraftFor(p);
-    const targetSave = I18n.html`<div class="actions">${button("保存", "target-save", "primary")}${button("全部保存", "manifest-save-all", "", !p.directoryHandle ? 'disabled title="请在基本信息选择本地代码目录"' : "")}</div>`;
-    return card("目标主机", "按本地绑定顺序发布；组名和别名须在本机唯一匹配。", I18n.html`<div class="stack">${targets.map((target, i) => I18n.html`<div class="manifest-target"><span>${i + 1}.</span>${field("主机组", input(`manifest-group-${i}`, target.group))}${field("主机别名", input(`manifest-host-${i}`, target.host))}${ib("up", "上移", `manifest-target-up:${i}`, i === 0 ? "disabled" : "")}${ib("down", "下移", `manifest-target-down:${i}`, i === targets.length - 1 ? "disabled" : "")}${ib("trash", "移除", `manifest-target-remove:${i}`)}</div>`).join("")}${button(icon("plus") + "添加目标", "manifest-target-add")}${targets.some((t) => hosts.filter((h) => h.group === t.group && h.name === t.host).length !== 1) || state.previewYamlError ? I18n.t('<div class="notice warning">目标主机缺失或名称不唯一；需管理员先配置主机和可信指纹，发布保持禁用。</div>') : ""}<div class="notice muted">目标绑定不写入 devingpanel.yaml。原型保存后仅在当前会话有效；正式客户端写入本机 SQLite。</div>${targetSave}</div>`);
+    return editorSection("目标主机", "按本地绑定顺序发布；组名和别名须在本机唯一匹配。", I18n.html`<div class="stack">${targets.map((target, i) => I18n.html`<div class="manifest-target"><span>${i + 1}.</span>${field("主机组", input(`manifest-group-${i}`, target.group))}${field("主机别名", input(`manifest-host-${i}`, target.host))}${ib("up", "上移", `manifest-target-up:${i}`, i === 0 ? "disabled" : "")}${ib("down", "下移", `manifest-target-down:${i}`, i === targets.length - 1 ? "disabled" : "")}${ib("trash", "移除", `manifest-target-remove:${i}`)}</div>`).join("")}${button(icon("plus") + "添加目标", "manifest-target-add")}${targets.some((t) => hosts.filter((h) => h.group === t.group && h.name === t.host).length !== 1) || state.previewYamlError ? I18n.t('<div class="notice warning">目标主机缺失或名称不唯一；需管理员先配置主机和可信指纹，发布保持禁用。</div>') : ""}<div class="notice muted">目标绑定不写入 devingpanel.yaml。原型保存后仅在当前会话有效；正式客户端写入本机 SQLite。</div></div>`);
   }
   return "";
 }
@@ -756,23 +1003,25 @@ function projectDetail() {
   const tab = state.tab || "build";
   let body = "";
   if (tab === "env")
-    body = card(
+    body = editorSection(
       "环境变量",
-      "主机专属值覆盖项目通用值。正式客户端将普通变量写入本机 SQLite，敏感值存入系统凭据管理器；都不写入 devingpanel.yaml。",
-      I18n.html`<form id="env-form" class="stack">${field("配置范围", select("env-scope", [["common", "项目通用"], ...p.hostIds.map((id) => [id, hosts.find((h) => h.id === id)?.name || id])], "common"))}<div id="env-rows">${kvRows([], true)}</div><div class="actions">${button("保存", "env-save", "primary")}${button("全部保存", "manifest-save-all", "", !p.directoryHandle ? 'disabled title="请在基本信息选择本地代码目录"' : "")}</div></form>`,
+      "主机专属值覆盖项目通用值；原型只校验输入，不保存变量值。",
+      I18n.html`<form id="env-form" class="stack">${field("配置范围", select("env-scope", [["common", "项目通用"], ...p.hostIds.map((id) => [id, hosts.find((h) => h.id === id)?.name || id])], "common"))}<div id="env-rows">${kvRows([], true)}</div></form>`,
     );
   if (tab === "history") {
     const records = history.filter((h) => h.projectId === p.id);
     const lastPage = Math.max(0, Math.ceil(records.length / 20) - 1);
     state.historyPage = Math.min(state.historyPage, lastPage);
-    body = I18n.html`<section class="card">${historyTable(
+    body = I18n.html`<section class="card resource-table">${historyTable(
       records.slice(state.historyPage * 20, (state.historyPage + 1) * 20),
       false,
       true,
     )}<div class="table-foot"><small>每页 20 条 · 共 ${records.length} 条 · 第 ${state.historyPage + 1} / ${lastPage + 1} 页</small><div class="actions">${button("上一页", "history-prev", "", state.historyPage === 0 ? "disabled" : "")}${button("下一页", "history-next", "", state.historyPage === lastPage ? "disabled" : "")}</div></div></section>`;
   }
   if (["basic", "build", "compose", "targets"].includes(tab)) body = manifestEditor(p, tab);
+  const m = manifestFor(p);
   return (
+    I18n.html`<div class="breadcrumb">${go("项目", "projects", "link")}${icon("chevron")}<span>${esc(p.name)}</span></div>` +
     dataHead(
       esc(p.name),
       button(
@@ -782,6 +1031,7 @@ function projectDetail() {
         !projectReady(p) ? 'disabled title="请保存并核对项目配置"' : "",
       ),
     ) +
+    I18n.html`<div class="object-meta"><span class="mono">${esc(p.path)}</span><span id="project-readiness">${badge(projectReady(p) ? "就绪" : "待完善", projectReady(p) ? "success" : "warning")}</span></div>` +
     tabs(
       [
         ["basic", "基本信息"],
@@ -792,7 +1042,8 @@ function projectDetail() {
         ["history", "发布历史"],
       ],
       tab,
-    ) + body
+    ) + I18n.html`<div id="manifest-errors" class="notice destructive stack" role="alert" hidden></div>` +
+    (tab === "history" ? body : I18n.html`<div class="project-workspace"><div class="project-editor">${body}</div><aside class="project-context" aria-label="配置摘要"><h2>配置摘要</h2><dl class="summary-list"><div><dt>项目文件</dt><dd>${p.directoryHandle ? p.manifestSource === null ? I18n.t("待创建") : I18n.t("已读取") : go("选择目录", `projects/${p.id}/basic`, "link")}</dd></div><div><dt>构建服务</dt><dd id="project-build-count">${m.builds.length}</dd></div><div><dt>Compose 文件</dt><dd id="project-file-count">${m.files.length}</dd></div><div><dt>目标主机</dt><dd id="project-target-count">${targetDraftFor(p).length}</dd></div></dl><p class="muted">发布前请保存配置并核对目标主机。</p>${go("核对目标绑定", `projects/${p.id}/targets`, "link")}</aside></div><footer class="project-save-bar"><div><div id="project-draft" class="row draft-status" hidden><strong>未保存</strong>${button("放弃修改", "manifest-discard", "ghost")}</div><small>${tab === "env" ? I18n.t("保存仅校验变量；全部保存不包含变量值。") : tab === "targets" ? I18n.t("当前页保存本机绑定；全部保存同时写入项目 YAML。") : I18n.t("保存当前页配置；全部保存包含 YAML 和本机绑定。")}</small></div><div class="actions">${button("保存", tab === "env" ? "env-save" : tab === "targets" ? "target-save" : "manifest-save", "primary", !["env", "targets"].includes(tab) && !p.directoryHandle ? 'disabled title="请在基本信息选择本地代码目录"' : "")}${button("全部保存", "manifest-save-all", "", !p.directoryHandle ? 'disabled title="请在基本信息选择本地代码目录"' : "")}</div></footer>`)
   );
 }
 function targetTable(ids, deploy = false) {
@@ -833,7 +1084,7 @@ function deployPage() {
         ],
         tab,
       ) +
-      I18n.html`<section class="card">${historyTable(state.view === "empty" ? [] : history)}</section>`
+      I18n.html`<section class="card resource-table">${historyTable(state.view === "empty" ? [] : history)}</section>`
     );
   if (!projects.length || state.view === "empty")
     return (
@@ -855,7 +1106,7 @@ function deployPage() {
       ],
       tab,
     ) +
-    I18n.html`<section class="card pad"><div class="config-bar">${field(
+    I18n.html`<section class="release-config" aria-label="发布配置"><div class="config-bar">${field(
       "项目",
       select(
         "deploy-project",
@@ -863,7 +1114,7 @@ function deployPage() {
         p.id,
         locked ? "disabled" : "",
       ),
-    )}${field("发布标识", I18n.html`<output id="release-tag" class="release-tag-value mono">${esc(locked ? d.tag : releaseTag(p))}</output>`)}<div><p class="muted">目标主机</p><div class="row"><span>已选 ${configIds.length} 台</span>${button("更改", "deploy-targets", "link", locked ? "disabled" : "")}</div></div>${field(
+    )}${field("发布标识", I18n.html`<output id="release-tag" class="release-tag-value mono">${esc(locked ? d.tag : releaseTag(p))}</output>`)}<div class="field-box"><span class="field-label">目标主机</span><div class="config-target-box row between"><span>已选 ${configIds.length} 台</span>${button("更改", "deploy-targets", "link", locked ? "disabled" : "")}</div></div>${field(
       "并行度",
       select(
         "parallel",
@@ -873,7 +1124,7 @@ function deployPage() {
         state.parallel,
         locked ? "disabled" : "",
       ),
-    )}${button(locked ? I18n.t("终止") : I18n.t("开始发布"), locked ? "deploy-stop" : "deploy-start", locked ? "danger" : "primary", !locked && (!projectReady(p) || !configIds.length || !state.docker) ? I18n.t('disabled title="需要项目配置完整、至少一台目标主机且 Docker 可用"') : "")}</div></section><section class="card"><div class="card-head row between"><h2>目标主机</h2>${d ? badge(d.running ? I18n.t("进行中") : d.paused ? I18n.t("已暂停") : d.result, d.running ? "info" : d.tone || "muted") : ""}</div>${d?.message ? I18n.html`<p class="release-message ${d.tone || ""}">${esc(I18n.t(String(d.message)))}</p>` : ""}${table(
+    )}${button(locked ? I18n.t("终止") : I18n.t("开始发布"), locked ? "deploy-stop" : "deploy-start", locked ? "danger" : "primary", !locked && (!projectReady(p) || !configIds.length || !state.docker) ? I18n.t('disabled title="需要项目配置完整、至少一台目标主机且 Docker 可用"') : "")}</div></section><section class="release-targets"><div class="section-head row between"><h2>目标主机</h2>${d ? badge(d.running ? I18n.t("进行中") : d.paused ? I18n.t("已暂停") : d.result, d.running ? "info" : d.tone || "muted") : ""}</div>${d?.message ? I18n.html`<p class="release-message ${d.tone || ""}">${esc(I18n.t(String(d.message)))}</p>` : ""}${table(
       ["顺序", "主机", "状态", "阶段", "进度", "耗时", "操作"],
       ids.map((id, i) => {
         const h = hosts.find((h) => h.id === id);
@@ -895,7 +1146,7 @@ function deployPage() {
           I18n.html`<div class="actions">${r.status === "失败" ? button("查看原因", `deploy-reason:${i}`, "ghost") + (!d.stopping ? button("重试该主机", `deploy-retry:${i}`) + button("跳过此台继续", `deploy-skip:${i}`) + button("终止", "deploy-stop", "ghost destructive") : "") : r.status === "待核实" ? button("重新核实状态", `deploy-verify:${i}`) : "—"}</div>`,
         ]);
       }),
-    )}</section><section class="card pad"><details ${!d || d.running || d.paused ? "open" : ""}><summary>构建日志</summary><div class="row between"><small>演示日志 · 不包含环境变量值</small>${button(icon("copy") + "复制日志", "copy-log", "ghost")}</div><pre class="log" id="build-log" translate="no">${esc(d?.logs.join("\n") || I18n.t("等待开始发布…"))}</pre></details></section>`
+    )}</section><section class="release-log"><details ${!d || d.running || d.paused ? "open" : ""}><summary>构建日志</summary><div class="row between"><small>演示日志 · 不包含环境变量值</small>${button(icon("copy") + "复制日志", "copy-log", "ghost")}</div><pre class="log" id="build-log" translate="no">${esc(d?.logs.join("\n") || I18n.t("等待开始发布…"))}</pre></details></section>`
   );
 }
 function containersPage() {
@@ -905,21 +1156,21 @@ function containersPage() {
   const tab = state.tab || "containers";
   const prefix =
     head("容器", button("清理磁盘", "prune")) +
-    I18n.html`<div class="container-toolbar">${field(
+    I18n.html`<div class="resource-bar container-resource-bar"><div class="container-toolbar">${field(
       "主机",
       select(
         "container-host",
         hosts.map((h) => [h.id, h.name]),
         id,
       ),
-    )}<small>每 10s 刷新 · 原型使用演示数据</small></div>` +
+    )}</div>` +
     tabs(
       [
         ["containers", "容器"],
         ["images", "镜像"],
       ],
       tab,
-    );
+    ) + I18n.html`<small class="muted container-refresh-note">每 10s 刷新 · 原型使用演示数据</small></div>`;
   if (!h || state.view === "empty")
     return (
       prefix +
@@ -933,7 +1184,7 @@ function containersPage() {
   if (tab === "images")
     return (
       prefix +
-      I18n.html`<section class="card"><div class="card-head row between"><h2>镜像</h2>${button("清理悬空镜像", "image-prune", "ghost", 'disabled title="需先接入发布历史保护，避免删除回滚镜像"')}</div><div class="notice muted">清理悬空镜像需先接入发布历史保护；无标签镜像仍可能用于回滚。</div>${table(
+      I18n.html`<section class="card resource-table"><div class="card-head row between"><h2>镜像</h2>${button("清理悬空镜像", "image-prune", "ghost", 'disabled title="需先接入发布历史保护，避免删除回滚镜像"')}</div><div class="notice muted">清理悬空镜像需先接入发布历史保护；无标签镜像仍可能用于回滚。</div>${table(
         ["仓库名:tag", "大小", "创建时间", "未使用标记", "操作"],
         [
           [
@@ -964,7 +1215,7 @@ function containersPage() {
     );
   return (
     prefix +
-    I18n.html`<section class="card">${table(
+    I18n.html`<section class="card resource-table">${table(
       ["状态", "名称", "镜像", "端口", "CPU", "内存", "操作"],
       containers
         .filter((c) => c.host === id)
@@ -980,7 +1231,7 @@ function containersPage() {
             c.cpu,
             c.memory,
             containerActions(c),
-          ]),
+          ], `data-context="container:${c.id}"`),
         ),
     )}</section>`
   );
@@ -991,7 +1242,7 @@ function settingsPage() {
       card(
         "发布保留策略",
         "按项目和主机保留已完成版本；当前运行版本和可回滚版本受保护。",
-        I18n.html`<div class="stack">${field("已完成版本保留数", select("retention", ["1", "2", "3", "5", "10", ["custom", "自定义"]], ["1", "2", "3", "5", "10"].includes(String(state.keep)) ? state.keep : "custom"))}${!["1", "2", "3", "5", "10"].includes(String(state.keep)) ? field("自定义数量", input("retention-custom", state.keep, 'type="number" min="1" required')) : ""}${state.keep === 1 ? I18n.t('<div class="notice warning">仅保留当前版本，该主机无法回滚到上一版本。</div>') : ""}<label class="row"><input type="checkbox" name="auto-cleanup" ${state.autoCleanup ? "checked" : ""}>自动清理策略（演示设置）</label><p class="muted">${state.autoCleanup ? I18n.t("本原型不运行定时清理；桌面客户端在线时每日检查。") : I18n.t("自动清理已关闭；可预览会话内历史材料。")}</p>${button("立即清理托管的历史镜像", "managed-clean")}</div>`,
+        I18n.html`<div class="stack">${field("已完成版本保留数", select("retention", ["1", "2", "3", "5", "10", ["custom", "自定义"]], !state.keepCustom && ["1", "2", "3", "5", "10"].includes(String(state.keep)) ? state.keep : "custom"))}${state.keepCustom || !["1", "2", "3", "5", "10"].includes(String(state.keep)) ? field("自定义数量", input("retention-custom", state.keep, 'type="number" min="1" required')) : ""}${state.keep === 1 ? I18n.t('<div class="notice warning">仅保留当前版本，该主机无法回滚到上一版本。</div>') : ""}<label class="row"><input type="checkbox" name="auto-cleanup" ${state.autoCleanup ? "checked" : ""}>自动清理策略（演示设置）</label><p class="muted">${state.autoCleanup ? I18n.t("本原型不运行定时清理；桌面客户端在线时每日检查。") : I18n.t("自动清理已关闭；可预览会话内历史材料。")}</p>${button("立即清理托管的历史镜像", "managed-clean")}</div>`,
       ),
     appearance: () =>
       card(
@@ -1137,7 +1388,7 @@ function hostForm(id = 0, copyId = 0) {
   const editing = !!id;
   const segment = (name, options, selected) =>
     I18n.html`<div class="host-segments">${options.map(([value, label]) => I18n.html`<label><input type="radio" name="${name}" value="${value}" ${value === selected ? "checked" : ""}><span>${I18n.t(label)}</span></label>`).join("")}</div>`;
-  const jumpOptions = (selected = "") => select("jump-host", [["", "选择跳板主机"], ...hosts.filter((host) => host.id !== id).map((host) => [host.id, `${host.name} (${host.user}@${host.address}:${host.port})`])], selected, "required");
+  const jumpOptions = (selected = "") => select("jump-host", [["", "选择跳板主机"], ...hosts.filter((host) => host.id !== id).map((host) => [host.id, `${host.name} (${host.user}@${host.address}:${host.port})`])], selected, 'required aria-label="跳板主机"');
   modal(
     editing ? "编辑主机" : copyId ? "复制主机" : "新建主机",
     I18n.html`<form id="host-form" class="host-form stack" data-id="${id}">
@@ -1168,15 +1419,81 @@ function hostRoute(form) {
 function savedHostRoute(host) {
   return JSON.stringify(host.connectionMode === "jump" ? ["jump", (host.jumpHostIds || []).map(String)] : host.connectionMode === "proxy" ? ["proxy", host.proxyType, host.proxyAddress, String(host.proxyPort), host.proxyUser] : ["direct"]);
 }
+function terminalMarkup(host) {
+  const prompt = `${host.user}@${host.name}:~${host.user === "root" ? "#" : "$"} `;
+  const welcome = `Linux demo-debian 6.12.63+deb13-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.63-1 x86_64\n\nThe programs included with the Debian GNU/Linux system are free software;\nthe exact distribution terms for each program are described in the\nindividual files in /usr/share/doc/*/copyright.\n\nDebian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent\npermitted by applicable law.\nLast login: ${new Date().toLocaleString(I18n.locale === "en" ? "en-US" : "zh-CN")}\n${I18n.t("[演示] 未建立远程 SSH 连接，命令不会执行。")}\n`;
+  return I18n.html`<div class="ssh-terminal"><pre id="ssh-terminal-output" aria-live="polite">${esc(welcome)}</pre><form id="ssh-terminal-form" class="ssh-terminal-prompt" data-prompt="${esc(prompt)}"><span aria-hidden="true">${esc(prompt)}</span><span class="terminal-entry"><span class="terminal-cursor" aria-hidden="true"></span><input name="terminal-command" autocomplete="off" spellcheck="false" aria-label="${I18n.t("终端命令")}"></span></form></div>`;
+}
 function openHostTerminal(id) {
   const host = hosts.find((item) => item.id === id);
   if (!host) return;
   $$("details.menu[open]").forEach((menu) => (menu.open = false));
-  const prompt = `${host.user}@${host.name}:~${host.user === "root" ? "#" : "$"} `;
-  const welcome = `Linux demo-debian 6.12.63+deb13-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.63-1 x86_64\n\nThe programs included with the Debian GNU/Linux system are free software;\nthe exact distribution terms for each program are described in the\nindividual files in /usr/share/doc/*/copyright.\n\nDebian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent\npermitted by applicable law.\nLast login: ${new Date().toLocaleString(I18n.locale === "en" ? "en-US" : "zh-CN")}\n${I18n.t("[演示] 未建立远程 SSH 连接，命令不会执行。")}\n`;
-  modal("连接", I18n.html`<div class="ssh-terminal"><pre id="ssh-terminal-output" aria-live="polite">${esc(welcome)}</pre><form id="ssh-terminal-form" class="ssh-terminal-prompt" data-prompt="${esc(prompt)}"><span aria-hidden="true">${esc(prompt)}</span><span class="terminal-entry"><span class="terminal-cursor" aria-hidden="true"></span><input name="terminal-command" autocomplete="off" spellcheck="false" aria-label="${I18n.t("终端命令")}"></span></form></div>`);
+  if (state.dock?.type === "terminal" && state.dock.id === id) state.dock = null;
+  modal(
+    "连接",
+    I18n.html`${terminalMarkup(host)}<div class="terminal-foot"><span>${I18n.t("[演示] 未建立远程 SSH 连接，命令不会执行。")}</span><div class="actions">${button(icon("dockBottom") + I18n.t("停靠到底部"), `dock-terminal:${id}`, "ghost", "", false)}</div></div>`,
+  );
   $("#dialog").classList.add("terminal-dialog");
+  $("#dialog-title")?.insertAdjacentHTML("afterend", I18n.html`<span class="terminal-host-meta mono muted">${esc(host.name)} · ${esc(host.user)}@${esc(host.address)}</span>`);
   $('[name="terminal-command"]').focus();
+}
+function renderDock() {
+  const pane = $("#dock-pane");
+  if (!pane) return;
+  if (!state.dock || !state.docker) {
+    pane.hidden = true;
+    pane.innerHTML = "";
+    return;
+  }
+  pane.hidden = false;
+  if (state.dock.type === "terminal") {
+    const host = hosts.find((item) => item.id === state.dock.id);
+    if (!host) { state.dock = null; pane.hidden = true; return; }
+    pane.innerHTML = I18n.html`<div class="dock-head"><div class="row">${icon("terminal")}<strong>${esc(host.name)}</strong><span class="mono muted">${esc(host.user)}@${esc(host.address)}</span></div><div class="actions">${button("弹出窗口", `host-connect:${host.id}`, "ghost")}${ib("close", "关闭", "dock-close")}</div></div><div class="dock-body">${terminalMarkup(host)}</div>`;
+    return;
+  }
+  if (state.dock.type === "log") {
+    const c = containers.find((item) => item.id === state.dock.id);
+    if (!c) { state.dock = null; pane.hidden = true; return; }
+    const hostName = hosts.find((h) => h.id === c.host)?.name || "";
+    pane.innerHTML = I18n.html`<div class="dock-head"><div class="row">${icon("box")}<strong>${esc(c.name)}</strong><span class="muted">${esc(hostName)}</span><span class="mono muted">${esc(c.image)}</span></div><div class="actions">${button("弹出窗口", `logs:${c.id}`, "ghost")}${ib("close", "关闭", "dock-close")}</div></div><div class="dock-body dock-log-body"><pre class="log" id="dock-container-log" translate="no" tabindex="0">${esc(Array.from({ length: 35 }, (_, i) => `2026-10-24 14:${String(i).padStart(2, "0")}:00 INFO [demo] ${i % 4 ? "GET /health 200 OK" : "服务已就绪，监听 0.0.0.0:3000"}`).join("\n"))}</pre></div>`;
+    const log = $("#dock-container-log");
+    if (log) log.scrollTop = log.scrollHeight;
+  }
+}
+function openCommandPalette() {
+  if (!state.docker) return;
+  const items = [
+    ...navItems.filter((n) => state.stage !== "p0" || n[0] !== "containers").map(([id, label, sym]) => ({ label: I18n.t(label), meta: I18n.t("页面"), icon: sym, hash: `#/${id}` })),
+    ...hosts.map((h) => ({ label: h.name, meta: `${h.address} · ${h.group}`, icon: "server", hash: `#/hosts/${h.id}` })),
+    ...projects.map((p) => ({ label: p.name, meta: p.path, icon: "folder", hash: `#/projects/${p.id}/build` })),
+  ];
+  const renderList = (q = "") => {
+    const term = q.trim().toLowerCase();
+    const matched = items.filter((item) => !term || item.label.toLowerCase().includes(term) || item.meta.toLowerCase().includes(term));
+    return matched.length
+      ? matched.map((item, idx) => I18n.html`<button type="button" class="palette-item ${idx === 0 ? "selected" : ""}" data-action="palette-go:${esc(item.hash)}">${icon(item.icon)}<span>${esc(item.label)}</span><small class="muted mono">${esc(item.meta)}</small></button>`).join("")
+      : I18n.html`<div class="pad muted">${I18n.t("没有匹配项")}</div>`;
+  };
+  modal("快速跳转", I18n.html`<div class="stack"><input name="palette-query" placeholder="${esc(I18n.t("搜索页面、主机或项目…"))}" autocomplete="off"><div id="palette-list" class="palette-list">${renderList()}</div></div>`);
+  const qInput = $('[name="palette-query"]');
+  qInput.focus();
+  qInput.addEventListener("input", () => { $("#palette-list").innerHTML = renderList(qInput.value); });
+  qInput.addEventListener("keydown", (e) => {
+    const list = $$(".palette-item", $("#palette-list"));
+    if (!list.length) return;
+    const cur = Math.max(0, list.findIndex((el) => el.classList.contains("selected")));
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      list[cur]?.classList.remove("selected");
+      const next = (cur + (e.key === "ArrowDown" ? 1 : -1) + list.length) % list.length;
+      list[next].classList.add("selected");
+      list[next].scrollIntoView({ block: "nearest" });
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      list[cur]?.click();
+    }
+  });
 }
 function submitTerminalCommand() {
   const input = $('[name="terminal-command"]');
@@ -1191,6 +1508,7 @@ function submitTerminalCommand() {
 function updateHostForm() {
   const form = $("#host-form");
   if (!form) return;
+  $$('[name="jump-host"]', form).forEach((control, i) => control.setAttribute("aria-label", I18n.t(I18n.msg`跳板主机 ${i + 1}`)));
   const auth = $('[name="auth"]:checked', form).value;
   const authInput = $("#auth-input");
   if (authInput.dataset.auth !== auth) {
@@ -1335,7 +1653,7 @@ function showLogs(id) {
   state.follow = true;
   modal(
     esc(c.name),
-    I18n.html`<div class="row wrap between"><label class="row"><input type="checkbox" name="follow" checked>跟随</label><div class="actions">${button("停止", `container-stop:${id}`)}${button("重启", `container-restart:${id}`)}</div></div><pre class="log" id="container-log" translate="no" tabindex="0">${esc(Array.from({ length: 35 }, (_, i) => `2026-10-24 14:${String(i).padStart(2, "0")}:00 INFO [demo] ${i % 4 ? "GET /health 200 OK" : "服务已就绪，监听 0.0.0.0:3000"}`).join("\n"))}</pre><div class="row between"><small>仅显示最近 1000 行 (docker logs) · 演示日志</small>${button("回到底部", "log-bottom", "ghost")}</div>`,
+    I18n.html`<p class="log-context">${esc(hosts.find((h) => h.id === c.host)?.name || "")}<span class="mono">${esc(c.image)}</span></p><div class="row wrap between"><label class="row"><input type="checkbox" name="follow" checked>跟随</label><div class="actions">${button(icon("dockBottom") + I18n.t("停靠到底部"), `dock-log:${id}`, "ghost", "", false)}${button("停止", `container-stop:${id}`)}${button("重启", `container-restart:${id}`)}</div></div><pre class="log" id="container-log" translate="no" tabindex="0">${esc(Array.from({ length: 35 }, (_, i) => `2026-10-24 14:${String(i).padStart(2, "0")}:00 INFO [demo] ${i % 4 ? "GET /health 200 OK" : "服务已就绪，监听 0.0.0.0:3000"}`).join("\n"))}</pre><div class="row between"><small>仅显示最近 1000 行 (docker logs) · 演示日志</small>${button("回到底部", "log-bottom", "ghost")}</div>`,
     "",
     true,
     true,
@@ -1550,6 +1868,9 @@ function deployTick(d) {
   else renderShellProgress();
 }
 function renderShellProgress() {
+  // Overview has no live log; redraw it only when the task's visible state changes.
+  const task = $("#dashboard-task");
+  if (state.route === "dashboard" && task && task.dataset.state !== dashboardTaskKey(state.deploy)) render();
   const marker = $(".global-progress");
   if (!state.deploy?.running) {
     marker?.remove();
@@ -1639,7 +1960,7 @@ function updateProjectReadiness(p) {
   );
 }
 function projectReady(p) {
-  if (!p.ready) return false;
+  if (!p.ready || (p.nameDraft !== undefined && p.nameDraft !== p.name)) return false;
   const m = manifestFor(p);
   if (p.demo && !p.directoryHandle && !state.previewYamlProject) return JSON.stringify(m) === JSON.stringify(p.manifest) && JSON.stringify(targetDraftFor(p)) === JSON.stringify(targetRowsFor(p)) && p.name === p.demoName;
   return !!p.directoryHandle && p.manifestSource !== null && p.manifestName === p.name && m.builds.length === 1 && !state.previewYamlError && JSON.stringify(m) === JSON.stringify(p.manifest) &&
@@ -1666,12 +1987,15 @@ document.addEventListener("input", (e) => {
   if (!p) return;
   const m = manifestFor(p);
   const parts = name.split("-");
-  if (name === "manifest-name") p.name = e.target.value;
+  if (name === "manifest-name") p.nameDraft = e.target.value;
   else if (name === "manifest-tag") m.tag = e.target.value;
   else if (parts[1] === "file") m.files[Number(parts[2])] = e.target.value;
   else if (parts[1] === "group" || parts[1] === "host") targetDraftFor(p)[Number(parts[2])][parts[1]] = e.target.value;
   else if (["service", "dockerfile", "image", "platform"].includes(parts[1])) m.builds[Number(parts[2])][parts[1]] = e.target.value;
   else if (parts[1] === "arg") m.builds[Number(parts[3])].args[Number(parts[4])][parts[2] === "key" ? 0 : 1] = e.target.value;
+  p.manifestErrors = (p.manifestErrors || []).filter((issue) => issue.field !== name);
+  paintManifestErrors(p);
+  syncProjectDraft();
 });
 document.addEventListener("change", (e) => {
   if (e.target.name?.startsWith("manifest-")) e.target.dispatchEvent(new Event("input", { bubbles: true }));
@@ -1720,7 +2044,6 @@ document.addEventListener("click", async (e) => {
   }
   if (action === "theme") {
     theme(document.documentElement.classList.contains("dark") ? "light" : "dark");
-    render();
     return;
   }
   if (action === "docker-setup")
@@ -1729,6 +2052,35 @@ document.addEventListener("click", async (e) => {
       I18n.html`<div class="stack"><p>选择本机操作系统，按 Docker 官方指引安装并启动 Docker。</p><div class="docker-install-links"><a href="https://docs.docker.com/desktop/setup/install/windows-install/" target="_blank" rel="noopener noreferrer">Windows · Docker Desktop</a><a href="https://docs.docker.com/desktop/setup/install/mac-install/" target="_blank" rel="noopener noreferrer">macOS · Docker Desktop</a><a href="https://docs.docker.com/engine/install/" target="_blank" rel="noopener noreferrer">Linux · Docker Engine</a></div><p class="muted">网页原型不会执行安装或检测；安装完成后可在预览选项中模拟检测结果。</p></div>`,
       button("关闭", "close"),
     );
+  if (action === "sidebar-toggle") {
+    state.sidebarCollapsed = !state.sidebarCollapsed;
+    render();
+    return;
+  }
+  if (action === "command-palette") return openCommandPalette();
+  if (action === "palette-go") {
+    close();
+    location.hash = parts.join(":");
+    return;
+  }
+  if (action === "dock-terminal") {
+    close();
+    state.dock = { type: "terminal", id: Number(arg) };
+    renderDock();
+    $('[name="terminal-command"]', $("#dock-pane"))?.focus();
+    return;
+  }
+  if (action === "dock-log") {
+    close();
+    state.dock = { type: "log", id: arg };
+    renderDock();
+    return;
+  }
+  if (action === "dock-close") {
+    state.dock = null;
+    renderDock();
+    return;
+  }
   if (action === "preview")
     return modal(
       "原型预览选项",
@@ -1857,12 +2209,14 @@ document.addEventListener("click", async (e) => {
     const row = $("#jump-hosts .host-jump-row").cloneNode(true);
     $("select", row).value = "";
     $("#jump-hosts").append(row);
+    updateHostForm();
     return;
   }
   if (action === "host-jump-remove") {
     const rows = $$("#jump-hosts .host-jump-row");
     if (rows.length > 1) el.closest(".host-jump-row").remove();
     else $("select", rows[0]).value = "";
+    updateHostForm();
     return;
   }
   if (action === "host-form-test") {
@@ -2045,6 +2399,7 @@ document.addEventListener("click", async (e) => {
     return toast("请由管理员预先配置并确认本机目标主机与凭据。");
   if (action.startsWith("manifest-build-") || action.startsWith("manifest-file-") || action.startsWith("manifest-target-") || action.startsWith("manifest-arg-")) {
     const m = manifestFor(project());
+    project().manifestErrors = [];
     const [operation, op] = action.slice("manifest-".length).split("-");
     const list = operation === "build" ? m.builds : operation === "file" ? m.files : targetDraftFor(project());
     const index = Number(parts[0]);
@@ -2088,52 +2443,28 @@ document.addEventListener("click", async (e) => {
     const m = tab === "all" ? structuredClone(draft) : structuredClone(p.manifest);
     if (tab === "build") { m.tag = draft.tag; m.builds = structuredClone(draft.builds); }
     if (tab === "compose") m.files = structuredClone(draft.files);
-    const name = tab === "all" || tab === "basic" ? p.name.trim() : p.manifestName || p.name.trim();
-    if (!name || projects.some((item) => item !== p && item.name === name)) return toast("项目名为空或已存在。", true);
-    const services = m.builds.map((b) => b.service.trim());
-    if (!m.tag.trim() || !m.builds.length || services.some((name) => !/^[A-Za-z][A-Za-z0-9_-]*$/.test(name)) || new Set(services).size !== services.length || m.builds.some((b) => !b.image.trim() || !b.dockerfile.trim() || b.dockerfile.startsWith("/") || b.dockerfile.includes("..") || (b.args || []).some(([key]) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)))) return toast("请检查 Tag、唯一服务、镜像、Dockerfile 和构建参数。", true);
-    if (!m.files.length || m.files.some((file, i) => !/\.ya?ml$/i.test(file) || file.startsWith("/") || file.includes(":") || file.split(/[\\/]/).includes("..") || (i === 0 && /[\\/]/.test(file))) || new Set(m.files).size !== m.files.length) return toast("Compose 文件路径无效；首个文件须位于项目根目录。", true);
-    if (!p.directoryHandle) return toast("请在基本信息选择本地代码目录。", true);
-    if (p.restoreNeedsReview && m.builds.some((build) => build.args.some(([key, value]) => key && !value))) return toast("请补齐导入后清空的构建参数值，或明确删除不需要的参数。", true);
+    const name = tab === "all" || tab === "basic" ? p.nameDraft.trim() : p.manifestName || p.name;
+    if (p.manifestSaving) return;
+    const issues = validateManifest(p, name, m);
+    if (issues.length) return showManifestErrors(p, issues);
     let targetIds = null;
     if (tab === "all") {
       try { targetIds = targetIdsFor(p); }
-      catch (error) { return toast(error.message, true); }
+      catch (error) { return showManifestErrors(p, [{ field: "manifest-group-0", tab: "targets", message: error.message }]); }
     }
     p.pendingManifestSave = { m, name, tab, sourceTab: state.tab, targetIds };
     if (targetIds && JSON.stringify(targetIds) !== JSON.stringify(p.hostIds)) return confirmAction("确认目标绑定变更", "取消绑定的主机专属环境变量可能被清理；请核对目标顺序与主机身份。", "manifest-commit", "确认保存");
-    el.dataset.action = "manifest-commit";
-    return el.click();
+    return commitManifest(p);
   }
-  if (action === "manifest-commit") {
-    const p = project(), pending = p.pendingManifestSave;
-    if (!pending) return;
-    const { m, name, tab, sourceTab, targetIds } = pending;
+  if (action === "manifest-commit") return commitManifest(project());
+  if (action === "manifest-discard") {
+    const p = project();
     if (p.manifestSaving) return;
-    p.manifestSaving = true;
-    try {
-      const draft = structuredClone(manifestFor(p));
-      const draftName = p.name;
-      const source = await ManifestIO.save(p.directoryHandle, p.manifestSource, name, m);
-      p.restoreNeedsReview = false;
-      useManifest(p, { name, manifest: structuredClone(m), source }, p.directoryHandle);
-      if (targetIds) commitTargets(p, targetIds);
-      if (tab !== "all") {
-        p.manifestDraft = draft;
-        if (tab === "build") {
-          p.manifestDraft.tag = m.tag;
-          p.manifestDraft.builds = structuredClone(m.builds);
-        } else if (tab === "compose") p.manifestDraft.files = structuredClone(m.files);
-        if (tab !== "basic") p.name = draftName;
-      }
-      delete p.pendingManifestSave;
-      const envForm = sourceTab === "env" ? $("#env-form") : null;
-      close();
-      render();
-      if (envForm) $("#env-form").replaceWith(envForm);
-      toast(sourceTab === "env" ? "YAML 配置已保存；环境变量值未保存。" : "已写入项目目录中的 devingpanel.yaml。");
-    } catch (error) { toast(error.message || "保存项目配置失败。", true); }
-    finally { p.manifestSaving = false; }
+    p.manifestDraft = structuredClone(p.manifest);
+    p.nameDraft = p.name;
+    p.targetDraft = targetRowsFor(p);
+    p.manifestErrors = [];
+    render();
     return;
   }
   if (action === "project-new") return projectForm();
@@ -2389,14 +2720,13 @@ document.addEventListener("click", async (e) => {
     $('[name="follow"]').checked = true;
     return;
   }
-  if (
-    ["container-stop", "container-restart", "container-delete"].includes(action)
-  )
-    return confirmAction(
-      "确认容器操作",
-      I18n.msg`确认${action === "container-stop" ? I18n.t("停止") : action === "container-delete" ? I18n.t("删除") : I18n.t("重启")}此容器？可能中断服务。`,
-      `container-confirm:${action}:${arg}`,
-    );
+  if (["container-stop", "container-restart", "container-delete"].includes(action)) {
+    const c = containers.find((item) => item.id === arg);
+    if (!c) return;
+    const host = hosts.find((item) => item.id === c.host);
+    const verb = I18n.t(action === "container-stop" ? "停止" : action === "container-delete" ? "删除" : "重启");
+    return confirmAction("确认容器操作", I18n.msg`确认${verb}主机 ${esc(host.name)} 上的容器 ${esc(c.name)}？可能中断服务。`, `container-confirm:${action}:${arg}`, verb);
+  }
   if (action === "container-start" || action === "container-confirm") {
     const [op, cid] =
       action === "container-start"
@@ -2559,7 +2889,6 @@ document.addEventListener("change", (e) => {
   }
   if (name === "theme") {
     theme(el.value);
-    render();
     toast("主题已保存。");
   }
   if (name === "auth" || name === "connection-mode") updateHostForm();
@@ -2584,10 +2913,10 @@ document.addEventListener("change", (e) => {
   if (name === "container-host")
     location.hash = `#/containers/${el.value}/${state.tab || "containers"}`;
   if (name === "retention") {
-    if (el.value === "custom") state.keep = 4;
-    else state.keep = Number(el.value);
+    state.keepCustom = el.value === "custom";
+    if (!state.keepCustom) state.keep = Number(el.value);
     render();
-    toast("保留策略已更新（演示）。");
+    if (!state.keepCustom) toast("保留策略已更新（演示）。");
   }
   if (name === "retention-custom") {
     if (!el.reportValidity()) return;
@@ -2679,12 +3008,54 @@ document.addEventListener(
   },
   true,
 );
+document.addEventListener("contextmenu", (e) => {
+  const tr = e.target.closest("tr[data-context]");
+  const menuEl = $("#context-menu");
+  if (!tr || !menuEl) return;
+  e.preventDefault();
+  const [type, rawId] = tr.dataset.context.split(":");
+  let items = "";
+  if (type === "host") {
+    const id = Number(rawId);
+    items = go("详情", `hosts/${id}`, "ghost", "eye") + button(icon("terminal") + I18n.t("连接"), `host-connect:${id}`, "ghost", "", false) + button(icon("pencil") + I18n.t("编辑"), `host-edit:${id}`, "ghost", "", false) + button(icon("copy") + I18n.t("复制"), `host-copy:${id}`, "ghost", "", false) + button(icon("trash") + I18n.t("删除"), `host-delete:${id}`, "ghost destructive", "", false);
+  } else if (type === "project") {
+    const id = Number(rawId);
+    const p = projects.find((item) => item.id === id);
+    items = button("发布", `project-deploy:${id}`, "ghost", !projectReady(p) ? "disabled" : "") + go("编辑", `projects/${id}/basic`, "ghost") + button("删除", `project-delete:${id}`, "ghost destructive");
+  } else if (type === "container") {
+    const c = containers.find((item) => item.id === rawId);
+    if (!c) return;
+    items = button("日志", `logs:${c.id}`, "ghost") + (c.state === "running" ? button("停止", `container-stop:${c.id}`, "ghost") : button("启动", `container-start:${c.id}`, "ghost")) + button("重启", `container-restart:${c.id}`, "ghost") + button("删除", `container-delete:${c.id}`, "ghost destructive");
+  }
+  if (!items) return;
+  menuEl.innerHTML = items;
+  menuEl.hidden = false;
+  menuEl.style.left = Math.min(innerWidth - menuEl.offsetWidth - 8, Math.max(8, e.clientX)) + "px";
+  menuEl.style.top = Math.min(innerHeight - menuEl.offsetHeight - 8, Math.max(8, e.clientY)) + "px";
+});
 document.addEventListener("click", (e) => {
   $$("details.menu[open]").forEach((m) => {
     if (!m.contains(e.target)) m.open = false;
   });
+  const cm = $("#context-menu");
+  if (cm && !cm.hidden) cm.hidden = true;
 });
 document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    openCommandPalette();
+    return;
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s" && state.route === "projects" && state.id) {
+    e.preventDefault();
+    $('.project-save-bar .primary')?.click();
+    return;
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "l" && ScreenLock.isEnabled()) {
+    e.preventDefault();
+    $('[data-action="screen-lock"]')?.click();
+    return;
+  }
   const tab = e.target.closest('.tabs [role="tab"]');
   if (tab && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) {
     const items = $$('[role="tab"]', tab.parentElement).filter((item) => !item.disabled);
@@ -2700,6 +3071,8 @@ document.addEventListener("keydown", (e) => {
   }
   if (e.key === "Escape") {
     $$("details.menu[open]").forEach((m) => (m.open = false));
+    const cm = $("#context-menu");
+    if (cm && !cm.hidden) cm.hidden = true;
     $("#sidebar").classList.remove("open");
   }
 });

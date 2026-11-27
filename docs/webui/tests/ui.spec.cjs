@@ -259,7 +259,7 @@ test("preview loading empty error and P0/P2 views", async ({ page }) => {
   await page.getByRole("button", { name: "原型预览选项" }).click();
   await page.locator('[name="preview-stage"]').selectOption("p2");
   await page.getByRole("button", { name: "应用", exact: true }).click();
-  await page.locator("a.host-card").first().click();
+  await page.locator("a.host-summary").first().click();
   await expect(page.getByText("资源趋势", { exact: true })).toBeVisible();
 });
 
@@ -324,9 +324,9 @@ test("YAML preview requires directory authorization before saving", async ({ pag
   await page.getByRole("button", { name: "原型预览选项" }).click();
   await page.locator('[name="preview-yaml-project"]').check();
   await page.getByRole("button", { name: "应用", exact: true }).click();
-  await expect(page.locator("main > .card")).toHaveCount(1);
+  await expect(page.locator(".project-editor > .editor-section")).toHaveCount(1);
   await page.getByRole("tab", { name: "基本信息" }).click();
-  await expect(page.locator("main > .card")).toHaveCount(1);
+  await expect(page.locator(".project-editor > .editor-section")).toHaveCount(1);
   await expect(page.locator('[name="path"]')).toHaveAttribute("readonly", "");
   await expect(page.getByText("尚未授权本地代码目录")).toBeVisible();
   await expect(page.getByRole("button", { name: "选择目录" })).toBeVisible();

@@ -141,7 +141,7 @@ test("import previews, requires consent, applies config and resets trust and rea
   await expect(page.getByRole("button", { name: "保存", exact: true })).toBeDisabled();
   await connectProjectDirectory(page, false);
   await page.getByRole("button", { name: "保存", exact: true }).click();
-  await expect(page.getByText(/请补齐导入后清空的构建参数值/)).toBeVisible();
+  await expect(page.locator("#manifest-errors").getByText(/请补齐导入后清空的构建参数值/)).toBeVisible();
   await page.locator('[name="manifest-arg-value-0-0"]').fill("production");
   await page.getByRole("button", { name: "保存", exact: true }).click();
   await expect.poll(() => page.evaluate(() => window.testFiles["devingpanel.yaml"])).toContain('name: restored-project');

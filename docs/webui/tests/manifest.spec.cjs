@@ -119,7 +119,7 @@ test("target Save updates only local bindings; Save all writes YAML without targ
   await page.locator('[name="manifest-host-0"]').fill("web-2");
   await page.getByRole("button", { name: "保存", exact: true }).click();
   await page.getByRole("button", { name: "确认保存" }).click();
-  await expect.poll(() => page.evaluate(() => projects.find((p) => p.name === "pending-name").hostIds)).toEqual([2]);
+  await expect.poll(() => page.evaluate(() => projects.find((p) => p.name === "sample").hostIds)).toEqual([2]);
   let saved = await page.evaluate(() => window.testFiles["devingpanel.yaml"]);
   expect(saved).toContain("name: sample");
   expect(saved).not.toContain("pending-{timestamp}");
@@ -175,7 +175,7 @@ test("environment values never enter YAML through Save all", async ({ page }) =>
   await expect(page.locator('#env-form [name="value"]')).toHaveValue("not-a-real-secret");
   expect(await page.evaluate(() => window.testFiles["devingpanel.yaml"])).not.toContain("not-a-real-secret");
   expect(await page.evaluate(() => window.testFiles["devingpanel.yaml"])).not.toContain("targets:");
-  await page.locator('#env-form [data-action="env-save"]').click();
+  await page.locator('.project-save-bar [data-action="env-save"]').click();
   await expect(page.locator('#env-form [name="value"]')).toHaveValue("");
   expect(await page.evaluate(() => window.testFiles["devingpanel.yaml"])).not.toContain("not-a-real-secret");
 });
@@ -268,7 +268,7 @@ test("Compose override and image variable collision are rejected", async ({ page
   await page.locator('[name="manifest-service-1"]').fill("api_a");
   await page.locator('[name="manifest-image-1"]').fill("sample-api");
   await page.getByRole("button", { name: "保存", exact: true }).click();
-  await expect(page.locator(".toast.error").filter({ hasText: "镜像变量名不能重复" })).toBeVisible();
+  await expect(page.locator("#manifest-errors").filter({ hasText: "镜像变量名不能重复" })).toBeVisible();
 });
 
 test("save changes a real project YAML file through the browser file-handle contract", async ({ page }) => {

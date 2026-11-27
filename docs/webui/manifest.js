@@ -14,12 +14,19 @@ const ManifestIO = (() => {
   async function fileIn(directory, path) {
     const parts = pathParts(path);
     let current = directory;
-    for (const part of parts.slice(0, -1)) current = await current.getDirectoryHandle(part);
-    return current.getFileHandle(parts.at(-1));
+    try {
+      for (const part of parts.slice(0, -1)) current = await current.getDirectoryHandle(part);
+      return await current.getFileHandle(parts.at(-1));
+    } catch {
+      const error = new Error(I18n.t(I18n.msg`无法读取项目文件：${path}。请确认文件存在且允许读取。`));
+      throw error;
+    }
   }
   function parse(source) {
     if (encoder.encode(source).length > limit) throw new Error("devingpanel.yaml 不能超过 64 KiB。");
-    const data = jsyaml.load(source, { schema: jsyaml.JSON_SCHEMA });
+    let data;
+    try { data = jsyaml.load(source, { schema: jsyaml.JSON_SCHEMA }); }
+    catch { throw new Error("devingpanel.yaml 格式错误。请检查 YAML 语法后重新选择目录。"); }
     exact(data, ["version", "name", "tag", "builds", "deploy"], "项目配置");
     if (data.version !== 2) throw new Error("只支持 devingpanel.yaml version: 2。");
     if (typeof data.name !== "string" || !data.name.trim() || typeof data.tag !== "string" || !data.tag.trim()) throw new Error("项目名和 Tag 规则不能为空。");
@@ -41,6 +48,9 @@ const ManifestIO = (() => {
     return { name: data.name, manifest: { tag: data.tag, builds, files: [...files] } };
   }
   function serialize(name, manifest) {
+    for (const build of manifest.builds) {
+      if (new Set(build.args.map(([key]) => key)).size !== build.args.length) throw new Error("同一构建内的参数名不能重复。");
+    }
     const data = {
       version: 2,
       name,
@@ -53,20 +63,37 @@ const ManifestIO = (() => {
     return source;
   }
   async function verifyFiles(directory, manifest) {
-    for (const build of manifest.builds) await fileIn(directory, build.dockerfile);
+    for (const [index, build] of manifest.builds.entries()) {
+      try { await fileIn(directory, build.dockerfile); }
+      catch (error) { error.manifestField = `manifest-dockerfile-${index}`; error.manifestTab = "build"; throw error; }
+    }
     const images = new Map();
-    for (const path of manifest.files) {
-      const file = await fileIn(directory, path);
-      const compose = jsyaml.load(await (await file.getFile()).text(), { schema: jsyaml.JSON_SCHEMA });
-      for (const [service, config] of Object.entries(compose?.services || {})) {
-        if (config && Object.hasOwn(config, "image")) images.set(service, config.image);
+    for (const [index, path] of manifest.files.entries()) {
+      try {
+        const file = await fileIn(directory, path);
+        const compose = jsyaml.load(await (await file.getFile()).text(), { schema: jsyaml.JSON_SCHEMA });
+        for (const [service, config] of Object.entries(compose?.services || {})) {
+          if (config && Object.hasOwn(config, "image")) images.set(service, config.image);
+        }
+      } catch {
+        // YAML parser diagnostics can contain file content; show only the path.
+        const error = new Error(I18n.t(I18n.msg`无法读取或解析 Compose 文件：${path}。请检查文件、权限和 YAML 格式。`));
+        error.manifestField = `manifest-file-${index}`;
+        error.manifestTab = "compose";
+        throw error;
       }
     }
     for (const build of manifest.builds) {
       const variable = imageVariable(build.service);
-      if (images.get(build.service) !== `\${${variable}}`) throw new Error(`Compose 服务 ${build.service} 最终须使用 \${${variable}} 镜像变量。`);
+      if (images.get(build.service) !== `\${${variable}}`) {
+        const error = new Error(I18n.t(I18n.msg`Compose 服务 ${build.service} 最终须使用 ${"${" + variable + "}"} 镜像变量。`));
+        error.manifestField = "manifest-file-0";
+        error.manifestTab = "compose";
+        throw error;
+      }
     }
   }
+
   async function read(directory) {
     const file = await directory.getFileHandle(filename);
     const source = await (await file.getFile()).text();
@@ -83,9 +110,12 @@ const ManifestIO = (() => {
     const source = serialize(name, manifest);
     if (encoder.encode(source).length > limit) throw new Error("devingpanel.yaml 不能超过 64 KiB。");
     await verifyFiles(directory, manifest);
-    const file = await directory.getFileHandle(filename, { create: true });
-    const writer = await file.createWritable();
-    try { await writer.write(source); await writer.close(); } catch (error) { await writer.abort().catch(() => {}); throw error; }
+    try {
+      const file = await directory.getFileHandle(filename, { create: true });
+      const writer = await file.createWritable();
+      try { await writer.write(source); await writer.close(); }
+      catch (error) { await writer.abort().catch(() => {}); throw error; }
+    } catch { throw new Error("无法写入 devingpanel.yaml。请检查目录写入权限后重试。"); }
     return source;
   }
   async function pick() {
