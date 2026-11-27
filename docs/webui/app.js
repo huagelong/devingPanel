@@ -281,7 +281,9 @@ const state = {
   containerHost: 1,
   theme: "system",
   sidebarCollapsed: false,
-  dock: null,
+  hostQuery: "",
+  containerQuery: "",
+  dock: { open: false, expanded: false, activeKey: "", tabs: [] },
   keep: 3,
   autoCleanup: false,
   hostCollectionIntervalSeconds: 60,
@@ -486,11 +488,12 @@ function render() {
         "",
       )}</nav><div class="sidebar-foot"><div class="row between"><span class="row"><span class="dot success"></span>仅 SSH · 无 Agent</span><span>v0.1</span></div><div class="sidebar-foot-actions"><small>交互原型 · 演示数据</small>${button("原型预览选项", "preview", "ghost")}</div></div>`;
   $("#topbar").innerHTML =
-    I18n.html`<div class="row">${ib("menu", "打开导航", "menu")}${ib("panelLeft", "折叠侧栏", "sidebar-toggle", `aria-pressed="${!!state.sidebarCollapsed}"`)}<a class="brand" href="#/dashboard"><svg class="brand-mark" viewBox="0 0 36 36" aria-hidden="true"><rect x="5" y="9" width="11" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 14h5M8 18h5M8 22h4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path class="brand-transfer" d="M17.5 18h5m-2.5-2.5L22.5 18 20 20.5" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><rect x="24" y="8" width="8" height="20" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M27 13h2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle class="brand-transfer-dot" cx="28" cy="23" r="1.25"/></svg>devingPanel</a></div><div class="top-actions">${state.docker ? button(I18n.html`${icon("search")}<span>${I18n.t("快速跳转…")}</span><kbd>Ctrl+K</kbd>`, "command-palette", "command-trigger", "", false) : ""}<span class="row"><span class="dot ${state.docker ? "success" : "destructive"}"></span><span class="docker-label">${state.docker ? I18n.t("本地 Docker 可用") : I18n.t("Docker 不可用")}</span></span>${ScreenLock.isEnabled() ? ib("lock", "立即锁屏", "screen-lock") : ""}${button(icon(isDark ? "sun" : "moon"), "theme", "ghost icon-btn", `aria-label="${I18n.t(isDark ? "切换至浅色" : "切换至深色")}" title="${I18n.t(isDark ? "切换至浅色" : "切换至深色")}"`)}</div>${state.deploy?.running ? I18n.t('<div class="global-progress" aria-label="发布进行中"></div>') : ""}`;
+    I18n.html`<div class="row">${ib("menu", "打开导航", "menu")}${ib("panelLeft", "折叠侧栏", "sidebar-toggle", `aria-pressed="${!!state.sidebarCollapsed}"`)}<a class="brand" href="#/dashboard"><svg class="brand-mark" viewBox="0 0 36 36" aria-hidden="true"><rect x="5" y="9" width="11" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 14h5M8 18h5M8 22h4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path class="brand-transfer" d="M17.5 18h5m-2.5-2.5L22.5 18 20 20.5" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><rect x="24" y="8" width="8" height="20" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M27 13h2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle class="brand-transfer-dot" cx="28" cy="23" r="1.25"/></svg>devingPanel</a></div><div class="top-actions">${state.docker ? button(I18n.html`${icon("search")}<span>${I18n.t("快速跳转…")}</span><kbd>Ctrl+K</kbd>`, "command-palette", "command-trigger", "", false) : ""}<span class="row"><span class="dot ${state.docker ? "success" : "destructive"}"></span><span class="docker-label">${state.docker ? I18n.t("本地 Docker 可用") : I18n.t("Docker 不可用")}</span></span>${ScreenLock.isEnabled() ? ib("lock", "立即锁屏", "screen-lock") : ""}${button(icon(isDark ? "sun" : "moon"), "theme", "ghost icon-btn", `aria-label="${I18n.t(isDark ? "切换至浅色" : "切换至深色")}" title="${I18n.t(isDark ? "切换至浅色" : "切换至深色")}"`)}<span class="window-controls desktop-only" aria-hidden="true"><span>&#8212;</span><span>&#9633;</span><span>&#10005;</span></span></div>${state.deploy?.running ? I18n.t('<div class="global-progress" aria-label="发布进行中"></div>') : ""}`;
   $('#topbar [data-action="menu"]').classList.add("mobile-menu");
   $('#topbar [data-action="sidebar-toggle"]').classList.add("desktop-only");
   const onlineCount = hosts.filter((h) => h.online).length;
-  $("#statusbar").innerHTML = I18n.html`<div class="row"><span class="row"><span class="dot ${state.docker ? "success" : "destructive"}"></span><span>${state.docker ? I18n.t("本地 Docker 可用") : I18n.t("Docker 不可用")}</span></span><span class="statusbar-sep"></span><span>${esc(I18n.t("在线主机"))} ${onlineCount}/${hosts.length}</span>${state.deploy?.running ? I18n.html`<span class="statusbar-sep"></span><a href="#/deploy" class="info">${esc(state.deploy.project)} · ${I18n.t("进行中")}</a>` : ""}</div><div class="row statusbar-right"><span class="muted">Ctrl+K ${I18n.t("快速跳转")}</span><span class="statusbar-sep"></span><span class="muted">v0.1</span></div>`;
+  const dockCount = state.dock?.tabs?.length || 0;
+  $("#statusbar").innerHTML = I18n.html`<div class="row"><span class="row"><span class="dot ${state.docker ? "success" : "destructive"}"></span><span>${state.docker ? I18n.t("本地 Docker 可用") : I18n.t("Docker 不可用")}</span></span><span class="statusbar-sep"></span><span>${esc(I18n.t("在线主机"))} ${onlineCount}/${hosts.length}</span>${state.deploy?.running ? I18n.html`<span class="statusbar-sep"></span><a href="#/deploy" class="info">${esc(state.deploy.project)} · ${I18n.t("进行中")}</a>` : ""}${dockCount ? I18n.html`<span class="statusbar-sep"></span>${button(I18n.html`${icon("terminal")}<span>${I18n.t("底部工作区")} (${dockCount})</span>`, "dock-toggle", "ghost statusbar-btn", "", false)}` : ""}</div><div class="row statusbar-right"><span class="muted">Ctrl+K ${I18n.t("快速跳转")}</span><span class="statusbar-sep"></span><span class="muted">v0.1</span></div>`;
   renderDock();
   if (!state.docker) {
     $("#content").innerHTML = dockerSetup();
@@ -631,13 +634,14 @@ function dashboard() {
 }
 function hostsPage() {
   if (state.id) return hostDetail();
+  const q = state.hostQuery.trim().toLowerCase();
   const items =
     state.view === "empty"
       ? []
-      : hosts.filter((h) => state.group === "all" || h.group === state.group);
+      : hosts.filter((h) => (state.group === "all" || h.group === state.group) && (!q || h.name.toLowerCase().includes(q) || h.address.toLowerCase().includes(q) || h.group.toLowerCase().includes(q)));
   return (
     head("主机", button(icon("plus") + "添加主机", "host-new", "primary")) +
-    I18n.html`<div class="resource-bar"><div class="row wrap">${select("host-group", [["all", "全部分组"], ...hostGroups, ...(hosts.some((host) => host.group === "未分组") ? ["未分组"] : [])], state.group, 'class="inline-select" aria-label="主机分组"')}${button(icon("settings") + I18n.t("管理分组"), "host-groups", "", "", false)}</div><small class="muted">${esc(I18n.t(I18n.msg`共 ${items.length} 台主机`))}</small></div><section class="card resource-table">${
+    I18n.html`<div class="resource-bar"><div class="row wrap">${select("host-group", [["all", "全部分组"], ...hostGroups, ...(hosts.some((host) => host.group === "未分组") ? ["未分组"] : [])], state.group, 'class="inline-select" aria-label="主机分组"')}${input("host-filter", state.hostQuery, 'type="search" class="inline-filter" placeholder="过滤主机名、IP 或分组…" aria-label="过滤主机"')}${button(icon("settings") + I18n.t("管理分组"), "host-groups", "", "", false)}</div><small class="muted">${esc(I18n.t(I18n.msg`共 ${items.length} 台主机`))}</small></div><section class="card resource-table">${
       items.length
         ? table(
             [
@@ -1213,12 +1217,13 @@ function containersPage() {
           ),
       )}</section>`
     );
+  const cq = state.containerQuery.trim().toLowerCase();
+  const hostContainers = containers.filter((c) => c.host === id && (!cq || c.name.toLowerCase().includes(cq) || c.image.toLowerCase().includes(cq) || c.ports.toLowerCase().includes(cq)));
   return (
     prefix +
-    I18n.html`<section class="card resource-table">${table(
+    I18n.html`<div class="resource-bar"><div class="row wrap">${input("container-filter", state.containerQuery, 'type="search" class="inline-filter" placeholder="过滤容器名、镜像或端口…" aria-label="过滤容器"')}</div><small class="muted">${esc(I18n.t(I18n.msg`容器 · ${hostContainers.length} 项`))}</small></div><section class="card resource-table">${table(
       ["状态", "名称", "镜像", "端口", "CPU", "内存", "操作"],
-      containers
-        .filter((c) => c.host === id)
+      hostContainers
         .map((c) =>
           row([
             badge(
@@ -1428,7 +1433,8 @@ function openHostTerminal(id) {
   const host = hosts.find((item) => item.id === id);
   if (!host) return;
   $$("details.menu[open]").forEach((menu) => (menu.open = false));
-  if (state.dock?.type === "terminal" && state.dock.id === id) state.dock = null;
+  const key = `terminal:${id}`;
+  if (state.dock?.activeKey === key) state.dock.open = false;
   modal(
     "连接",
     I18n.html`${terminalMarkup(host)}<div class="terminal-foot"><span>${I18n.t("[演示] 未建立远程 SSH 连接，命令不会执行。")}</span><div class="actions">${button(icon("dockBottom") + I18n.t("停靠到底部"), `dock-terminal:${id}`, "ghost", "", false)}</div></div>`,
@@ -1437,29 +1443,47 @@ function openHostTerminal(id) {
   $("#dialog-title")?.insertAdjacentHTML("afterend", I18n.html`<span class="terminal-host-meta mono muted">${esc(host.name)} · ${esc(host.user)}@${esc(host.address)}</span>`);
   $('[name="terminal-command"]').focus();
 }
+function openDockTab(type, id) {
+  const key = `${type}:${id}`;
+  if (!state.dock.tabs.some((t) => t.key === key)) {
+    state.dock.tabs.push({ key, type, id });
+  }
+  state.dock.activeKey = key;
+  state.dock.open = true;
+  render();
+}
 function renderDock() {
   const pane = $("#dock-pane");
   if (!pane) return;
-  if (!state.dock || !state.docker) {
+  if (!state.dock?.open || !state.dock.tabs.length || !state.docker) {
     pane.hidden = true;
+    pane.classList.remove("expanded");
     pane.innerHTML = "";
     return;
   }
+  const active = state.dock.tabs.find((t) => t.key === state.dock.activeKey) || state.dock.tabs[0];
+  state.dock.activeKey = active.key;
   pane.hidden = false;
-  if (state.dock.type === "terminal") {
-    const host = hosts.find((item) => item.id === state.dock.id);
-    if (!host) { state.dock = null; pane.hidden = true; return; }
-    pane.innerHTML = I18n.html`<div class="dock-head"><div class="row">${icon("terminal")}<strong>${esc(host.name)}</strong><span class="mono muted">${esc(host.user)}@${esc(host.address)}</span></div><div class="actions">${button("弹出窗口", `host-connect:${host.id}`, "ghost")}${ib("close", "关闭", "dock-close")}</div></div><div class="dock-body">${terminalMarkup(host)}</div>`;
+  pane.classList.toggle("expanded", !!state.dock.expanded);
+  const tabsMarkup = state.dock.tabs.map((t) => {
+    const label = t.type === "terminal"
+      ? hosts.find((h) => h.id === t.id)?.name || "SSH"
+      : containers.find((c) => c.id === t.id)?.name || "Log";
+    return I18n.html`<div class="dock-tab ${t.key === active.key ? "active" : ""}">${button(I18n.html`${icon(t.type === "terminal" ? "terminal" : "box")}<span>${esc(label)}</span>`, `dock-select:${t.key}`, "ghost dock-tab-btn", "", false)}${ib("close", "关闭", `dock-tab-close:${t.key}`, 'class="ghost icon-btn dock-tab-x"')}</div>`;
+  }).join("");
+  const popoutAction = active.type === "terminal" ? `host-connect:${active.id}` : `logs:${active.id}`;
+  const headMarkup = I18n.html`<div class="dock-head"><div class="dock-tabs">${tabsMarkup}</div><div class="actions">${button(state.dock.expanded ? "收起" : "展开", "dock-expand", "ghost")}${button("弹出窗口", popoutAction, "ghost")}${ib("close", "关闭", "dock-close")}</div></div>`;
+  if (active.type === "terminal") {
+    const host = hosts.find((item) => item.id === active.id);
+    if (!host) return;
+    pane.innerHTML = headMarkup + I18n.html`<div class="dock-body">${terminalMarkup(host)}</div>`;
     return;
   }
-  if (state.dock.type === "log") {
-    const c = containers.find((item) => item.id === state.dock.id);
-    if (!c) { state.dock = null; pane.hidden = true; return; }
-    const hostName = hosts.find((h) => h.id === c.host)?.name || "";
-    pane.innerHTML = I18n.html`<div class="dock-head"><div class="row">${icon("box")}<strong>${esc(c.name)}</strong><span class="muted">${esc(hostName)}</span><span class="mono muted">${esc(c.image)}</span></div><div class="actions">${button("弹出窗口", `logs:${c.id}`, "ghost")}${ib("close", "关闭", "dock-close")}</div></div><div class="dock-body dock-log-body"><pre class="log" id="dock-container-log" translate="no" tabindex="0">${esc(Array.from({ length: 35 }, (_, i) => `2026-10-24 14:${String(i).padStart(2, "0")}:00 INFO [demo] ${i % 4 ? "GET /health 200 OK" : "服务已就绪，监听 0.0.0.0:3000"}`).join("\n"))}</pre></div>`;
-    const log = $("#dock-container-log");
-    if (log) log.scrollTop = log.scrollHeight;
-  }
+  const c = containers.find((item) => item.id === active.id);
+  if (!c) return;
+  pane.innerHTML = headMarkup + I18n.html`<div class="dock-body dock-log-body"><pre class="log" id="dock-container-log" translate="no" tabindex="0">${esc(Array.from({ length: 35 }, (_, i) => `2026-10-24 14:${String(i).padStart(2, "0")}:00 INFO [demo] ${i % 4 ? "GET /health 200 OK" : "服务已就绪，监听 0.0.0.0:3000"}`).join("\n"))}</pre></div>`;
+  const log = $("#dock-container-log");
+  if (log) log.scrollTop = log.scrollHeight;
 }
 function openCommandPalette() {
   if (!state.docker) return;
@@ -2065,19 +2089,40 @@ document.addEventListener("click", async (e) => {
   }
   if (action === "dock-terminal") {
     close();
-    state.dock = { type: "terminal", id: Number(arg) };
-    renderDock();
+    openDockTab("terminal", Number(arg));
     $('[name="terminal-command"]', $("#dock-pane"))?.focus();
     return;
   }
   if (action === "dock-log") {
     close();
-    state.dock = { type: "log", id: arg };
+    openDockTab("log", arg);
+    return;
+  }
+  if (action === "dock-select") {
+    state.dock.activeKey = parts.join(":");
+    renderDock();
+    return;
+  }
+  if (action === "dock-tab-close") {
+    const targetKey = parts.join(":");
+    state.dock.tabs = state.dock.tabs.filter((t) => t.key !== targetKey);
+    if (!state.dock.tabs.length) state.dock.open = false;
+    else if (state.dock.activeKey === targetKey) state.dock.activeKey = state.dock.tabs[0].key;
+    render();
+    return;
+  }
+  if (action === "dock-expand") {
+    state.dock.expanded = !state.dock.expanded;
+    renderDock();
+    return;
+  }
+  if (action === "dock-toggle") {
+    state.dock.open = !state.dock.open;
     renderDock();
     return;
   }
   if (action === "dock-close") {
-    state.dock = null;
+    state.dock.open = false;
     renderDock();
     return;
   }
@@ -3008,6 +3053,15 @@ document.addEventListener(
   },
   true,
 );
+document.addEventListener("input", (e) => {
+  if (e.target.name === "host-filter") {
+    state.hostQuery = e.target.value;
+    render();
+  } else if (e.target.name === "container-filter") {
+    state.containerQuery = e.target.value;
+    render();
+  }
+});
 document.addEventListener("contextmenu", (e) => {
   const tr = e.target.closest("tr[data-context]");
   const menuEl = $("#context-menu");

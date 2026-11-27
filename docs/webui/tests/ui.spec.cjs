@@ -365,7 +365,7 @@ test("YAML editor exposes multiple builds but does not publish an unsaved draft"
 test("theme tokens and shell match specification", async ({ page }) => {
   await page.goto("/");
   await expect(page.locator("#sidebar")).toHaveCSS("width", "224px");
-  await expect(page.locator("#topbar")).toHaveCSS("height", "56px");
+  await expect(page.locator("#topbar")).toHaveCSS("height", "44px");
   await page.locator('[data-action="theme"]').click();
   await expect(page.locator("html")).toHaveClass("dark");
   await expect(page.locator("#dialog[open]")).toHaveCount(0);
